@@ -1,58 +1,70 @@
 # Home Assistant EG4 Monitor Integration
 
-![EG4 Monitor Banner](docs/images/banner.png)
+Custom Home Assistant integration for EG4 portal-backed systems, tuned for modern multi-device installs like dual FlexBOSS + GridBoss.
 
-This is a custom Home Assistant integration for monitoring EG4 inverter systems. It connects to the EG4 web portal to fetch real-time data about your solar system.
+## What Changed
 
-[![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
-[![GitHub release](https://img.shields.io/github/release/ZoarTech/EG4_HA_Inverter.svg)](https://GitHub.com/ZoarTech/EG4_HA_Inverter/releases/)
+This project was expanded from simple single-device polling to a site-aware model:
 
-## Features
-
-- Real-time monitoring of your EG4 inverter system
-- Battery State of Charge monitoring
-- Solar production monitoring
-- Grid import/export monitoring
-- Battery charge/discharge monitoring
-- Customizable update intervals
-- User-friendly sensor names and icons
-
-![Dashboard Example](docs/images/dashboard.png)
+- Multi-device cloud polling with role detection (`flexboss_master`, `flexboss_slave`, `gridboss`)
+- GridBoss-specific ingestion paths for real site telemetry
+  - `getParallelGroupDetails`
+  - `getMidboxRuntime`
+  - `dayMultiLineParallel`
+  - event list (`api/analyze/event/list`)
+- Portal-aligned energy naming and mapping
+  - `Today's Usage`, `Total Usage`, `Today Export`, `Total Export`
+  - `UPS Usage Today`, `UPS Usage Total`
+- Generator status improvements
+  - running/supplying power binary sensors
+  - status source sensor
+- Battery telemetry improvements
+  - charging power, discharging power, direction (`Idle/Charging/Discharging`)
+  - battery energy remaining (kWh)
+- Uncleared error monitoring
+  - active problem binary sensor
+  - count + summary + top open event details
 
 ## Quick Start
 
-1. Copy the `custom_components/eg4_monitor` directory to your Home Assistant's `custom_components` directory
+1. Copy `custom_components/eg4_monitor` to Home Assistant `custom_components`
 2. Restart Home Assistant
-3. Add the integration through the Home Assistant UI
+3. Add `EG4 Monitor` from Integrations
+4. (Recommended) Configure serial role overrides in integration options
 
-For detailed instructions, see our [Installation Guide](docs/installation.md).
+## Key Entities
 
-## Documentation
+- Site power: `sensor.grid_power`, `sensor.load_power`, `sensor.grid_voltage`, `sensor.grid_frequency`, `sensor.eps_voltage`
+- Battery: `sensor.battery_state_of_charge`, `sensor.battery_power`, `sensor.battery_charging_power`, `sensor.battery_discharging_power`, `sensor.battery_power_direction`, `sensor.battery_energy_remaining`
+- Energy: `sensor.today_usage`, `sensor.total_usage`, `sensor.today_export`, `sensor.total_export`, `sensor.ups_usage_today`, `sensor.ups_usage_total`, `sensor.today_solar_yield`, `sensor.total_solar_yield`
+- Generator: `binary_sensor.generator_running`, `binary_sensor.generator_supplying_power`, `sensor.generator_status_source`
+- Active faults: `binary_sensor.uncleared_error_active`, `sensor.uncleared_error_count`, `sensor.uncleared_error_summary`
 
-- [Installation Guide](docs/installation.md)
-- [Configuration Guide](docs/configuration.md)
-- [FAQ](docs/faq.md)
+## Automation Reference
 
-## Screenshots
+`Grid Power Loss Detection` was updated to repeat every 30 minutes while all are true:
 
-### Configuration
-![Configuration](docs/images/config.png)
+- `sensor.grid_voltage < 200`
+- `sensor.battery_state_of_charge < 50`
+- `binary_sensor.generator_running == off`
+- `input_boolean.mute_grid_power_alarm == off`
 
-### Energy Dashboard
-![Energy Dashboard](docs/images/energy.png)
+It sends the same media alert + mobile push on each repeat interval.
 
-### Battery Status
-![Battery Status](docs/images/battery.png)
+## Mute Button Reference
 
-## Configuration
+A mute helper is used to silence repeated alerts:
 
-The integration requires your EG4 portal credentials:
-- Username
-- Password
+- Helper: `input_boolean.mute_grid_power_alarm`
+- Dashboard placement: `Main Dash` -> `Battery Backup Status`
+- UI chip behavior:
+  - icon changes by state (`mdi:volume-off` when muted, `mdi:volume-high` when active)
+  - red when muted, green when active
+  - tap toggles mute state
 
-### Local Test Credentials
+## Local Dev Credentials
 
-For local scripts/tests, use structured environment variables via `.env.local`:
+Use structured env vars via `.env.local`:
 
 ```env
 EG4_PORTAL__USERNAME="your_eg4_username"
@@ -61,36 +73,13 @@ HOME_ASSISTANT__BASE_URL="http://192.168.0.253:8123"
 HOME_ASSISTANT__TOKEN="your_long_lived_access_token"
 ```
 
-Best practice is to keep secrets in `.env.local` and never commit it. `.gitignore` is configured to ignore `.env`, `.env.local`, and `.env.*` while allowing `.env.example`.
+Keep secrets out of git. `.gitignore` is set to ignore `.env`, `.env.local`, and `.env.*` while keeping `.env.example` tracked.
 
-For detailed configuration options, see our [Configuration Guide](docs/configuration.md).
+## Notes
 
-## Available Sensors
-
-| Sensor | Unit | Description |
-|--------|------|-------------|
-| Battery State of Charge | % | Current battery charge level |
-| Solar Production | W | Current solar panel power production |
-| Grid Power | W | Current grid power flow |
-| Battery Power | W | Current battery power flow |
-| Daily Energy Production | kWh | Total solar energy produced today |
-| Daily Grid Import/Export | kWh | Net grid energy exchange |
-| Daily Battery Charge/Discharge | kWh | Net battery energy exchange |
-
-## Support
-
-- Check our [FAQ](docs/faq.md)
-- Report issues on [GitHub](https://github.com/ZoarTech/EG4_HA_Inverter/issues)
-- Join our [Discord community](#) (coming soon)
-
-## Contributing
-
-Contributions are welcome! Please read our [Contributing Guidelines](CONTRIBUTING.md) before submitting pull requests.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+- This integration is cloud portal based today.
+- Local CAN/Modbus transport can be added later behind the same normalized site model.
 
 ## Disclaimer
 
-This integration is not officially associated with EG4 Electronics. Use at your own risk.
+This project is not officially affiliated with EG4 Electronics.
