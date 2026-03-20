@@ -2,6 +2,10 @@
 
 DOMAIN = "eg4_monitor"
 
+CONF_MASTER_SERIAL = "master_serial"
+CONF_SLAVE_SERIAL = "slave_serial"
+CONF_GRIDBOSS_SERIAL = "gridboss_serial"
+
 # Base URLs
 BASE_URL = "https://monitor.eg4electronics.com/WManage"
 LOGIN_URL = f"{BASE_URL}/web/login"

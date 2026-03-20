@@ -1,84 +1,111 @@
-# map_api.py
+"""Map the API calls of the EG4 website using pyppeteer."""
+
 import asyncio
 import json
 import logging
 from datetime import datetime
+from typing import Any, Dict, List
 
 from pyppeteer import launch
+from pyppeteer.browser import Browser
+from pyppeteer.page import Page, Request, Response
 from settings import settings
 
-# Set up logging for real-time output
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),  # Console output
-    ]
-)
+# --- Constants ---
+LOGIN_URL = "https://monitor.eg4electronics.com/WManage/web/login"
+OUTPUT_FILENAME = "api_map.json"
+MONITORING_DURATION = 60  # in seconds
+
+# --- Logger Setup ---
 logger = logging.getLogger(__name__)
 
-# --- Best Practice: Use Environment Variables for Credentials ---
-# In your terminal, run:
-# export EG4_USER="your_email@example.com"
-# export EG4_PASS="your_secret_password"
 
-LOGIN_URL = 'https://monitor.eg4electronics.com/WManage/web/login'
+def setup_logging() -> None:
+    """Set up logging for real-time output."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler()],
+    )
 
-async def main():
-    username = settings.eg4_username
-    password = settings.eg4_password
 
-    if not username or not password:
-        print("❌ Error: Set EG4_USER and EG4_PASS environment variables.")
-        logger.error("Missing credentials")
-        return
+async def launch_browser() -> Browser:
+    """Launch the pyppeteer browser with the necessary arguments."""
+    logger.info("Launching browser...")
+    return await launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-web-security",
+            "--disable-extensions",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--single-process",
+            "--no-zygote",
+            "--disable-features=VizDisplayCompositor",
+        ],
+    )
 
-    print("\n🚀 Starting EG4 API mapping...")
-    print(f"📧 Using username: {username}")
-    print(f"🔗 Login URL: {LOGIN_URL}")
-    print(f"⏰ Starting at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("="*60)
-    logger.info("Starting EG4 API mapping")
 
-    # This list will store all our captured API call data
-    api_log = []
-    request_log = {}
+async def login(page: Page, username: str, password: str) -> None:
+    """Log in to the EG4 website."""
+    logger.info(f"Navigating to login page: {LOGIN_URL}")
+    await page.goto(LOGIN_URL, {"waitUntil": "networkidle2"})
 
-    print("🔧 Step 1: Setting up event listeners...")
-    logger.info("Setting up event listeners")
+    logger.info("Filling login credentials...")
+    await page.type('input[name="account"]', username)
+    await page.type('input[name="password"]', password)
 
-    def log_request(request):
-        """Capture request data"""
+    logger.info("Clicking login and waiting for navigation...")
+    try:
+        await asyncio.gather(
+            page.waitForNavigation({"waitUntil": "networkidle2", "timeout": 10000}),
+            page.click('button[type="submit"]'),
+        )
+        logger.info("Login successful!")
+    except Exception as e:
+        logger.warning(f"Login navigation issue (continuing anyway): {e}")
+
+
+async def monitor_requests(page: Page, duration: int) -> List[Dict[str, Any]]:
+    """Monitor network requests for a given duration."""
+    api_log: List[Dict[str, Any]] = []
+    request_log: Dict[str, Dict[str, Any]] = {}
+
+    def log_request(request: Request) -> None:
+        """Capture request data."""
         url = request.url
         if "/WManage/web/" in url and "/resources/" not in url:
             timestamp = datetime.now().strftime("%H:%M:%S")
-            print(f"\n🔵 [{timestamp}] REQUEST: {request.method} {url}")
             logger.info(f"REQUEST: {request.method} {url}")
-
             if request.postData:
-                print(f"   📤 POST Data: {request.postData}")
                 logger.info(f"POST Data: {request.postData}")
 
             request_log[url] = {
-                'method': request.method,
-                'headers': dict(request.headers),
-                'post_data': request.postData,
-                'url': url,
-                'timestamp': timestamp
+                "method": request.method,
+                "headers": dict(request.headers),
+                "post_data": request.postData,
+                "url": url,
+                "timestamp": timestamp,
             }
 
-    def log_response(response):
-        """Capture response data"""
+    def log_response(response: Response) -> None:
+        """Capture response data."""
         url = response.url
         if "/WManage/web/" in url and "/resources/" not in url:
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            print(f"🔶 [{timestamp}] RESPONSE: {response.status} {url}")
             logger.info(f"RESPONSE: {response.status} {url}")
-            # Schedule the async processing
-            asyncio.create_task(process_response(response, request_log.get(url, {}), api_log))
+            asyncio.create_task(
+                process_response(response, request_log.get(url, {}), api_log)
+            )
 
-    async def process_response(response, request_data, api_log):
-        """Process response data asynchronously"""
+    async def process_response(
+        response: Response, request_data: Dict[str, Any], log: List[Dict[str, Any]]
+    ) -> None:
+        """Process response data asynchronously."""
         try:
             response_body = await response.json()
         except Exception:
@@ -87,138 +114,84 @@ async def main():
             except Exception:
                 response_body = "Could not read response body"
 
-        api_log.append({
-            'url': response.url,
-            'method': request_data.get('method', 'UNKNOWN'),
-            'request_headers': request_data.get('headers', {}),
-            'request_body': request_data.get('post_data'),
-            'response_status': response.status,
-            'response_headers': dict(response.headers),
-            'response_body': response_body,
-        })
-
-    browser = await launch(
-        headless=True,  # Must be True in dev container
-        args=[
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--disable-web-security',
-            '--disable-extensions',
-            '--disable-background-timer-throttling',
-            '--disable-backgrounding-occluded-windows',
-            '--disable-renderer-backgrounding',
-            '--single-process',
-            '--no-zygote',
-            '--disable-features=VizDisplayCompositor'
-        ]
-    )
-    page = await browser.newPage()
-
-    print("🔧 Step 2: Setting up browser and page...")
-    logger.info("Browser launched, setting up page")
-
-    # Enable request interception to capture POST data
-    await page.setRequestInterception(True)
-
-    # Step 2: Attach the listeners
-    page.on('request', log_request)
-    page.on('response', log_response)
-
-    # Allow all requests to continue - fix the async issue
-    def continue_request(request):
-        asyncio.create_task(request.continue_())
-    page.on('request', continue_request)
-
-    print("✅ Event listeners attached - monitoring all requests!")
-    logger.info("Event listeners attached")
-
-    print(f"🌐 Step 3: Navigating to login page: {LOGIN_URL}")
-    logger.info(f"Navigating to: {LOGIN_URL}")
-    await page.goto(LOGIN_URL, {'waitUntil': 'networkidle2'})
-
-    print("Step 4: Filling login credentials...")
-    # NOTE: Inspect the login page to get the correct selectors for the inputs
-    await page.type('input[name="account"]', username)
-    await page.type('input[name="password"]', password)
-
-    print("🔑 Step 5: Clicking login and waiting for navigation...")
-    try:
-        await asyncio.gather(
-            page.waitForNavigation({'waitUntil': 'networkidle2', 'timeout': 10000}),  # Reduced timeout
-            page.click('button[type="submit"]')
+        log.append(
+            {
+                "url": response.url,
+                "method": request_data.get("method", "UNKNOWN"),
+                "request_headers": request_data.get("headers", {}),
+                "request_body": request_data.get("post_data"),
+                "response_status": response.status,
+                "response_headers": dict(response.headers),
+                "response_body": response_body,
+            }
         )
-        print("✅ Login successful!")
-    except Exception as e:
-        print(f"⚠️  Login navigation issue (continuing anyway): {e}")
-        # Continue even if navigation fails - we might still be logged in
-    print("Login successful. Now monitoring for API calls...")
 
-    # Step 6: Navigate to the main dashboard or data page after login
-    print("Step 6: Navigating to main page to trigger API calls...")
-    try:
-        # Wait a bit for the page to settle after login
-        await asyncio.sleep(3)
+    await page.setRequestInterception(True)
+    page.on("request", log_request)
+    page.on("response", log_response)
 
-        # Try to navigate to the main page or trigger some actions
-        current_url = page.url
-        print(f"Current page URL: {current_url}")
+    def continue_request(request: Request) -> None:
+        """Continue all requests."""
+        asyncio.create_task(request.continue_())
 
-        # Look for dashboard or main page link
-        try:
-            await page.waitForSelector('a[href*="dashboard"], a[href*="main"], .nav-item', timeout=5000)
-            dashboard_link = await page.querySelector('a[href*="dashboard"], a[href*="main"], .nav-item')
-            if dashboard_link:
-                print("Found dashboard link, clicking...")
-                await dashboard_link.click()
-                await page.waitForNavigation({'waitUntil': 'networkidle2'})
-        except Exception:
-            print("No dashboard link found, staying on current page")
+    page.on("request", continue_request)
 
-        # Trigger a page reload to capture initial API calls
-        print("Reloading page to capture API calls...")
-        await page.reload({'waitUntil': 'networkidle2'})
+    logger.info("Event listeners attached - monitoring all requests!")
 
-    except Exception as e:
-        print(f"Error during navigation: {e}")
-
-    # Step 7: Wait for a while to let the page load all its initial data.
-    # The listeners will be firing in the background.
-    # Increase this time if the page has a lot to load.
-    print("⏳ Waiting for 60 seconds to capture data... (Page should be visible)")
-    logger.info("Starting 60-second monitoring period")
-
-    # Wait and show countdown
-    for remaining in range(60, 0, -10):
-        print(f"⏱️  {remaining} seconds remaining... (watching for API calls)")
+    logger.info(f"Waiting for {duration} seconds to capture data...")
+    for remaining in range(duration, 0, -10):
+        logger.info(f"{remaining} seconds remaining...")
         await asyncio.sleep(10)
 
-    print("\n⏹️  Monitoring period complete!")
-    logger.info("Monitoring period complete")
+    logger.info("Monitoring period complete!")
+    return api_log
 
-    print("\n🔍 Step 8: Halting monitoring. Processing results...")
-    await browser.close()
 
-    # Step 9: Save the results to a file
-    output_filename = 'api_map.json'
-    with open(output_filename, 'w') as f:
+def save_results(api_log: List[Dict[str, Any]], filename: str) -> None:
+    """Save the captured API calls to a file."""
+    with open(filename, "w") as f:
         json.dump(api_log, f, indent=2)
 
-    print(f"\n✅ Reverse engineering complete! See '{output_filename}' for the full log.")
-    print(f"Found {len(api_log)} API calls.")
+    logger.info(f"Reverse engineering complete! See '{filename}' for the full log.")
+    logger.info(f"Found {len(api_log)} API calls.")
 
-    # Print summary of captured calls
     if api_log:
-        print("\nCaptured API calls summary:")
+        logger.info("Captured API calls summary:")
         for i, call in enumerate(api_log, 1):
-            print(f"{i}. {call['method']} {call['url']} -> {call['response_status']}")
+            logger.info(
+                f"{i}. {call['method']} {call['url']} -> {call['response_status']}"
+            )
     else:
-        print("\n⚠️  No API calls were captured. This could mean:")
-        print("   - The login failed")
-        print("   - The page doesn't make API calls immediately")
-        print("   - The API endpoints don't match our filter criteria")
-        print("   - We need to interact with the page more")
+        logger.warning("No API calls were captured.")
 
-if __name__ == '__main__':
+
+async def main() -> None:
+    """Run the API mapping script."""
+    setup_logging()
+
+    username = settings.eg4_username
+    password = settings.eg4_password
+
+    if not username or not password:
+        logger.error(
+            "Missing credentials. Set EG4_PORTAL__USERNAME and EG4_PORTAL__PASSWORD."
+        )
+        return
+
+    logger.info("Starting EG4 API mapping...")
+    logger.info(f"Using username: {username}")
+
+    browser = await launch_browser()
+    page = await browser.newPage()
+
+    await login(page, username, password)
+
+    api_log = await monitor_requests(page, MONITORING_DURATION)
+
+    await browser.close()
+
+    save_results(api_log, OUTPUT_FILENAME)
+
+
+if __name__ == "__main__":
     asyncio.run(main())

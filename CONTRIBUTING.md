@@ -67,14 +67,17 @@ pytest
 ### Code Style
 
 We use:
-* [black](https://github.com/psf/black) for code formatting
-* [flake8](https://flake8.pycqa.org/) for style guide enforcement
-* [isort](https://pycqa.github.io/isort/) for import sorting
+* [ruff](https://github.com/astral-sh/ruff) for linting and code style enforcement.
+* [black](https://github.com/psf/black) for code formatting.
+* [isort](https://pycqa.github.io/isort/) for import sorting.
+
+Ruff is configured to be compatible with black, so running `ruff check . --fix` and `ruff format .` will handle most style and formatting issues.
 
 Run code style checks:
 ```bash
+ruff check .
+ruff format .
 black .
-flake8 .
 isort .
 ```
 

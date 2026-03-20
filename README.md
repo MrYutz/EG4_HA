@@ -50,6 +50,19 @@ The integration requires your EG4 portal credentials:
 - Username
 - Password
 
+### Local Test Credentials
+
+For local scripts/tests, use structured environment variables via `.env.local`:
+
+```env
+EG4_PORTAL__USERNAME="your_eg4_username"
+EG4_PORTAL__PASSWORD="your_eg4_password"
+HOME_ASSISTANT__BASE_URL="http://192.168.0.253:8123"
+HOME_ASSISTANT__TOKEN="your_long_lived_access_token"
+```
+
+Best practice is to keep secrets in `.env.local` and never commit it. `.gitignore` is configured to ignore `.env`, `.env.local`, and `.env.*` while allowing `.env.example`.
+
 For detailed configuration options, see our [Configuration Guide](docs/configuration.md).
 
 ## Available Sensors

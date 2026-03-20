@@ -27,14 +27,16 @@ wheels/
 *.swo
 
 # Test files that might contain credentials
-test_*.py
-*_test.py
-test/
-tests/
+# test_*.py
+# *_test.py
+# test/
+# tests/
 
 # Environment variables
 .env
 *.env
+.env.*
+!.env.example
 
 # Logs
 *.log
