@@ -38,6 +38,8 @@ SENSOR_TYPES = {
     "battery_charging_power": "Battery Charging Power",
     "battery_discharging_power": "Battery Discharging Power",
     "battery_power_direction": "Battery Power Direction",
+    "battery_charging_energy_estimated": "Battery Charging Energy (Estimated)",
+    "battery_discharging_energy_estimated": "Battery Discharging Energy (Estimated)",
     "battery_voltage": "Battery Voltage",
     "battery_remaining_kwh": "Battery Energy Remaining",
     "solar_power": "Solar Power",

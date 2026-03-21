@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Any
 from collections.abc import Callable
@@ -22,6 +23,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
@@ -94,6 +96,20 @@ SENSOR_TYPES: dict[str, EG4SensorEntityDescription] = {
         name="Battery Power Direction",
         value_fn=lambda data: _safe_get(data, ("aggregate", "Battery", "Direction")),
     ),
+    "battery_charging_energy_estimated": EG4SensorEntityDescription(
+        key="battery_charging_energy_estimated",
+        name="Battery Charging Energy (Estimated)",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+    ),
+    "battery_discharging_energy_estimated": EG4SensorEntityDescription(
+        key="battery_discharging_energy_estimated",
+        name="Battery Discharging Energy (Estimated)",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+    ),
     "battery_voltage": EG4SensorEntityDescription(
         key="battery_voltage",
         name="Battery Voltage",
@@ -106,7 +122,6 @@ SENSOR_TYPES: dict[str, EG4SensorEntityDescription] = {
         key="battery_remaining_kwh",
         name="Battery Energy Remaining",
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda data: _safe_get(data, ("aggregate", "Battery", "RemainingKWh")),
     ),
@@ -339,10 +354,39 @@ async def async_setup_entry(
 
     entities = []
     for description in SENSOR_TYPES.values():
+        if description.key in {
+            "battery_charging_energy_estimated",
+            "battery_discharging_energy_estimated",
+        }:
+            continue
         if entry.options.get(description.key, True):
             entities.append(
                 EG4Sensor(coordinator, description, entry.entry_id, device_info)
             )
+
+    if entry.options.get("battery_charging_energy_estimated", True):
+        entities.append(
+            EG4IntegratedEnergySensor(
+                coordinator=coordinator,
+                entry_id=entry.entry_id,
+                key="battery_charging_energy_estimated",
+                name="Battery Charging Energy (Estimated)",
+                source_path=("aggregate", "Battery", "ChargePower"),
+                device_info=device_info,
+            )
+        )
+
+    if entry.options.get("battery_discharging_energy_estimated", True):
+        entities.append(
+            EG4IntegratedEnergySensor(
+                coordinator=coordinator,
+                entry_id=entry.entry_id,
+                key="battery_discharging_energy_estimated",
+                name="Battery Discharging Energy (Estimated)",
+                source_path=("aggregate", "Battery", "DischargePower"),
+                device_info=device_info,
+            )
+        )
 
     async_add_entities(entities)
 
@@ -384,3 +428,60 @@ class EG4Sensor(CoordinatorEntity, SensorEntity):
         if isinstance(top, list):
             return {"open_events": top}
         return None
+
+
+class EG4IntegratedEnergySensor(CoordinatorEntity, SensorEntity, RestoreEntity):
+    """Integrate positive power samples into total increasing kWh."""
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+
+    def __init__(
+        self,
+        coordinator: DataUpdateCoordinator,
+        entry_id: str,
+        key: str,
+        name: str,
+        source_path: tuple[str, ...],
+        device_info: dict[str, Any],
+    ) -> None:
+        super().__init__(coordinator)
+        self._attr_name = name
+        self._attr_unique_id = f"{entry_id}_{key}"
+        self._attr_device_info = device_info
+        self._source_path = source_path
+        self._energy_kwh: float = 0.0
+        self._last_sample_ts: datetime | None = None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is not None:
+            try:
+                self._energy_kwh = float(last_state.state)
+            except (TypeError, ValueError):
+                self._energy_kwh = 0.0
+
+    @property
+    def native_value(self) -> StateType:
+        return round(self._energy_kwh, 5)
+
+    def _handle_coordinator_update(self) -> None:
+        ts = self.coordinator.last_update_success_time
+        data = self.coordinator.data or {}
+        power = _safe_get(data, self._source_path)
+        try:
+            power_w = max(float(power or 0.0), 0.0)
+        except (TypeError, ValueError):
+            power_w = 0.0
+
+        if ts is not None and self._last_sample_ts is not None:
+            delta_seconds = (ts - self._last_sample_ts).total_seconds()
+            if delta_seconds > 0:
+                self._energy_kwh += (power_w * (delta_seconds / 3600.0)) / 1000.0
+
+        if ts is not None:
+            self._last_sample_ts = ts
+
+        self.async_write_ha_state()
