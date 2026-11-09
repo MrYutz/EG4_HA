@@ -47,3 +47,25 @@ DEFAULT_LOCAL_DISCOVERY_CONCURRENCY = 8
 DEFAULT_LOCAL_TRACE_ENABLED = True
 DEFAULT_LOCAL_TRACE_INTERVAL = 1.0
 DEFAULT_LOCAL_TRACE_BMS_INTERVAL = 5.0
+
+# Read-only, zero-based profiles. The recorder owns scheduling; shared shapes
+# (notably inverter holding110/125) have exactly one maintenance deadline.
+LOCAL_INVERTER_PRIMARY_BLOCKS = ((4, 0, 40),)
+LOCAL_INVERTER_DYNAMIC_BLOCKS = ((4, 40, 40), (4, 120, 26))
+LOCAL_GRIDBOSS_PRIMARY_BLOCKS = ((4, 0, 40), (4, 120, 12))
+LOCAL_GRIDBOSS_DYNAMIC_BLOCKS = ((4, 500, 100),)
+LOCAL_INVERTER_MAINTENANCE = (
+    (4, 80, 40, None),  # Configured BMS interval.
+    (3, 110, 125, 60.0),
+    (3, 0, 20, 300.0),
+    (3, 20, 90, 300.0),
+    (3, 235, 102, 300.0),
+)
+LOCAL_GRIDBOSS_MAINTENANCE = (
+    (3, 4500, 10, 5.0),
+    (3, 0, 20, 300.0),
+    (3, 20, 90, 300.0),
+    (3, 110, 125, 300.0),
+    (3, 235, 88, 300.0),
+    (3, 2000, 108, 300.0),
+)

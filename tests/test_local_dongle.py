@@ -452,142 +452,105 @@ def test_parse_dongle_frame_rejects_corrupt_or_misrouted_data(mutator) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("client_type", [EG4LocalDongle, EG4GridBossDongle])
-async def test_diagnostics_reject_cached_wrong_function_blocks(client_type) -> None:
-    dongle_serial = "DJ12345678"
-    inverter_serial = "INV1234567"
-
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            writer.write(
-                _fixture_response(
-                    dongle_serial=dongle_serial,
-                    inverter_serial=inverter_serial,
-                    register=0,
-                    values=[0],
-                )
+@pytest.mark.parametrize("function", [3, 4])
+async def test_register_block_rejects_cached_wrong_function(client_type, function) -> None:
+    async def handle(reader, writer, rows):
+        writer.write(_identity_response())
+        await writer.drain()
+        request = await reader.readexactly(38)
+        register, count = struct.unpack("<HH", request[32:36])
+        writer.write(
+            _fixture_response(
+                dongle_serial="DJ12345678", inverter_serial="INV1234567",
+                register=register, values=[65000] * count,
+                function=3 if function == 4 else 4,
             )
-            await writer.drain()
-            request = await reader.readexactly(38)
-            function = request[21]
-            register, count = struct.unpack("<HH", request[32:36])
-            writer.write(
-                _fixture_response(
-                    dongle_serial=dongle_serial,
-                    inverter_serial=inverter_serial,
-                    register=register,
-                    values=[65000] * count,
-                    function=3 if function == 4 else 4,
-                )
-                + _fixture_response(
-                    dongle_serial=dongle_serial,
-                    inverter_serial=inverter_serial,
-                    register=register,
-                    values=[0] + [123] * (count - 1),
-                    function=function,
-                )
+            + _fixture_response(
+                dongle_serial="DJ12345678", inverter_serial="INV1234567",
+                register=register, values=[0, 123], function=function,
             )
-            await writer.drain()
-        finally:
-            writer.close()
-            await writer.wait_closed()
-
-    server = await asyncio.start_server(handle, "127.0.0.1", 0)
-    port = server.sockets[0].getsockname()[1]
-    try:
-        blocks = await client_type(
-            host="127.0.0.1", port=port, timeout=1.0
-        ).async_read_diagnostics()
-    finally:
-        server.close()
-        await server.wait_closed()
-
-    assert blocks[0]["values"][0] == 0
-    for block in blocks:
-        assert block["ok"] is True
-        assert 65000 not in block["values"]
-        assert "error" not in block
-        assert datetime.fromisoformat(block["started_at"]).utcoffset().total_seconds() == 0
-        assert datetime.fromisoformat(block["completed_at"]) >= datetime.fromisoformat(
-            block["started_at"]
         )
-        assert block["duration_ms"] >= 0
+        await writer.drain()
+
+    async with _evidence_loopback(handle, client_type=client_type) as (client, rows):
+        frame = await client.async_read_register_block(40, 2, function=function)
+        assert frame.register == 40
+        assert frame.modbus_function == function
+        assert frame.values == (0, 123)
+        transaction, = rows
+        assert transaction["ok"] is True
+        assert transaction["request"]["function"] == function
+        assert transaction["frames"][1]["values"] == (65000, 65000)
+        assert transaction["frames"][1]["validation"]["function"] == "failed"
+        assert transaction["frames"][2]["validation"]["function"] == "passed"
+        assert datetime.fromisoformat(transaction["started_at"]).utcoffset().total_seconds() == 0
+        assert datetime.fromisoformat(transaction["completed_at"]) >= datetime.fromisoformat(
+            transaction["started_at"]
+        )
+        assert transaction["duration_ms"] >= 0
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["unsupported", "timeout"])
-async def test_diagnostic_failure_preserves_primary_and_subsequent_block(failure) -> None:
-    dongle_serial = "DJ12345678"
-    inverter_serial = "INV1234567"
+async def test_block_failure_preserves_primary_and_remaining_reads(failure) -> None:
+    requested = []
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            writer.write(
-                _fixture_response(
-                    dongle_serial=dongle_serial,
-                    inverter_serial=inverter_serial,
-                    register=0,
-                    values=[0],
-                )
-            )
-            await writer.drain()
-            request = await reader.readexactly(38)
-            register, count = struct.unpack("<HH", request[32:36])
-            if register == 40:
-                if failure == "timeout":
-                    await reader.read()
-                else:
-                    # Unsupported firmware replies with an exception, not zero data.
-                    writer.write(
-                        _fixture_response(
-                            dongle_serial=dongle_serial,
-                            inverter_serial=inverter_serial,
-                            register=register,
-                            values=[0],
-                            function=0x84,
-                        )
-                    )
-                    await writer.drain()
-                return
-            values = [0] * count
-            if register == 0:
-                values[4] = 523
-                values[10] = 4200
-            writer.write(
-                _fixture_response(
-                    dongle_serial=dongle_serial,
-                    inverter_serial=inverter_serial,
-                    register=register,
-                    values=values,
-                    function=request[21],
-                )
-            )
-            await writer.drain()
-        finally:
-            writer.close()
-            await writer.wait_closed()
+    async def handle(reader, writer, rows):
+        writer.write(_identity_response())
+        await writer.drain()
+        request = await reader.readexactly(38)
+        function = request[21]
+        register, count = struct.unpack("<HH", request[32:36])
+        requested.append((function, register, count))
+        if register == 40:
+            if failure == "timeout":
+                await reader.read()
+            else:
+                # Unsupported firmware replies with an exception, not zero data.
+                writer.write(_fixture_response(
+                    dongle_serial="DJ12345678", inverter_serial="INV1234567",
+                    register=register, values=[0], function=0x84,
+                ))
+                await writer.drain()
+            return
+        values = [0] * count
+        if register == 0:
+            values[4] = 523
+            values[10] = 4200
+        writer.write(_fixture_response(
+            dongle_serial="DJ12345678", inverter_serial="INV1234567",
+            register=register, values=values, function=function,
+        ))
+        await writer.drain()
 
-    server = await asyncio.start_server(handle, "127.0.0.1", 0)
-    port = server.sockets[0].getsockname()[1]
-    try:
-        client = EG4LocalDongle(host="127.0.0.1", port=port, timeout=0.1)
-        primary = await client.async_read_core_snapshot()
-        blocks = await client.async_read_diagnostics()
-    finally:
-        server.close()
-        await server.wait_closed()
-
-    assert primary.battery_voltage == 52.3
-    assert primary.charge_power == 4200.0
-    assert blocks[0]["ok"] is False
-    assert blocks[0]["values"] is None
-    assert blocks[0]["error"]
-    assert blocks[0]["duration_ms"] >= 0
-    assert blocks[1]["ok"] is True
-    assert blocks[1]["values"] == (0,) * blocks[1]["count"]
+    async with _evidence_loopback(handle) as (client, rows):
+        with client.capture() as acquisition:
+            primary = await client.async_read_core_snapshot()
+            error = TimeoutError if failure == "timeout" else DongleFrameError
+            with pytest.raises(error):
+                await client.async_read_register_block(40, 40, timeout=0.05)
+            supplemental = await client.async_read_register_block(120, 26)
+            settings = await client.async_read_register_block(110, 125, function=3)
+        assert primary.battery_voltage == 52.3
+        assert primary.charge_power == 4200.0
+        assert supplemental.values == (0,) * 26
+        assert settings.values == (0,) * 125
+        assert requested == [(4, 0, 40), (4, 40, 40), (4, 120, 26), (3, 110, 125)]
+        transactions = [row for row in rows if row["kind"] == "transaction"]
+        assert [row["ok"] for row in transactions] == [True, False, True, True]
+        failed = transactions[1]
+        assert failed["error"]["type"] == error.__name__
+        assert failed["duration_ms"] >= 0
+        assert acquisition["transaction_ids"] == [row["transaction_id"] for row in transactions]
+        assert acquisition["failed_transaction_ids"] == [failed["transaction_id"]]
+        assert acquisition["successful_transaction_ids"] == [
+            row["transaction_id"] for row in transactions if row["ok"]
+        ]
+        assert {row["acquisition_id"] for row in rows} == {acquisition["acquisition_id"]}
 
 
 @pytest.mark.asyncio
-async def test_diagnostics_cancellation_closes_active_connection() -> None:
+async def test_register_block_cancellation_closes_active_connection() -> None:
     request_received = asyncio.Event()
     connection_closed = asyncio.Event()
 
@@ -613,7 +576,7 @@ async def test_diagnostics_cancellation_closes_active_connection() -> None:
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     capture = asyncio.create_task(
-        EG4LocalDongle(host="127.0.0.1", port=port).async_read_diagnostics()
+        EG4LocalDongle(host="127.0.0.1", port=port).async_read_register_block(40, 40)
     )
     try:
         await asyncio.wait_for(request_received.wait(), timeout=1.0)
@@ -971,7 +934,11 @@ async def test_capture_groups_wait_for_reads_and_serializes_same_client() -> Non
                 asyncio.wait_for(client.async_read_core_snapshot(), timeout=1),
                 asyncio.wait_for(client.async_read_bms_snapshot(), timeout=1),
             )
-            await asyncio.wait_for(client.async_read_diagnostics(), timeout=1)
+            await asyncio.wait_for(client.async_read_register_block(40, 40), timeout=1)
+            await asyncio.wait_for(
+                client.async_read_register_block(110, 125, function=3), timeout=1,
+            )
+            await asyncio.wait_for(client.async_read_register_block(120, 26), timeout=1)
         transactions = [row for row in rows if row["kind"] == "transaction"]
         assert len(transactions) == 5
         assert peak == 1
@@ -1006,3 +973,209 @@ async def test_public_snapshot_assigns_one_acquisition_without_explicit_capture(
         assert len({row["transaction_id"] for row in transactions}) == 4
         assert all(row["role"] == "master" for row in rows)
         assert all(row["session_id"] == "test-session" for row in rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("peer_operation", ["block", "identity"])
+async def test_same_endpoint_clients_serialize_block_and_discovery(peer_operation) -> None:
+    first_requested = asyncio.Event()
+    release_first = asyncio.Event()
+    second_connected = asyncio.Event()
+    second_completed = asyncio.Event()
+    connections = 0
+    active = 0
+    peak = 0
+    requests = []
+
+    async def handle(reader, writer, rows):
+        nonlocal connections, active, peak
+        connections += 1
+        connection_number = connections
+        if connection_number == 2:
+            second_connected.set()
+        active += 1
+        peak = max(peak, active)
+        try:
+            writer.write(_identity_response())
+            await writer.drain()
+            try:
+                request = await reader.readexactly(38)
+            except asyncio.IncompleteReadError as err:
+                requests.append(err.partial)
+                return
+            requests.append(request)
+            register, count = struct.unpack("<HH", request[32:36])
+            if connection_number == 1:
+                first_requested.set()
+                await release_first.wait()
+            writer.write(_fixture_response(
+                dongle_serial="DJ12345678", inverter_serial="INV1234567",
+                register=register, values=[123] * count, function=request[21],
+            ))
+            await writer.drain()
+        finally:
+            active -= 1
+            if connection_number == 2:
+                second_completed.set()
+        await reader.read()
+
+    async with _evidence_loopback(handle, timeout=1) as (client, rows):
+        peer = EG4GridBossDongle(
+            host=client.host, port=client.port, timeout=1,
+            evidence_sink=client.evidence_sink, role="discovery",
+            session_id=client.session_id,
+        )
+        first = asyncio.create_task(client.async_read_register_block(40, 2))
+        pending = None
+        try:
+            await asyncio.wait_for(first_requested.wait(), timeout=1)
+            if peer_operation == "identity":
+                pending = asyncio.create_task(peer.async_discover_identity())
+            else:
+                pending = asyncio.create_task(
+                    peer.async_read_register_block(4500, 10, function=3)
+                )
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(second_connected.wait(), timeout=0.03)
+            assert not first.done()
+            assert not pending.done()
+            release_first.set()
+            primary, secondary = await asyncio.wait_for(
+                asyncio.gather(first, pending), timeout=1,
+            )
+            await asyncio.wait_for(second_connected.wait(), timeout=1)
+            await asyncio.wait_for(second_completed.wait(), timeout=1)
+            assert primary.values == (123, 123)
+            if peer_operation == "identity":
+                assert secondary.inverter_serial == "INV1234567"
+            else:
+                assert secondary.values == (123,) * 10
+                assert secondary.modbus_function == 3
+            assert connections == 2
+            assert peak == 1
+            assert len(rows) == 2
+            assert all(row["ok"] for row in rows)
+            assert len({row["acquisition_id"] for row in rows}) == 2
+            assert len({row["transaction_id"] for row in rows}) == 2
+            assert rows[0]["role"] == "master"
+            assert rows[1]["role"] == "discovery"
+            assert rows[1]["request"]["function"] == (
+                None if peer_operation == "identity" else 3
+            )
+        finally:
+            release_first.set()
+            for task in (first, pending):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (first, pending) if task is not None),
+                return_exceptions=True,
+            )
+    assert len(requests[0]) == 38
+    if peer_operation == "identity":
+        assert requests[1] == b""
+    else:
+        assert len(requests[1]) == 38
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "cancel"])
+async def test_route_lock_wait_is_bounded_and_does_not_interrupt_owner(failure) -> None:
+    first_requested = asyncio.Event()
+    release_first = asyncio.Event()
+    second_connected = asyncio.Event()
+    connections = 0
+
+    async def handle(reader, writer, rows):
+        nonlocal connections
+        connections += 1
+        if connections == 2:
+            second_connected.set()
+        writer.write(_identity_response())
+        await writer.drain()
+        request = await reader.readexactly(38)
+        register, count = struct.unpack("<HH", request[32:36])
+        if register == 40:
+            first_requested.set()
+            await release_first.wait()
+        writer.write(_fixture_response(
+            dongle_serial="DJ12345678", inverter_serial="INV1234567",
+            register=register, values=[321] * count, function=request[21],
+        ))
+        await writer.drain()
+        await reader.read()
+
+    async with _evidence_loopback(handle, timeout=1) as (client, rows):
+        peer = EG4LocalDongle(
+            host=client.host, port=client.port, timeout=1,
+            evidence_sink=client.evidence_sink, role="peer", session_id=client.session_id,
+        )
+        first = asyncio.create_task(client.async_read_register_block(40, 1))
+        waiting = recovery = None
+        try:
+            await asyncio.wait_for(first_requested.wait(), timeout=1)
+            waiting = asyncio.create_task(
+                peer.async_read_register_block(
+                    120, 1, timeout=0.03 if failure == "timeout" else 1,
+                )
+            )
+            if failure == "cancel":
+                await asyncio.sleep(0.01)
+                waiting.cancel()
+            error = TimeoutError if failure == "timeout" else asyncio.CancelledError
+            with pytest.raises(error):
+                await waiting
+            failed, = rows
+            assert failed["ok"] is False
+            assert failed["error"]["type"] == error.__name__
+            assert failed["error"]["stage"] == "lock"
+            assert failed["request"]["bytes_hex"] is None
+            assert failed["frames"] == []
+            assert failed["received_bytes"] == 0
+            assert connections == 1
+            assert not first.done()
+            recovery = asyncio.create_task(peer.async_read_register_block(120, 1))
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(second_connected.wait(), timeout=0.03)
+            release_first.set()
+            primary, recovered = await asyncio.wait_for(
+                asyncio.gather(first, recovery), timeout=1,
+            )
+            assert primary.values == (321,)
+            assert recovered.values == (321,)
+            assert connections == 2
+            assert [row["ok"] for row in rows] == [False, True, True]
+            assert len({row["transaction_id"] for row in rows}) == 3
+        finally:
+            release_first.set()
+            for task in (first, waiting, recovery):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (first, waiting, recovery) if task is not None),
+                return_exceptions=True,
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("function", [0, 6, 16, 0x83, 0x84])
+async def test_register_block_rejects_non_read_functions_without_sending(function) -> None:
+    sent = []
+    disconnected = asyncio.Event()
+
+    async def handle(reader, writer, rows):
+        writer.write(_identity_response())
+        await writer.drain()
+        sent.append(await reader.read())
+        disconnected.set()
+
+    async with _evidence_loopback(handle) as (client, rows):
+        with pytest.raises(ValueError, match="only Modbus read functions"):
+            await client.async_read_register_block(110, 1, function=function)
+        await asyncio.wait_for(disconnected.wait(), timeout=1)
+        transaction, = rows
+        assert transaction["ok"] is False
+        assert transaction["error"]["stage"] == "request"
+        assert transaction["error"]["type"] == "ValueError"
+        assert transaction["request"]["bytes_hex"] is None
+    assert sent == [b""]

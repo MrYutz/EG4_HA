@@ -40,26 +40,53 @@ created on the Trigo HA instance at `/eg4-data-logger` with title **EG4 Mother o
 All Data**. The dashboard template below is a portable raw-editor backup; maintain
 the live dashboard in HA.
 
-## Controller diagnostics: deployed
+## Independent local capture
 
-Read-only controller observations are deployed alongside the existing raw trace.
+The host-recorder release uses one local capture owner with an independent task
+for each device. Portal consumers read its snapshots instead of starting another
+collection round. A failed device or slow maintenance block cannot impose an
+all-role barrier, including when raw persistence is disabled. Installation is
+verified separately; these targets are not a claim of measured production rate.
+
+Every role reads dynamic evidence first, then at most one oldest-due maintenance
+block. Startup baselines are staggered between dynamic rounds. Read indices are
+zero-based, device-specific and read-only:
+
+| Role | Read profile | Target |
+| --- | --- | --- |
+| Each FlexBOSS | Input0/40,40/40,120/26 | Dynamic rounds, requested1s spacing |
+| GridBOSS | Input0/40,120/12,500/100 | Dynamic rounds, requested1s spacing |
+| Each FlexBOSS | Input80/40 BMS | Startup and5s |
+| Each FlexBOSS | Holding110/125 | Startup and60s; reused by baseline |
+| GridBOSS | Local holding4500/10 | Startup and5s |
+| Each FlexBOSS | Baseline holding0/20,20/90,235/102 plus latest110/125 | Startup and5min, staggered |
+| GridBOSS | Baseline holding0/20,20/90,110/125,235/88 and local2000/108 | Startup and5min, staggered |
+
+Cached blocks retain their original acquisition intervals and IDs. A failed
+baseline block is missing in current context; last-successful values remain
+separate and explicitly aged. A common round is not an atomic snapshot.
+Do not use exact FlexBOSS starts224/248, GridBOSS4516, undefined input132–499 or
+engineering1100. Safe ranges and caveats are in the
+[governing read profile](host-recorder-mvp-spec.md#fixed-read-profiles).
+
+The existing local-dongle diagnostic exposes compact `RecorderHealth` with
+session/build, per-role attempts/success/freshness, measured median/max spacing
+and missing/failed context. Its local updates continue during portal failures.
+The existing count retains its inverter-only meaning; health lists GridBOSS
+separately. No dashboard, entity ID or protection setting changes.
+
+Role notifications coalesce logger-state checkpoints without postponing an
+already-pending one-second save request. Transfer-change evidence retains the
+previous/current inferred states and explicitly marks intervening unknown
+coverage; the initial observation establishes a baseline, not a physical edge.
+
+### Historical controller capture
+
 Initial deployment was verified on2026-11-08. Historical November9 correction
-evidence is retained outside Git at
+evidence remains outside Git under
 `investigations/2026-11-08-firmware-reverse-engineering/capture-upgrade/README.md`;
-it is not evidence that the new host-recorder initiative has been deployed.
-The debounced AC-evidence logger remains separate; controller decision words are
-never debounced or labeled as physical contact transitions.
-
-Supplemental requests run in the existing role's polling lock, after successful
-primary telemetry has been cached, on trace-recording cycles only:
-
-| Role | Function | Start | Count | Evidence |
-|---|---|---:|---:|---|
-| FlexBOSS | 04 input | 40 | 40 | Faults62/63, true warnings60/61, derived77 |
-| FlexBOSS | 03 holding | 110 | 125 | Settings and controller readbacks through234 |
-| FlexBOSS | 04 input | 120 | 26 | Commands142/143 as raw context; limiter/state144/145 also trigger discrete observations |
-| GridBOSS | 04 input | 500 | 100 | Defined diagnostics including518/519 and command counters |
-| GridBOSS | 03 holding, local dongle wrapper | 4500 | 10 | Initialized GPIO/test-state output readback, not contact feedback |
+it is not proof that the new release is installed. Controller observations are
+not debounced and are never physical contact feedback.
 
 The existing GridBOSS frequency/context request is narrowed to input120/count12:
 only120–131 are defined by the recovered firmware. Old40-word traces remain
@@ -75,14 +102,13 @@ was not added. Historical native proof and live verification remain in the local
 research copy under `direct-session/README.md` and `capture-upgrade/README.md`;
 these reports and their raw evidence are not bundled with the integration.
 
-These are additional serialized network requests, not free background reads.
-Each diagnostic stage is limited to `min(client.timeout, 2.0)` seconds; multiple
-stages/blocks and roles can accumulate additional delay. Individual block
-`started_at`, `completed_at`, `duration_ms`, success/error and values are retained,
-along with whole-sample timing and any recorded sample gap. Actual cadence must
-be measured from those timestamps after deployment; **one-second sampling is not
-guaranteed**. A failed supplemental request leaves successful primary telemetry
-usable and records missing diagnostic values rather than substituting zeros.
+The earlier collector serialized these additional requests inside an all-role
+round, with supplemental stages capped at `min(client.timeout, 2.0)` seconds.
+The resulting timings below describe that collector, not the independent owner.
+Current records retain each block's `started_at`, `completed_at`, `duration_ms`,
+success/error and values plus whole-round timing/gaps. Measure actual cadence:
+**one-second sampling is not guaranteed**. Successful primary or partial raw
+evidence survives later supplemental failures; missing values are not zeros.
 
 The initial November8 post-deployment98-sample-per-role window measured median gaps about4.92s,
 maximum7.887s. All294 primary samples succeeded; eight supplemental blocks failed
@@ -109,9 +135,10 @@ state/quality are compared too; unresolved continuously changing input593 and
 GPIO594 are retained in emitted raw blocks but do not trigger observations.
 Restart begins a new baseline, not a synthetic physical transition.
 
-The regular profile does not poll GridBOSS holding18/24/37/38/170/226/2102.
-These were read separately as a timestamped configuration baseline; corresponding
-unpolled fields in controller observations remain null, not zero or current values.
+Historical regular profiles did not poll GridBOSS holding18/24/37/38/170/226/2102;
+those fields were null unless separately baselined. The new approved settings
+banks retain their actual acquisition references and age, not invented historical
+values or effective change times.
 
 Every emitted observation keeps full raw diagnostic blocks, primary telemetry
 context and their individual acquisition timestamps, without the unrelated HA
