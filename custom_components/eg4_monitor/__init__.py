@@ -1800,7 +1800,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 local_bms_sources[role] = {
                     "acquisition_id": acquisition["acquisition_id"],
                     "transaction_ids": list(acquisition["transaction_ids"][transaction_offset:]),
-                    "acquired_at": bms_at.isoformat(),
+                    "cached_at": bms_at.isoformat(),
                 }
                 record["bms_sampled"] = True
         bms_age = (
