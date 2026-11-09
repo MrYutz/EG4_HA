@@ -611,7 +611,7 @@ class ChargingSessionMachine:
         age = _seconds_between(now, self.last_acquired_at)
         return {
             "State": self.state,
-            "Active": self.state == "charging" and active is not None,
+            "Active": active is not None,
             "Quality": self.quality,
             "Source": self.source,
             "Provenance": "measured_power_inferred_session",

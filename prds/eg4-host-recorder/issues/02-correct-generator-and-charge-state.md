@@ -65,3 +65,12 @@ One green entry is sufficient; no layer-only PR. Existing approved seams: logger
 - Integrated green:63 focused logger/aggregation/discovery/normalization tests passed, Ruff passed, and Pyright on all four changed production modules reported0 errors.
 - Offline production-closure smoke used real loopback TCP, HomeAssistant/Store/coordinator, logger and optional trace writer. Both persistence-enabled and disabled runs preserved original source times/IDs, rejected cached repeats, retained partial missing-master/zero-slave totals and rejected an aged GridBOSS source window. Evidence: `/tmp/eg4-host-recorder/2.1-source-green.txt`. Time separation was controlled by an offline UTC clock, not a live wall-clock device stall. This is not full HA setup/coordinator proof; production loading remains EG4REC-06.
 - An additional public assertion confirms an interrupted partial charge session remains active/open. The temporary smoke script was removed after proof; results remain outside Git.
+
+### Review correction evidence
+
+Standards review of `50667ac` found no actionable new findings. Spec found that young caches concealed observed failures and that consecutive partial samples could report an open session inactive.
+
+- A strengthened public regression reproduced `Active=false` after two partial samples; activity now reflects the open session independently of instantaneous charging certainty, including restoration.
+- Primary success/failure is now tracked separately from retained last-good values/provenance. Failure is fed to the logger immediately, before BMS/diagnostic work or a subsequent success can hide the interruption.
+- Offline real-TCP/HA/logger/storage replay compared the `50667ac` producer with its correction in both persistence modes: old code ended a session at recovery, integrated0.001→0.003kWh across the failed observation, and omitted resumed-transfer uncertainty. Corrected code kept the session open, held energy at0.001kWh until a new endpoint, and emitted `intervening_unknown=true`. Evidence: `/tmp/eg4-host-recorder/2.1-continuity-red-green.txt`.
+- After corrections:63 focused tests, Ruff and Pyright0 errors passed. The temporary replay script was removed. No live outage, equipment write, or deployment was performed.

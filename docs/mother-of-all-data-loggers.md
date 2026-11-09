@@ -23,6 +23,9 @@ The integration now has a stateful logger for the local telemetry path:
   90-day/100-session bounded ledger.
 - Unknown or stale samples do not end an active charge session. The session remains
   open and is marked `interrupted`.
+  Session activity means an open session, even when instantaneous charging state
+  is unknown. A newly failed primary read interrupts continuity immediately;
+  a young last-good cache cannot conceal that failure or confirm recovery.
 - Unknown endpoints and restart gaps break energy-integration continuity and
   reset pending debounce/stop dwell. A resumed known sample establishes a new
   endpoint; it cannot integrate the preceding unobserved interval.

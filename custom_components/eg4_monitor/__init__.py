@@ -1603,10 +1603,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     gridboss_snapshot_source: dict[str, Any] | None = None
     gridboss_snapshot_sequence: int | None = None
     gridboss_snapshot_error: str | None = None
+    gridboss_primary_available = False
     gridboss_poll_lock = asyncio.Lock()
     local_snapshot_cache: dict[str, EG4LocalTelemetry] = {}
     local_snapshot_times: dict[str, datetime] = {}
     local_snapshot_sources: dict[str, dict[str, Any]] = {}
+    local_primary_available: dict[str, bool] = {}
     configured_local_roles = {
         role for role in role_map.values()
         if role in {"flexboss_master", "flexboss_slave"}
@@ -1696,6 +1698,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "MaxAgeSeconds": local_trace_max_age,
             "SampleAgesSeconds": ages,
             "StaleRoles": stale_roles,
+            "PrimaryAvailable": {
+                role: local_primary_available.get(role, False)
+                for role in configured_local_roles
+            },
             "MissingRoles": sorted(configured_local_roles - local_snapshot_cache.keys()),
             "Sources": {role: dict(source) for role, source in local_snapshot_sources.items()},
             "BMSSources": {
@@ -1731,6 +1737,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if gridboss_age is not None
             and gridboss_age <= local_trace_max_age
             and gridboss_snapshot_source is not None
+            and gridboss_primary_available
             else None
         )
         charge_role_context: dict[str, dict[str, Any]] = {}
@@ -1746,6 +1753,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     **source,
                     "available": (
                         process_charge and role in local_snapshots
+                        and local_primary_available.get(role, False)
                         and bool(source) and valid_power
                     ),
                     "acquisition_id": source.get("acquisition_id"),
@@ -1947,6 +1955,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "Local EG4 trace read failed for role %s (%s): %s",
                 role, dongle.host, err_local,
             )
+            local_primary_available[role] = False
+            # A failed observation breaks continuity even while the last good
+            # cache is young. Publish it before a later success can hide the gap.
+            await _process_logger_sample(
+                sequence=sequence, process_generator=False, process_charge=True
+            )
 
         # BMS is an independent scheduled acquisition, not conditional on decoding
         # the core. Its original transaction references survive cache reuse.
@@ -1995,6 +2009,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             local_snapshot_cache[role] = snapshot
             local_snapshot_times[role] = core_completed_at
             local_snapshot_sources[role] = core_source
+            local_primary_available[role] = True
             record.update({
                 "ok": True,
                 "telemetry": telemetry_to_record(snapshot),
@@ -2053,6 +2068,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         nonlocal gridboss_snapshot_cache, gridboss_snapshot_time
         nonlocal gridboss_snapshot_source
         nonlocal gridboss_snapshot_sequence, gridboss_snapshot_error
+        nonlocal gridboss_primary_available
         nonlocal gridboss_last_transfer_state
         if gridboss_dongle is None:
             return None
@@ -2086,6 +2102,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 gridboss_snapshot_time = datetime.fromisoformat(source["acquired_at"])
                 gridboss_snapshot_sequence = sequence
                 gridboss_snapshot_error = None
+                gridboss_primary_available = True
                 previous_state = gridboss_last_transfer_state
                 gridboss_last_transfer_state = snapshot.transfer_state
                 record_data.update(
@@ -2120,6 +2137,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "Direct GridBOSS telemetry read failed (%s): %s",
                     gridboss_dongle.host,
                     err_gridboss,
+                )
+                gridboss_primary_available = False
+                await _process_logger_sample(
+                    sequence=sequence, process_generator=True, process_charge=False
                 )
                 return None
             finally:
@@ -2162,6 +2183,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             local_snapshot_cache[role] = snapshot
             local_snapshot_sources[role] = source
             local_snapshot_times[role] = datetime.fromisoformat(source["acquired_at"])
+            local_primary_available[role] = True
             bms_source = _acquired_source(
                 role, ((4, 80, 40),), acquisition["acquisition_id"]
             )
@@ -2213,6 +2235,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         role,
                         dongle.host,
                         result,
+                    )
+                    local_primary_available[role] = False
+                    await _process_logger_sample(
+                        sequence=sequence, process_generator=False, process_charge=True
                     )
             return snapshots
 

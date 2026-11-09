@@ -267,6 +267,8 @@ def test_partial_zero_slave_keeps_session_interrupted_with_all_role_context() ->
         },
     )
     events = logger.process(partial)
+    partial = replace(partial, observed_at=BASE + timedelta(seconds=3), sequence=3)
+    events.extend(logger.process(partial))
     assert not any(event["event_type"] == EVENT_CHARGE_SESSION_ENDED for event in events)
     charging = logger.snapshot(partial.observed_at)["Charging"]
     assert charging["ChargePowerW"] is None
@@ -276,6 +278,9 @@ def test_partial_zero_slave_keeps_session_interrupted_with_all_role_context() ->
     assert charging["Active"] is True
     assert charging["RoleContext"] == partial.charge_role_context
     assert charging["LastSession"] is None
+    restored = EG4TelemetryLogger("entry")
+    assert restored.restore(logger.to_dict()) is True
+    assert restored.snapshot(partial.observed_at)["Charging"]["Active"] is True
 
 
 @pytest.mark.parametrize(
