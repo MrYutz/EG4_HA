@@ -5,8 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import struct
+from collections.abc import Awaitable, Callable, Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from typing import Any, TypeVar
+from uuid import uuid4
 
 PACKET_PREFIX = b"\xa1\x1a"
 PROTOCOL_VERSION = 1
@@ -22,6 +26,9 @@ _GRIDBOSS_COUNT = 40
 _GRIDBOSS_FREQUENCY_REGISTER = 120
 _GRIDBOSS_FREQUENCY_COUNT = 12
 _MAX_PACKET_SIZE = 4096
+_MAX_TRANSACTION_BYTES = 256 * 1024
+_TRACE_SCHEMA = "eg4_local_dongle_trace.v2"
+_Decoded = TypeVar("_Decoded")
 _VALID_STATUS_CODES = frozenset(
     {0x00, 0x04, 0x08, 0x0C, 0x10, 0x11, 0x14, 0x20, 0x28, 0x40, 0x80, 0xC0}
 )
@@ -326,16 +333,163 @@ def parse_dongle_frame(
     )
 
 
-async def _read_frame(reader: asyncio.StreamReader) -> bytes:
-    """Read one length-delimited A1/1A frame from a TCP stream."""
-    header = await reader.readexactly(6)
-    if header[:2] != PACKET_PREFIX:
-        raise DongleFrameError("stream did not start with an A1/1A frame")
-    advertised_length = struct.unpack("<H", header[4:6])[0]
-    packet_size = 6 + advertised_length
-    if packet_size > _MAX_PACKET_SIZE:
-        raise DongleFrameError("dongle advertised an oversized frame")
-    return header + await reader.readexactly(advertised_length)
+def _frame_evidence(
+    raw: bytes,
+    *,
+    dongle_serial: str | None,
+    inverter_serial: str | None,
+    function: int | None,
+    register: int | None,
+    count: int | None,
+) -> dict[str, Any]:
+    """Inspect obtainable fields independently; never authorize sensor use."""
+    validation = dict.fromkeys(
+        ("framing", "crc", "identity", "function", "range"), "not_evaluated"
+    )
+    evidence: dict[str, Any] = {
+        "bytes_hex": raw.hex(),
+        "values": None,
+        "validation": validation,
+        "semantic": "not_evaluated",
+        "classification": "partial",
+    }
+    if len(raw) < 6:
+        validation["framing"] = "failed"
+        return evidence
+    packet_size = 6 + struct.unpack_from("<H", raw, 4)[0]
+    framed = (
+        raw[:2] == PACKET_PREFIX
+        and 22 <= packet_size <= _MAX_PACKET_SIZE
+        and len(raw) == packet_size
+    )
+    data_length = struct.unpack_from("<H", raw, 18)[0] if len(raw) >= 20 else 0
+    framed = framed and packet_size == 20 + data_length and data_length >= 2
+    validation["framing"] = "passed" if framed else "failed"
+    if len(raw) >= 18:
+        evidence["observed_dongle_serial"] = _decode_ascii_serial(raw[8:18])
+    if len(raw) < 20:
+        return evidence
+    if data_length >= 2 and len(raw) >= 20 + data_length:
+        data_end = 20 + data_length - 2
+        validation["crc"] = (
+            "passed"
+            if compute_crc16(raw[20:data_end]) == struct.unpack_from("<H", raw, data_end)[0]
+            else "failed"
+        )
+    if raw[7] != TCP_FUNC_TRANSLATED or (
+        data_length == 256 and raw[20:22] == b"\xa5\xa5"
+    ):
+        validation["function"] = "failed"
+        evidence["classification"] = "history"
+        return evidence
+    # Layout inspection is deliberately independent of CRC/identity validity.
+    data = raw[20 : min(len(raw), 20 + max(0, data_length - 2))]
+    if len(data) >= 15 and data[1] in (MODBUS_READ_HOLDING, MODBUS_READ_INPUT):
+        offset = 1
+    elif len(data) >= 16 and data[2] in (MODBUS_READ_HOLDING, MODBUS_READ_INPUT):
+        offset = 2
+    elif data[:1] == b"\x01":
+        offset = 1
+    elif data[:2] == b"\x00\x01":
+        offset = 2
+    else:
+        return evidence
+    if len(data) < offset + 14:
+        return evidence
+    observed_dongle = _decode_ascii_serial(raw[8:18])
+    observed_inverter = _decode_ascii_serial(data[offset + 1 : offset + 11])
+    evidence["observed_inverter_serial"] = observed_inverter
+    validation["identity"] = (
+        "passed"
+        if observed_dongle
+        and observed_inverter
+        and (dongle_serial is None or observed_dongle == dongle_serial)
+        and (inverter_serial is None or observed_inverter == inverter_serial)
+        else "failed"
+    )
+    observed_function = data[offset]
+    validation["function"] = (
+        "passed"
+        if observed_function in (MODBUS_READ_HOLDING, MODBUS_READ_INPUT)
+        and (function is None or observed_function == function)
+        else "failed"
+    )
+    observed_register = struct.unpack_from("<H", data, offset + 11)[0]
+    byte_count = data[offset + 13]
+    payload = data[offset + 14 : offset + 14 + byte_count]
+    evidence["values"] = tuple(
+        struct.unpack_from("<H", payload, index)[0]
+        for index in range(0, len(payload) - 1, 2)
+    )
+    if register is not None or count is not None:
+        validation["range"] = (
+            "passed"
+            if (register is None or observed_register == register)
+            and (count is None or byte_count == 2 * count)
+            and len(payload) == byte_count
+            and byte_count % 2 == 0
+            else "failed"
+        )
+    evidence["classification"] = "unrelated"
+    return evidence
+
+
+class _DongleTrafficLimitError(DongleFrameError):
+    """The transaction exhausted its bounded received-traffic allowance."""
+
+
+async def _read_frame(
+    reader: asyncio.StreamReader,
+    transaction: dict[str, Any],
+    *,
+    dongle_serial: str | None,
+    inverter_serial: str | None,
+    function: int | None,
+    register: int | None,
+    count: int | None,
+) -> bytes:
+    """Retain every consumed byte, including interrupted headers and payloads."""
+    raw = bytearray()
+
+    async def receive(size: int) -> None:
+        while size:
+            remaining = _MAX_TRANSACTION_BYTES - transaction["received_bytes"]
+            if remaining <= 0:
+                transaction["truncated"] = True
+                raise _DongleTrafficLimitError("transaction received-traffic limit exhausted")
+            chunk = await reader.read(min(size, remaining))
+            if not chunk:
+                raise asyncio.IncompleteReadError(bytes(raw), len(raw) + size)
+            raw.extend(chunk)
+            transaction["received_bytes"] += len(chunk)
+            size -= len(chunk)
+
+    try:
+        await receive(6)
+        if raw[:2] != PACKET_PREFIX:
+            raise DongleFrameError("stream did not start with an A1/1A frame")
+        advertised_length = struct.unpack_from("<H", raw, 4)[0]
+        if 6 + advertised_length > _MAX_PACKET_SIZE:
+            transaction["truncated"] = True
+            raise DongleFrameError("dongle advertised an oversized frame")
+        await receive(advertised_length)
+        return bytes(raw)
+    finally:
+        if raw:
+            evidence = _frame_evidence(
+                bytes(raw),
+                dongle_serial=dongle_serial,
+                inverter_serial=inverter_serial,
+                function=function,
+                register=register,
+                count=count,
+            )
+            transaction["frames"].append(evidence)
+            for field in ("observed_dongle_serial", "observed_inverter_serial"):
+                if field in evidence:
+                    transaction[field] = evidence[field]
+            if evidence["validation"]["framing"] == "failed":
+                transaction["truncated"] = True
 
 
 def _bounded(value: float | int | None, lower: float, upper: float) -> float | None:
@@ -833,44 +987,242 @@ class EG4LocalDongle:
         inverter_serial: str | None = None,
         port: int = 8000,
         timeout: float = 5.0,
+        evidence_sink: Callable[[dict[str, Any]], Awaitable[object]] | None = None,
+        role: str = "unknown",
+        session_id: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
-        # The unsolicited first frame carries the inverter serial. Keeping
-        # this optional lets host-only configuration discover it while still
-        # allowing callers to pin a serial for route validation.
         self.inverter_serial = inverter_serial
         self.timeout = timeout
+        self.evidence_sink = evidence_sink
+        self.role = role
+        self.session_id = session_id or str(uuid4())
+        self._request_lock = asyncio.Lock()
+        self._capture_context: ContextVar[dict[str, Any] | None] = ContextVar(
+            f"eg4_capture_{id(self)}", default=None
+        )
+
+    @contextlib.contextmanager
+    def capture(self) -> Iterator[dict[str, Any]]:
+        """Group public reads, including wait_for child tasks, into one acquisition."""
+        acquisition: dict[str, Any] = {
+            "acquisition_id": str(uuid4()),
+            "transaction_ids": [],
+            "successful_transaction_ids": [],
+            "failed_transaction_ids": [],
+        }
+        token = self._capture_context.set(acquisition)
+        try:
+            yield acquisition
+        finally:
+            self._capture_context.reset(token)
+
+    @contextlib.contextmanager
+    def _acquisition(self) -> Iterator[dict[str, Any]]:
+        existing = self._capture_context.get()
+        if existing is not None:
+            yield existing
+        else:
+            with self.capture() as acquisition:
+                yield acquisition
+
+    async def _emit(self, record: dict[str, Any]) -> None:
+        if self.evidence_sink is not None:
+            # Recorder failures must not replace device errors or measurements.
+            # The queue-based writer owns loss/error accounting.
+            with contextlib.suppress(Exception):
+                await self.evidence_sink(record)
+
+    async def _interpret(
+        self,
+        transactions: tuple[dict[str, Any], ...],
+        decode: Callable[[], _Decoded],
+    ) -> _Decoded:
+        error = None
+        try:
+            result = decode()
+        except Exception as err:
+            error = {"type": type(err).__name__, "stage": "decode", "message": str(err)}
+            raise
+        finally:
+            for transaction in transactions:
+                interpretation = {
+                    "schema": _TRACE_SCHEMA,
+                    "kind": "interpretation",
+                    "session_id": transaction["session_id"],
+                    "role": transaction["role"],
+                    "acquisition_id": transaction["acquisition_id"],
+                    "transaction_id": transaction["transaction_id"],
+                    "started_at": transaction["started_at"],
+                    "completed_at": transaction["completed_at"],
+                    "duration_ms": transaction["duration_ms"],
+                    "semantic": "accepted" if error is None else "rejected",
+                    "error": error,
+                }
+                if error is None:
+                    await self._emit(interpretation)
+                else:
+                    with contextlib.suppress(BaseException):
+                        await self._emit(interpretation)
+        return result
+
+    async def _transaction(
+        self,
+        register: int | None,
+        count: int | None,
+        *,
+        function: int | None = None,
+        timeout: float | None = None,
+    ) -> tuple[DongleFrame, str, dict[str, Any]]:
+        """Serialize and journal one bounded identity/read attempt before returning."""
+        with self._acquisition() as acquisition:
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            deadline = started + (self.timeout if timeout is None else timeout)
+            transaction: dict[str, Any] = {
+                "schema": _TRACE_SCHEMA,
+                "kind": "transaction",
+                "session_id": self.session_id,
+                "role": self.role,
+                "acquisition_id": acquisition["acquisition_id"],
+                "transaction_id": str(uuid4()),
+                "host": self.host,
+                "port": self.port,
+                "configured_inverter_serial": self.inverter_serial,
+                "observed_dongle_serial": None,
+                "observed_inverter_serial": None,
+                "request": {
+                    "function": function, "register": register, "count": count,
+                    "bytes_hex": None,
+                },
+                "started_at": datetime.now(UTC).isoformat(),
+                "frames": [],
+                "ok": False,
+                "error": None,
+                "truncated": False,
+                "received_bytes": 0,
+            }
+            acquisition["transaction_ids"].append(transaction["transaction_id"])
+            stage = "lock"
+            writer: asyncio.StreamWriter | None = None
+            locked = False
+            failure: BaseException | None = None
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await self._request_lock.acquire()
+                    locked = True
+                    stage = "connect"
+                    reader, writer = await asyncio.open_connection(self.host, self.port)
+                    stage = "identity"
+                    while True:
+                        if loop.time() >= deadline:
+                            raise TimeoutError("transaction deadline exhausted during identity")
+                        initial = await _read_frame(
+                            reader, transaction, dongle_serial=None,
+                            inverter_serial=self.inverter_serial,
+                            function=None, register=None, count=None,
+                        )
+                        # Both native A5/A5 history inside translated envelopes
+                        # and other envelope functions may precede identity.
+                        evidence = transaction["frames"][-1]
+                        if evidence["classification"] == "history":
+                            if evidence["validation"]["framing"] != "passed":
+                                raise DongleFrameError("malformed unsolicited history framing")
+                            if evidence["validation"]["crc"] != "passed":
+                                raise DongleFrameError("unsolicited history CRC mismatch")
+                            continue
+                        detected = parse_dongle_frame(
+                            initial, expected_inverter_serial=self.inverter_serial
+                        )
+                        if not detected.dongle_serial or not detected.inverter_serial:
+                            raise DongleFrameError("dongle identity frame has empty serials")
+                        transaction["frames"][-1]["classification"] = "identity"
+                        break
+                    dongle_serial = detected.dongle_serial
+                    inverter_serial = self.inverter_serial or detected.inverter_serial
+                    transaction["observed_dongle_serial"] = dongle_serial
+                    transaction["observed_inverter_serial"] = detected.inverter_serial
+                    if register is None:
+                        self.inverter_serial = detected.inverter_serial
+                        transaction["ok"] = True
+                        return detected, dongle_serial, transaction
+                    assert count is not None and function is not None
+                    stage = "request"
+                    request = build_read_packet(
+                        dongle_serial=dongle_serial, inverter_serial=inverter_serial,
+                        register=register, count=count, function=function,
+                    )
+                    writer.write(request)
+                    transaction["request"]["bytes_hex"] = request.hex()
+                    await writer.drain()
+                    stage = "response"
+                    last_error: DongleFrameError | None = None
+                    while True:
+                        if loop.time() >= deadline:
+                            raise TimeoutError("transaction deadline exhausted during response")
+                        try:
+                            response = await _read_frame(
+                                reader, transaction, dongle_serial=dongle_serial,
+                                inverter_serial=inverter_serial, function=function,
+                                register=register, count=count,
+                            )
+                        except asyncio.IncompleteReadError as err:
+                            if not err.partial and last_error is not None:
+                                raise last_error from err
+                            raise
+                        try:
+                            parsed = parse_dongle_frame(
+                                response, expected_dongle_serial=dongle_serial,
+                                expected_inverter_serial=inverter_serial,
+                                expected_register=register, expected_count=count,
+                                expected_function=function,
+                            )
+                        except DongleFrameError as err:
+                            last_error = err
+                            continue
+                        transaction["frames"][-1]["classification"] = "matching"
+                        self.inverter_serial = parsed.inverter_serial
+                        transaction["ok"] = True
+                        return parsed, dongle_serial, transaction
+            except BaseException as err:
+                failure = err
+                transaction["error"] = {
+                    "type": type(err).__name__, "stage": stage, "message": str(err),
+                }
+                raise
+            finally:
+                outcome = (
+                    "successful_transaction_ids" if transaction["ok"]
+                    else "failed_transaction_ids"
+                )
+                acquisition[outcome].append(transaction["transaction_id"])
+                transaction["completed_at"] = datetime.now(UTC).isoformat()
+                transaction["duration_ms"] = (loop.time() - started) * 1000.0
+                try:
+                    if writer is not None:
+                        writer.close()
+                    if failure is None:
+                        await self._emit(transaction)
+                    else:
+                        # In particular, cancellation must retain acquired bytes
+                        # while the original CancelledError still propagates.
+                        with contextlib.suppress(BaseException):
+                            await self._emit(transaction)
+                    if writer is not None:
+                        with contextlib.suppress(Exception):
+                            await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
+                finally:
+                    if locked:
+                        self._request_lock.release()
 
     async def async_discover_identity(self) -> EG4LocalDongleIdentity:
-        """Read the unsolicited identity frame without sending a request."""
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(self.host, self.port),
-            timeout=self.timeout,
+        """Demultiplex unsolicited frames without sending a request."""
+        frame, dongle_serial, _ = await self._transaction(None, None)
+        return EG4LocalDongleIdentity(
+            host=self.host, port=self.port, dongle_serial=dongle_serial,
+            inverter_serial=frame.inverter_serial,
         )
-        try:
-            frame = await asyncio.wait_for(_read_frame(reader), timeout=self.timeout)
-            parsed = parse_dongle_frame(frame)
-            if not parsed.dongle_serial or not parsed.inverter_serial:
-                raise DongleFrameError("dongle identity frame has empty serials")
-            if (
-                self.inverter_serial is not None
-                and parsed.inverter_serial != self.inverter_serial
-            ):
-                raise DongleFrameError(
-                    "discovered inverter serial does not match the configured serial"
-                )
-            self.inverter_serial = parsed.inverter_serial
-            return EG4LocalDongleIdentity(
-                host=self.host,
-                port=self.port,
-                dongle_serial=parsed.dongle_serial,
-                inverter_serial=parsed.inverter_serial,
-            )
-        finally:
-            writer.close()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
 
     async def _read_registers(
         self,
@@ -879,134 +1231,72 @@ class EG4LocalDongle:
         *,
         function: int = MODBUS_READ_INPUT,
         timeout: float | None = None,
-    ) -> tuple[DongleFrame, str]:
-        """Read one range and return its validated frame plus detected serials."""
-        stage_timeout = self.timeout if timeout is None else timeout
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(self.host, self.port),
-            timeout=stage_timeout,
-        )
-        try:
-            initial = await asyncio.wait_for(_read_frame(reader), timeout=stage_timeout)
-            try:
-                detected = parse_dongle_frame(initial)
-                dongle_serial = detected.dongle_serial
-                detected_inverter_serial = detected.inverter_serial
-            except DongleFrameError:
-                dongle_serial = ""
-                detected_inverter_serial = ""
-            if not dongle_serial or not detected_inverter_serial:
-                raise DongleFrameError("dongle did not provide identifiable serials")
-
-            inverter_serial = self.inverter_serial or detected_inverter_serial
-            writer.write(
-                build_read_packet(
-                    dongle_serial=dongle_serial,
-                    inverter_serial=inverter_serial,
-                    register=register,
-                    count=count,
-                    function=function,
-                )
-            )
-            await asyncio.wait_for(writer.drain(), timeout=stage_timeout)
-            deadline = asyncio.get_running_loop().time() + stage_timeout
-            last_error: DongleFrameError | None = None
-            # The dongle can interleave unsolicited cached frames with the
-            # response to an active request. Keep reading until the requested
-            # range arrives instead of treating a valid-but-unrelated frame as
-            # a failed sample.
-            for _ in range(8):
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    break
-                response = await asyncio.wait_for(
-                    _read_frame(reader), timeout=remaining
-                )
-                try:
-                    parsed = parse_dongle_frame(
-                        response,
-                        expected_dongle_serial=dongle_serial,
-                        expected_inverter_serial=inverter_serial,
-                        expected_register=register,
-                        expected_count=count,
-                        expected_function=function,
-                    )
-                except DongleFrameError as err:
-                    last_error = err
-                    continue
-                # Preserve the auto-detected route for the second range. A
-                # configured serial was validated above and is retained unchanged.
-                self.inverter_serial = parsed.inverter_serial
-                return parsed, dongle_serial
-            if last_error is not None:
-                raise last_error
-            raise DongleFrameError(
-                f"no matching register response for {register} after request"
-            )
-        finally:
-            writer.close()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(
-                    writer.wait_closed(), timeout=min(stage_timeout, 0.5)
-                )
+    ) -> tuple[DongleFrame, str, dict[str, Any]]:
+        return await self._transaction(register, count, function=function, timeout=timeout)
 
     async def async_read_core_snapshot(self) -> EG4LocalTelemetry:
         """Read the fast core range used for second-level tracing."""
-        core, dongle_serial = await self._read_registers(_CORE_REGISTER, _CORE_COUNT)
-        return _decode_core_telemetry(
-            host=self.host,
-            port=self.port,
-            frame=core,
-            dongle_serial=dongle_serial,
-        )
+        with self._acquisition():
+            core, dongle_serial, transaction = await self._read_registers(
+                _CORE_REGISTER, _CORE_COUNT
+            )
+            return await self._interpret(
+                (transaction,),
+                lambda: _decode_core_telemetry(
+                    host=self.host, port=self.port, frame=core,
+                    dongle_serial=dongle_serial,
+                ),
+            )
 
     async def async_read_bms_snapshot(self) -> EG4LocalBMSData:
         """Read the slower BMS range independently from core telemetry."""
-        bms, dongle_serial = await self._read_registers(_BMS_REGISTER, _BMS_COUNT)
-        return _decode_bms_data(bms, dongle_serial)
+        with self._acquisition():
+            bms, dongle_serial, transaction = await self._read_registers(
+                _BMS_REGISTER, _BMS_COUNT
+            )
+            return await self._interpret(
+                (transaction,), lambda: _decode_bms_data(bms, dongle_serial)
+            )
 
     async def async_read_snapshot(self) -> EG4LocalTelemetry | EG4GridBossTelemetry:
         """Read core inverter values and the BMS diagnostic range."""
-        core = await self.async_read_core_snapshot()
-        bms = await self.async_read_bms_snapshot()
-        return merge_local_telemetry(core, bms)
+        with self._acquisition():
+            core = await self.async_read_core_snapshot()
+            bms = await self.async_read_bms_snapshot()
+            return merge_local_telemetry(core, bms)
 
     async def async_read_diagnostics(self) -> list[dict]:
         """Capture independent, read-only blocks without failing primary telemetry."""
-        blocks: list[dict] = []
-        loop = asyncio.get_running_loop()
-        for function, register, count in self._DIAGNOSTIC_RANGES:
-            started_at = datetime.now(UTC).isoformat()
-            started = loop.time()
-            block = {
-                "function": function,
-                "register": register,
-                "count": count,
-                "started_at": started_at,
-                "ok": False,
-                "values": None,
-            }
-            try:
-                frame, _ = await self._read_registers(
-                    register,
-                    count,
-                    function=function,
-                    timeout=min(self.timeout, 2.0),
-                )
-            except (
-                OSError,
-                asyncio.TimeoutError,
-                asyncio.IncompleteReadError,
-                DongleFrameError,
-            ) as err:
-                block["error"] = f"{type(err).__name__}: {err}"
-            else:
-                block["ok"] = True
-                block["values"] = frame.values
-            block["completed_at"] = datetime.now(UTC).isoformat()
-            block["duration_ms"] = (loop.time() - started) * 1000.0
-            blocks.append(block)
-        return blocks
+        with self._acquisition() as acquisition:
+            blocks: list[dict] = []
+            loop = asyncio.get_running_loop()
+            for function, register, count in self._DIAGNOSTIC_RANGES:
+                started = loop.time()
+                block: dict[str, Any] = {
+                    "function": function, "register": register, "count": count,
+                    "started_at": datetime.now(UTC).isoformat(),
+                    "acquisition_id": acquisition["acquisition_id"],
+                    "ok": False, "values": None,
+                }
+                transaction_index = len(acquisition["transaction_ids"])
+                try:
+                    frame, _, _ = await self._read_registers(
+                        register, count, function=function,
+                        timeout=min(self.timeout, 2.0),
+                    )
+                except (
+                    OSError, asyncio.TimeoutError, asyncio.IncompleteReadError,
+                    DongleFrameError,
+                ) as err:
+                    block["error"] = f"{type(err).__name__}: {err}"
+                else:
+                    block["ok"] = True
+                    block["values"] = frame.values
+                block["transaction_id"] = acquisition["transaction_ids"][transaction_index]
+                block["completed_at"] = datetime.now(UTC).isoformat()
+                block["duration_ms"] = (loop.time() - started) * 1000.0
+                blocks.append(block)
+            return blocks
 
 
 class EG4GridBossDongle(EG4LocalDongle):
@@ -1020,19 +1310,20 @@ class EG4GridBossDongle(EG4LocalDongle):
 
     async def async_read_snapshot(self) -> EG4GridBossTelemetry:
         """Read source/output power ranges and classify the observed transfer."""
-        input_frame, dongle_serial = await self._read_registers(
-            _GRIDBOSS_REGISTER, _GRIDBOSS_COUNT
-        )
-        frequency_frame, _ = await self._read_registers(
-            _GRIDBOSS_FREQUENCY_REGISTER, _GRIDBOSS_FREQUENCY_COUNT
-        )
-        return _decode_gridboss_telemetry(
-            host=self.host,
-            port=self.port,
-            dongle_serial=dongle_serial,
-            frame=input_frame,
-            frequency_frame=frequency_frame,
-        )
+        with self._acquisition():
+            input_frame, dongle_serial, input_transaction = await self._read_registers(
+                _GRIDBOSS_REGISTER, _GRIDBOSS_COUNT
+            )
+            frequency_frame, _, frequency_transaction = await self._read_registers(
+                _GRIDBOSS_FREQUENCY_REGISTER, _GRIDBOSS_FREQUENCY_COUNT
+            )
+            return await self._interpret(
+                (input_transaction, frequency_transaction),
+                lambda: _decode_gridboss_telemetry(
+                    host=self.host, port=self.port, dongle_serial=dongle_serial,
+                    frame=input_frame, frequency_frame=frequency_frame,
+                ),
+            )
 
 
 async def async_discover_dongles(

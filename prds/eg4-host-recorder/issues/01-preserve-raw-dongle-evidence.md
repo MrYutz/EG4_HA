@@ -68,3 +68,11 @@ Public seams and the full focused acceptance contract were approved during ticke
 - Green: 73 focused existing tests; after annotation changes, transport/trace34 tests, Pyright0 errors and Ruff passed. Evidence: `/tmp/eg4-host-recorder/baseline-verification.txt` (outside Git).
 - Two-axis review: Standards found two non-blocking existing catalogue/constants debts and a large-setup-closure smell; no additional annotation defect. Spec found two documentation hazards: prohibited equipment-manipulation instructions and links to unpublished supporting evidence. Both are corrected in this entry by passive/offline verification instructions and explicit external-retention labels.
 - These baseline maintainability debts do not widen the recorder initiative. No R1/R2 acceptance or production rollout is claimed; entry1.2 owns the correction. Merge evidence will be recorded before slice completion.
+
+### Stack progress
+
+- 1.1 remote head/base verified through GitHub REST: head `a1a3648f6f35dfafbda4b3172cb4ed69e3b95154`, base `main` at the recorded root; scoped41-file incremental diff inspected.
+- 1.1 merged as `d77222f5481683c897015db0a9bd1699b3017bcb`; GitHub reports the PR closed and merged. No production deployment.
+- 1.2 branch was created from the verified1.1 branch before implementation. Its PR initially targets that predecessor, then retargets `main` with the provider diff checked unchanged after the predecessor merge.
+- 1.2 red: TCP-to-filesystem regression `test_rejected_status_keeps_received_words_on_disk` fails before implementation because the evidence sink is unavailable. Evidence: `/tmp/eg4-host-recorder/1.2-red.txt`; earlier reproduced transport/lost-payload failures remain in the governing adversarial review.
+- Analyzer-only focused checks:3 subprocess CLI tests passed, Ruff passed, Pyright0 errors. A genuine, unmodified legacy trace copied off HA contains5118 records covering2026-11-09 19:48:12.670–21:49:40.023 UTC; the streaming CLI reported all three roles and8 acquisition failures without inventing telemetry or session identities. Copy and measured storage throughput remain outside Git under `/tmp/eg4-host-recorder/`.

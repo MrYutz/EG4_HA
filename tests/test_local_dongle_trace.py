@@ -60,7 +60,7 @@ async def test_trace_writer_writes_jsonl_without_secrets(tmp_path) -> None:
     lines = path.read_text().splitlines()
     assert len(lines) == 1
     decoded = json.loads(lines[0])
-    assert decoded["schema"] == "eg4_local_dongle_trace.v1"
+    assert decoded["schema"] == "eg4_local_dongle_trace.v2"
     assert decoded["telemetry"]["core"]["charge_power_w"] == 3000.0
     assert "password" not in lines[0].lower()
     assert "token" not in lines[0].lower()

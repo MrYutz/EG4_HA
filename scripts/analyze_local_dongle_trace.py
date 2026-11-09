@@ -1,151 +1,281 @@
 #!/usr/bin/env python3
-"""Summarize an EG4 local-dongle JSONL trace."""
+"""Stream a historical or raw-evidence EG4 local-dongle JSONL file."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import statistics
+import math
 from collections import Counter
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 
-def _values(rows: list[dict[str, Any]], key: str) -> list[float]:
-    values: list[float] = []
-    for row in rows:
-        value = row.get("telemetry", {}).get("core", {}).get(key)
-        if isinstance(value, (int, float)):
-            values.append(float(value))
-    return values
+def _mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
-def _print_gridboss(rows: list[dict[str, Any]]) -> None:
-    """Summarize direct GridBOSS source and transfer observations."""
-    valid = [row for row in rows if row.get("ok") and row.get("telemetry")]
-    errors = [row for row in rows if not row.get("ok")]
-    print(f"[gridboss] rows={len(rows)} valid={len(valid)} errors={len(errors)}")
-    if not valid:
-        return
-    states = Counter(
-        row["telemetry"].get("transfer", {}).get("state", "unknown")
-        for row in valid
+def _interval(row: dict[str, Any]) -> tuple[Any, Any]:
+    return (
+        row.get("started_at") or row.get("sample_started_at"),
+        row.get("completed_at") or row.get("sample_completed_at"),
     )
-    transitions = [
-        row["transfer_transition"]
-        for row in valid
-        if row.get("transfer_transition")
-    ]
-    print(f"  transfer_states={dict(states)}")
-    print(f"  transitions={len(transitions)}")
-    for row in valid:
+
+
+def _timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _context(row: dict[str, Any]) -> str:
+    start, end = _interval(row)
+    return (
+        f"role={row.get('role', 'unknown')} "
+        f"session={row.get('session_id') or 'unavailable'} "
+        f"acquisition={row.get('acquisition_id') or 'unavailable'} "
+        f"transaction={row.get('transaction_id') or 'unavailable'} "
+        f"start={start or 'unavailable'} end={end or 'unavailable'}"
+    )
+
+
+def _event(name: str, row: dict[str, Any], **details: Any) -> None:
+    print(f"  {name} {_context(row)} details={json.dumps(details, sort_keys=True)}")
+
+
+@dataclass
+class NumericSummary:
+    """Retain constant-space statistics, never all samples or trace rows."""
+
+    count: int = 0
+    total: float = 0
+    minimum: float = math.inf
+    maximum: float = -math.inf
+    latest: float = 0
+
+    def add(self, value: Any) -> None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return
+        if not math.isfinite(value):
+            return
+        self.count += 1
+        self.total += value
+        self.minimum = min(self.minimum, value)
+        self.maximum = max(self.maximum, value)
+        self.latest = value
+
+    def report(self, name: str) -> None:
+        if self.count:
+            print(
+                f"  {name}=min:{self.minimum:.3f} avg:{self.total / self.count:.3f} "
+                f"max:{self.maximum:.3f} latest:{self.latest:.3f} n:{self.count}"
+            )
+        else:
+            print(f"  {name}=unavailable n:0")
+
+
+@dataclass
+class RoleSummary:
+    rows: int = 0
+    valid: int = 0
+    errors: int = 0
+    core_samples: int = 0
+    transaction_failures: int = 0
+    partial_transactions: int = 0
+    rejections: int = 0
+    transitions: int = 0
+    kinds: Counter = field(default_factory=Counter)
+    statuses: Counter = field(default_factory=Counter)
+    transfer_states: Counter = field(default_factory=Counter)
+    numbers: dict[str, NumericSummary] = field(default_factory=lambda: {
+        name: NumericSummary()
+        for name in ("gap_s", "duration_ms", "charge_w", "discharge_w")
+    })
+    first: datetime | None = None
+    last: datetime | None = None
+    previous_session: str | None = None
+    previous_end: datetime | None = None
+    status: Any = None
+    status_start: dict[str, Any] | None = None
+    status_end: Any = None
+
+    def _close_status(self) -> None:
+        if self.status_start is not None:
+            _event(
+                "status_run=", self.status_start, status=self.status,
+                observed_through=self.status_end,
+                core=self.status_start["telemetry"]["core"],
+            )
+        self.status_start = None
+        self.status = None
+
+    def observe(self, row: dict[str, Any]) -> None:
+        self.rows += 1
+        kind = row.get("kind") or "historical"
+        self.kinds[kind] += 1
+        self.errors += row.get("ok") is False
+        start, end = _interval(row)
+        start_time, end_time = _timestamp(start), _timestamp(end)
+        if start_time is not None and (self.first is None or start_time < self.first):
+            self.first = start_time
+        if end_time is not None and (self.last is None or end_time > self.last):
+            self.last = end_time
+        session = row.get("session_id") or "unavailable"
+        if session != self.previous_session:
+            self._close_status()
+            if self.previous_session is None:
+                _event("session_start", row)
+            else:
+                gap = (
+                    (start_time - self.previous_end).total_seconds()
+                    if start_time is not None and self.previous_end is not None else None
+                )
+                _event(
+                    "session_change", row, previous_session=self.previous_session,
+                    observation_gap_s=gap, continuity="unknown",
+                )
+            self.previous_session = session
+            self.previous_end = None
+        if end_time is not None:
+            self.previous_end = max(self.previous_end, end_time) if self.previous_end else end_time
+
+        if kind == "transaction":
+            frames = row.get("frames") or []
+            partial = bool(row.get("truncated")) or any(
+                frame.get("partial") is True or (
+                    bool(frame.get("bytes_hex")) and frame.get("values") is None
+                    and _mapping(frame.get("validation")).get("framing") != "passed"
+                )
+                for frame in frames
+            )
+            failed = row.get("ok") is False
+            self.transaction_failures += failed
+            self.partial_transactions += partial
+            if failed or partial:
+                self._close_status()
+                _event(
+                    "transaction_failed" if failed else "transaction_partial", row,
+                    request=row.get("request"), error=row.get("error"),
+                    received_bytes=row.get("received_bytes"),
+                    truncated=row.get("truncated", False), partial=partial, frames=frames,
+                )
+            return
+        if kind == "interpretation":
+            if row.get("semantic") == "rejected":
+                self.rejections += 1
+                self._close_status()
+                _event("semantic_rejected", row, error=row.get("error"))
+            return
+        if kind not in ("acquisition", "historical"):
+            return
+
+        self.numbers["gap_s"].add(row.get("sample_gap_seconds"))
+        self.numbers["duration_ms"].add(row.get("duration_ms"))
+        if row.get("partial"):
+            _event("acquisition_partial", row, transaction_ids=row.get("transaction_ids"))
+        if row.get("ok") is not True:
+            self._close_status()
+            _event("acquisition_failed", row, error=row.get("error"))
+            return
+        telemetry = _mapping(row.get("telemetry"))
+        if not telemetry:
+            self._close_status()
+            return
+        self.valid += 1
+        core = _mapping(telemetry.get("core"))
+        if core:
+            self.core_samples += 1
+            self.numbers["charge_w"].add(core.get("charge_power_w"))
+            self.numbers["discharge_w"].add(core.get("discharge_power_w"))
+            status = core.get("status_code")
+            if status is not None:
+                self.statuses[status] += 1
+            if status != self.status or status is None:
+                self._close_status()
+            if status is not None and self.status_start is None:
+                # Only one compact decoded observation is retained for the current run.
+                self.status_start = {
+                    key: row[key] for key in (
+                        "role", "session_id", "acquisition_id", "started_at", "completed_at",
+                        "sample_started_at", "sample_completed_at", "written_at",
+                    ) if key in row
+                }
+                self.status_start["telemetry"] = {"core": {
+                    key: core.get(key) for key in (
+                        "charge_power_w", "grid_voltage_v", "grid_frequency_hz",
+                        "eps_voltage_r_v", "eps_frequency_hz",
+                    )
+                }}
+                self.status = status
+            self.status_end = end or row.get("written_at") or "unavailable"
+        transfer = _mapping(telemetry.get("transfer"))
+        if transfer:
+            self.transfer_states[transfer.get("state") or "unknown"] += 1
         transition = row.get("transfer_transition")
         if transition:
-            decoded = row["telemetry"].get("decoded", {})
-            print(
-                "  transition="
-                f"{row.get('written_at')} {transition.get('from')} -> "
-                f"{transition.get('to')} grid_v:{decoded.get('grid_voltage_v')} "
-                f"grid_hz:{decoded.get('grid_frequency_hz')} "
-                f"gen_v:{decoded.get('generator_voltage_v')} "
-                f"gen_hz:{decoded.get('generator_frequency_hz')} "
-                f"gen_w:{decoded.get('generator_power_w')} "
-                f"ups_v:{decoded.get('ups_voltage_v')} "
-                f"ups_w:{decoded.get('ups_power_w')}"
+            self.transitions += 1
+            _event(
+                "transfer_observation", row, transition=transition,
+                decoded=telemetry.get("decoded"),
             )
 
-
-def _print_role(role: str, rows: list[dict[str, Any]]) -> None:
-    valid = [row for row in rows if row.get("ok") and row.get("telemetry")]
-    errors = [row for row in rows if not row.get("ok")]
-    print(f"[{role}] rows={len(rows)} valid={len(valid)} errors={len(errors)}")
-    if not valid:
-        return
-
-    gaps = [
-        float(row["sample_gap_seconds"])
-        for row in rows
-        if isinstance(row.get("sample_gap_seconds"), (int, float))
-    ]
-    durations = [
-        float(row["duration_ms"])
-        for row in rows
-        if isinstance(row.get("duration_ms"), (int, float))
-    ]
-    charge = _values(valid, "charge_power_w")
-    discharge = _values(valid, "discharge_power_w")
-    statuses = Counter(
-        row["telemetry"]["core"].get("status_code") for row in valid
-    )
-    if gaps:
+    def report(self, role: str) -> None:
+        self._close_status()
+        print(f"[{role}] rows={self.rows} valid={self.valid} errors={self.errors}")
+        print(f"  kinds={dict(sorted(self.kinds.items()))}")
         print(
-            "  gap_s="
-            f"min:{min(gaps):.3f} median:{statistics.median(gaps):.3f} "
-            f"max:{max(gaps):.3f}"
+            f"  coverage_start={self.first.isoformat() if self.first else 'unavailable'} "
+            f"coverage_end={self.last.isoformat() if self.last else 'unavailable'}"
         )
-    if durations:
         print(
-            "  duration_ms="
-            f"min:{min(durations):.1f} median:{statistics.median(durations):.1f} "
-            f"max:{max(durations):.1f}"
+            f"  transaction_failures={self.transaction_failures} "
+            f"partial_transactions={self.partial_transactions} "
+            f"semantic_rejections={self.rejections}"
         )
-    print(f"  status_counts={dict(statuses)}")
-    print(
-        "  charge_w="
-        f"min:{min(charge):.0f} avg:{statistics.mean(charge):.0f} "
-        f"max:{max(charge):.0f} latest:{charge[-1]:.0f}"
-    )
-    print(
-        "  discharge_w="
-        f"min:{min(discharge):.0f} avg:{statistics.mean(discharge):.0f} "
-        f"max:{max(discharge):.0f} latest:{discharge[-1]:.0f}"
-    )
-
-    previous_status: object = object()
-    run_start: dict[str, Any] | None = None
-    for row in valid + [None]:
-        status = (
-            row["telemetry"]["core"].get("status_code") if row is not None else None
-        )
-        if run_start is None:
-            run_start = row
-            previous_status = status
-            continue
-        if status == previous_status:
-            continue
-        core = run_start["telemetry"]["core"]
-        print(
-            "  status_run="
-            f"{previous_status} start:{run_start.get('written_at')} "
-            f"end:{row.get('written_at') if row else valid[-1].get('written_at')} "
-            f"charge_w:{core.get('charge_power_w')} "
-            f"grid_v:{core.get('grid_voltage_v')} "
-            f"grid_hz:{core.get('grid_frequency_hz')} "
-            f"eps_v:{core.get('eps_voltage_r_v')} "
-            f"eps_hz:{core.get('eps_frequency_hz')}"
-        )
-        run_start = row
-        previous_status = status
+        if self.kinds["historical"] or self.kinds["acquisition"]:
+            self.numbers["gap_s"].report("gap_s")
+            self.numbers["duration_ms"].report("duration_ms")
+        if self.core_samples:
+            print(f"  status_counts={dict(self.statuses)}")
+            self.numbers["charge_w"].report("charge_w")
+            self.numbers["discharge_w"].report("discharge_w")
+        if self.transfer_states:
+            print(f"  transfer_states={dict(self.transfer_states)}")
+            print(f"  transitions={self.transitions}")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("trace", type=Path)
-    parser.add_argument("--role", action="append")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("trace", type=Path, help="single JSONL evidence file (read-only)")
+    parser.add_argument("--role", action="append", help="include only this role; repeatable")
     args = parser.parse_args()
-
-    rows = [
-        json.loads(line)
-        for line in args.trace.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    roles = args.role or sorted({row.get("role") for row in rows if row.get("role")})
-    for role in roles:
-        matching = [row for row in rows if row.get("role") == role]
-        if role == "gridboss":
-            _print_gridboss(matching)
-        else:
-            _print_role(role, matching)
+    summaries: dict[str, RoleSummary] = {}
+    print("Evidence observations only; raw/rejected words are not decoded telemetry.")
+    print("Acquisition intervals are host observations, not engine state or physical contacts.")
+    with args.trace.open(encoding="utf-8") as trace:
+        for line_number, line in enumerate(trace, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                parser.exit(2, f"{args.trace}:{line_number}: invalid JSON: {error.msg}\n")
+            if not isinstance(row, dict):
+                parser.exit(2, f"{args.trace}:{line_number}: expected a JSON object\n")
+            role = row.get("role") or "unknown"
+            if args.role and role not in args.role:
+                continue
+            if role not in summaries:
+                summaries[role] = RoleSummary()
+            summaries[role].observe(row)
+    for role in sorted(summaries):
+        summaries[role].report(role)
     return 0
 
 
