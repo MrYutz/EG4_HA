@@ -31,6 +31,13 @@
    - Password
 5. Click "Submit"
 
+Auto-discovery is enabled by default. After login, the integration probes
+private/local IP addresses reported by the portal and then falls back to a
+bounded scan of Home Assistant's enabled local IPv4 networks. Leave the local
+FlexBOSS host fields blank to use discovery. Configure a role-specific manual
+host only when discovery cannot reach that network segment; then reload the
+integration after changing network or dongle addresses.
+
 ## Troubleshooting
 
 ### Common Issues

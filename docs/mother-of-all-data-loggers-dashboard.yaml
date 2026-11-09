@@ -1,0 +1,309 @@
+# Lovelace raw-editor template for HA UI/storage mode.
+# Paste this into the dashboard raw editor; do not register this file under
+# lovelace.dashboards unless the deployment is intentionally changed to YAML mode.
+views:
+  - title: EG4 Overview
+    path: eg4-overview
+    type: masonry
+    cards:
+      - type: markdown
+        title: EG4 Mother of All Data Loggers
+        content: >-
+          Live generator state is inferred from fresh GridBOSS terminal AC
+          evidence. Transfer labels are observations/candidates, not relay
+          contact proof. Portal/local-inverter SOC values marked unverified
+          must not drive protection automations.
+      - type: entities
+        title: Site Health
+        entities:
+          - entity: binary_sensor.eg4_site_eg4_data_stale
+          - entity: binary_sensor.eg4_site_inverter_lost
+          - entity: sensor.eg4_site_grid_quality_state
+          - entity: binary_sensor.eg4_site_grid_outage_active
+          - entity: binary_sensor.eg4_site_grid_brownout_active
+          - entity: binary_sensor.uncleared_error_active
+          - entity: sensor.uncleared_error_count
+          - entity: sensor.eg4_site_local_eg4_dongles_available
+      - type: entities
+        title: Generator and Charging Now
+        entities:
+          - entity: sensor.eg4_site_generator_run_state
+          - entity: binary_sensor.eg4_site_generator_gridboss_ac_present
+          - entity: binary_sensor.eg4_site_generator_gridboss_supplying
+          - entity: binary_sensor.eg4_site_generator_gridboss_state_unknown
+          - entity: sensor.eg4_site_charge_session_state
+          - entity: binary_sensor.eg4_site_battery_charge_session_active
+          - entity: binary_sensor.eg4_site_battery_charge_session_interrupted
+      - type: grid
+        title: Live Power
+        columns: 3
+        square: false
+        cards:
+          - type: tile
+            entity: sensor.solar_power
+          - type: tile
+            entity: sensor.grid_power
+          - type: tile
+            entity: sensor.load_power
+          - type: tile
+            entity: sensor.battery_power
+          - type: tile
+            entity: sensor.eps_power
+          - type: tile
+            entity: sensor.battery_power_direction
+      - type: markdown
+        title: SOC trust
+        content: >-
+          The gauge below uses only the canonical, structurally validated SOC.
+          It may be unavailable when local BMS evidence is absent; portal and
+          local-inverter SOC cards are explicitly unverified alternatives.
+      - type: gauge
+        entity: sensor.battery_state_of_charge
+        name: Verified Battery SOC
+        min: 0
+        max: 100
+        severity:
+          green: 50
+          yellow: 25
+          red: 0
+      - type: entities
+        title: Battery Summary
+        entities:
+          - entity: sensor.battery_state_of_charge
+          - entity: sensor.battery_energy_remaining
+          - entity: sensor.eg4_site_battery_estimated_runtime
+          - entity: sensor.battery_voltage
+          - entity: sensor.eg4_site_battery_current
+          - entity: sensor.battery_power
+          - entity: sensor.battery_power_direction
+
+  - title: Generator and Charging
+    path: eg4-generator-charging
+    type: masonry
+    cards:
+      - type: entities
+        title: GridBOSS AC State Machine
+        entities:
+          - entity: sensor.eg4_site_generator_run_state
+          - entity: sensor.eg4_site_generator_presence_state
+          - entity: sensor.eg4_site_generator_supply_state
+          - entity: sensor.eg4_site_generator_state_quality
+          - entity: sensor.eg4_site_generator_state_confidence
+          - entity: sensor.eg4_site_generator_run_duration
+          - entity: sensor.eg4_site_generator_last_transition
+          - entity: sensor.eg4_site_generator_last_on
+          - entity: sensor.eg4_site_generator_last_off
+          - entity: sensor.eg4_site_generator_last_transition_reason
+      - type: entities
+        title: Generator Terminal Measurements
+        entities:
+          - entity: sensor.eg4_site_gridboss_generator_voltage
+          - entity: sensor.eg4_site_gridboss_generator_frequency
+          - entity: sensor.eg4_site_gridboss_generator_power
+          - entity: sensor.eg4_site_gridboss_generator_current
+          - entity: sensor.eg4_site_gridboss_transfer_observation
+          - entity: sensor.eg4_site_gridboss_ups_voltage
+          - entity: sensor.eg4_site_gridboss_ups_power
+      - type: history-graph
+        title: Generator / UPS / Grid Evidence (24h)
+        hours_to_show: 24
+        entities:
+          - entity: sensor.eg4_site_gridboss_generator_voltage
+          - entity: sensor.eg4_site_gridboss_generator_power
+          - entity: sensor.eg4_site_gridboss_ups_voltage
+          - entity: sensor.eg4_site_gridboss_ups_power
+          - entity: sensor.eg4_site_gridboss_grid_voltage
+      - type: entities
+        title: Charging Session Ledger
+        entities:
+          - entity: sensor.eg4_site_charge_session_state
+          - entity: sensor.eg4_site_charge_session_quality
+          - entity: sensor.eg4_site_charge_session_source
+          - entity: sensor.eg4_site_charge_session_duration
+          - entity: sensor.eg4_site_charge_session_start
+          - entity: sensor.eg4_site_last_charge_session_start
+          - entity: sensor.eg4_site_last_charge_session_end
+          - entity: sensor.eg4_site_last_charge_session_duration
+          - entity: sensor.eg4_site_charge_session_count
+          - entity: sensor.eg4_site_charge_session_energy_estimated
+          - entity: binary_sensor.eg4_site_battery_charge_session_active
+          - entity: binary_sensor.eg4_site_battery_charge_session_interrupted
+      - type: history-graph
+        title: Charging Power and Session State (7d)
+        hours_to_show: 168
+        entities:
+          - entity: sensor.eg4_site_battery_charging_power_local_dongle
+          - entity: sensor.battery_charging_power
+          - entity: sensor.eg4_site_charge_session_state
+          - entity: binary_sensor.eg4_site_battery_charge_session_active
+
+  - title: Battery and BMS
+    path: eg4-battery-bms
+    type: masonry
+    cards:
+      - type: markdown
+        title: Optional local telemetry
+        content: >-
+          Local BMS values are available only when a compatible local dongle is
+          discovered and fresh. Unavailable cards indicate that the source is
+          absent or stale, not zero.
+      - type: entities
+        title: BMS Measurements
+        entities:
+          - entity: binary_sensor.eg4_site_battery_local_bms_available
+          - entity: sensor.eg4_site_battery_soc_local_bms
+          - entity: sensor.eg4_site_battery_local_bms_current
+          - entity: sensor.eg4_site_battery_capacity_local_bms
+          - entity: sensor.eg4_site_battery_local_pack_count
+          - entity: sensor.eg4_site_battery_local_maximum_cell_voltage
+          - entity: sensor.eg4_site_battery_local_minimum_cell_voltage
+          - entity: sensor.eg4_site_battery_maximum_cell_temperature_local_bms
+          - entity: sensor.eg4_site_battery_minimum_cell_temperature_local_bms
+          - entity: sensor.eg4_site_battery_local_cycle_count
+          - entity: sensor.eg4_site_battery_voltage_spread
+      - type: entities
+        title: Battery Trust and Protection
+        entities:
+          - entity: sensor.battery_state_of_charge
+          - entity: sensor.eg4_site_battery_portal_soc_unverified
+          - entity: sensor.eg4_site_battery_soc_local_inverter_unverified
+          - entity: sensor.eg4_site_battery_soh_local_inverter_unverified
+          - entity: binary_sensor.eg4_site_battery_soc_voltage_mismatch
+          - entity: binary_sensor.eg4_site_battery_critical_voltage
+          - entity: binary_sensor.eg4_site_battery_imbalance_detected
+          - entity: binary_sensor.eg4_site_battery_bms_charging_allowed
+          - entity: binary_sensor.eg4_site_battery_bms_discharging_allowed
+          - entity: binary_sensor.eg4_site_battery_bms_force_charge
+      - type: history-graph
+        title: Battery Voltage, SOC, and Power (7d)
+        hours_to_show: 168
+        entities:
+          - entity: sensor.battery_state_of_charge
+          - entity: sensor.battery_voltage
+          - entity: sensor.eg4_site_battery_voltage_local
+          - entity: sensor.battery_power
+          - entity: sensor.eg4_site_battery_power_local_dongle
+      - type: entities
+        title: Battery Energy Counters
+        entities:
+          - entity: sensor.battery_charging_energy_estimated
+          - entity: sensor.battery_discharging_energy_estimated
+          - entity: sensor.eg4_site_battery_charge_today
+          - entity: sensor.eg4_site_battery_discharge_today
+          - entity: sensor.eg4_site_battery_charge_total
+          - entity: sensor.eg4_site_battery_discharge_total
+
+  - title: Grid and Transfer
+    path: eg4-grid-transfer
+    type: masonry
+    cards:
+      - type: entities
+        title: GridBOSS Terminals
+        entities:
+          - entity: sensor.eg4_site_gridboss_grid_voltage
+          - entity: sensor.eg4_site_gridboss_grid_frequency
+          - entity: sensor.eg4_site_gridboss_generator_voltage
+          - entity: sensor.eg4_site_gridboss_generator_frequency
+          - entity: sensor.eg4_site_gridboss_generator_power
+          - entity: sensor.eg4_site_gridboss_generator_current
+          - entity: sensor.eg4_site_gridboss_ups_voltage
+          - entity: sensor.eg4_site_gridboss_ups_power
+          - entity: sensor.eg4_site_gridboss_transfer_observation
+      - type: entities
+        title: FlexBOSS Terminals
+        entities:
+          - entity: sensor.eg4_site_flexboss_local_ac_input_voltage
+          - entity: sensor.eg4_site_flexboss_local_ac_input_frequency
+          - entity: sensor.eg4_site_flexboss_local_eps_voltage
+          - entity: sensor.eg4_site_flexboss_local_eps_frequency
+          - entity: sensor.eg4_site_flexboss_local_eps_power
+      - type: history-graph
+        title: Source Acceptance Correlation (24h)
+        hours_to_show: 24
+        entities:
+          - entity: sensor.eg4_site_gridboss_grid_voltage
+          - entity: sensor.eg4_site_gridboss_generator_voltage
+          - entity: sensor.eg4_site_gridboss_ups_voltage
+          - entity: sensor.eg4_site_flexboss_local_ac_input_voltage
+          - entity: sensor.eg4_site_flexboss_local_eps_voltage
+      - type: entities
+        title: Grid Quality
+        entities:
+          - entity: sensor.eg4_site_grid_quality_state
+          - entity: sensor.grid_voltage
+          - entity: sensor.grid_frequency
+          - entity: sensor.grid_outage_duration_24h
+          - entity: sensor.eg4_site_grid_outage_count_24h
+          - entity: sensor.eg4_site_grid_brownout_count_24h
+          - entity: binary_sensor.eg4_site_grid_outage_active
+          - entity: binary_sensor.eg4_site_grid_brownout_active
+
+  - title: Energy and Diagnostics
+    path: eg4-energy-diagnostics
+    type: masonry
+    cards:
+      - type: entities
+        title: Today
+        entities:
+          - entity: sensor.today_solar_yield
+          - entity: sensor.today_usage
+          - entity: sensor.today_export
+          - entity: sensor.ups_usage_today
+          - entity: sensor.eg4_site_battery_charge_today
+          - entity: sensor.eg4_site_battery_discharge_today
+      - type: entities
+        title: Lifetime
+        entities:
+          - entity: sensor.total_solar_yield
+          - entity: sensor.total_usage
+          - entity: sensor.total_export
+          - entity: sensor.ups_usage_total
+          - entity: sensor.eg4_site_battery_charge_total
+          - entity: sensor.eg4_site_battery_discharge_total
+          - entity: sensor.eg4_site_total_co2_reduction
+          - entity: sensor.eg4_site_total_coal_reduction
+      - type: history-graph
+        title: Site Power (7d)
+        hours_to_show: 168
+        entities:
+          - entity: sensor.solar_power
+          - entity: sensor.grid_power
+          - entity: sensor.load_power
+          - entity: sensor.battery_power
+          - entity: sensor.eps_power
+      - type: entities
+        title: Device and Trace Diagnostics
+        entities:
+          - entity: sensor.eg4_device_count
+          - entity: sensor.eg4_site_inverter_status
+          - entity: sensor.eg4_site_inverter_model
+          - entity: sensor.eg4_site_inverter_firmware
+          - entity: sensor.eg4_site_inverter_ac_power
+          - entity: sensor.eg4_site_inverter_rectifier_power
+          - entity: sensor.eg4_site_inverter_inner_temperature
+          - entity: sensor.eg4_site_radiator_1_temperature
+          - entity: sensor.eg4_site_radiator_2_temperature
+          - entity: sensor.eg4_site_environment_temperature
+          - entity: sensor.eg4_site_local_eg4_dongles_available
+          - entity: binary_sensor.eg4_site_eg4_data_stale
+          - entity: binary_sensor.uncleared_error_active
+          - entity: sensor.uncleared_error_count
+          - entity: sensor.uncleared_error_summary
+      - type: markdown
+        title: Optional fuel telemetry
+        content: >-
+          Fuel cards are populated only when diesel telemetry is configured and
+          fresh. An unavailable fuel card means no trustworthy fuel sample was
+          supplied.
+      - type: entities
+        title: Fuel and Generator Health
+        entities:
+          - entity: sensor.eg4_site_diesel_fuel_level
+          - entity: sensor.eg4_site_diesel_fuel_percent
+          - entity: sensor.eg4_site_diesel_burn_rate
+          - entity: sensor.eg4_site_generator_fuel_hours_remaining
+          - entity: binary_sensor.eg4_site_diesel_fuel_reorder_needed
+          - entity: binary_sensor.eg4_site_generator_running_without_load
+          - entity: sensor.generator_power
+          - entity: binary_sensor.generator_running
+          - entity: binary_sensor.generator_supplying_power
