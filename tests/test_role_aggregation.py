@@ -1,7 +1,18 @@
 """Unit tests for EG4 role mapping and aggregation helpers."""
 
+from datetime import UTC, datetime
+
+from custom_components.eg4_monitor.local_dongle import (
+    EG4LocalDongleIdentity,
+    EG4LocalTelemetry,
+)
 from custom_components.eg4_monitor.__init__ import (
+    _add_discovered_local_dongles,
+    _apply_battery_data_quality_guards,
+    _apply_local_telemetry_snapshot,
+    _apply_battery_info_snapshot,
     _apply_event_snapshot,
+    _apply_grid_quality_snapshot,
     _apply_parallel_day_snapshot,
     _apply_midbox_runtime_snapshot,
     _build_aggregate,
@@ -72,6 +83,71 @@ def test_build_aggregate_prefers_role_sources() -> None:
     assert aggregate["Grid"]["PowerNet"] == 900
     assert aggregate["Load"]["Power"] == 6500
     assert aggregate["Energy"]["Today"]["Solar Generation"] == 21.2
+
+
+def test_build_aggregate_fills_energy_gaps_from_battery_source() -> None:
+    role_map = {"MASTER": "flexboss_master", "GRID": "gridboss"}
+    device_data = {
+        "MASTER": {
+            "Battery": {"SOC": 80},
+            "Energy": {
+                "Today": {
+                    "Battery Charge": 2.5,
+                    "Battery Discharge": 1.25,
+                },
+                "Total": {"Battery Charge": 125.0},
+            },
+        },
+        "GRID": {
+            "Grid": {"VoltageR": 240.0},
+            "Energy": {
+                "Today": {"Solar Generation": 4.2},
+                "Total": {"Solar Generation": 400.0},
+            }
+        },
+    }
+
+    aggregate = _build_aggregate(device_data, role_map)
+
+    assert aggregate["Energy"]["Today"] == {
+        "Solar Generation": 4.2,
+        "Usage": None,
+        "Grid Import": None,
+        "Grid Export": None,
+        "Battery Charge": 2.5,
+        "Battery Discharge": 1.25,
+    }
+    assert aggregate["Energy"]["Total"]["Battery Charge"] == 125.0
+
+
+def test_apply_battery_info_snapshot_keeps_verified_fields_and_pack_rows() -> None:
+    aggregate = {"Battery": {"Power": -800.0}}
+    battery_info = {
+        "success": True,
+        "batStatus": "Discharging",
+        "batPower": -900,
+        "vBat": 531,
+        "currentText": "-17.0",
+        "totalVoltageText": "53.1",
+        "totalNumber": 2,
+        "bmsCycleCnt": 42,
+        "globalMaxCellTemp": "31.5",
+        "globalMinCellTemp": "29.0",
+        "batteryList": [
+            {"batterySn": "PACK-A", "batVolt": 530},
+            {"batterySn": "PACK-B", "batVolt": 532},
+        ],
+    }
+
+    _apply_battery_info_snapshot(aggregate, battery_info)
+
+    assert aggregate["Battery"]["Status"] == "Discharging"
+    assert aggregate["Battery"]["Current"] == -17.0
+    assert aggregate["Battery"]["TotalVoltage"] == 53.1
+    assert aggregate["Battery"]["CycleCount"] == 42.0
+    assert aggregate["Battery"]["PortalPower"] == -900.0
+    assert aggregate["Battery"]["PackVoltages"][1]["voltage"] == 53.2
+    assert aggregate["Battery"]["Power"] == -800.0
 
 
 def test_build_aggregate_solar_fallback_sum() -> None:
@@ -147,6 +223,210 @@ def test_merge_role_map_respects_locked_serials() -> None:
 
     assert merged["54700E0353"] == "flexboss_master"
     assert merged["52842P0677"] == "flexboss_master"
+
+
+def test_apply_battery_info_snapshot_keeps_parallel_rows_without_summary() -> None:
+    aggregate = {"Battery": {}}
+    parallel_info = {
+        "success": True,
+        "batteryArray": [
+            {"batterySn": "PACK-A", "totalVoltage": 5410},
+        ],
+    }
+
+    _apply_battery_info_snapshot(aggregate, None, parallel_info)
+
+    assert aggregate["Battery"]["ParallelDeviceCount"] == 1
+    assert aggregate["Battery"]["ParallelDevices"] == [
+        {"batterySn": "PACK-A", "totalVoltage": 5410}
+    ]
+
+
+def test_grid_quality_does_not_record_stale_runtime_sample() -> None:
+    aggregate = {"Grid": {"Voltage": 190.0}}
+    samples = []
+
+    _apply_grid_quality_snapshot(
+        aggregate,
+        samples,
+        datetime(2026, 8, 1, 12, 0, tzinfo=UTC),
+        record_sample=False,
+    )
+
+    assert samples == []
+    assert aggregate["GridQuality"]["SampleRecorded"] is False
+    assert aggregate["GridQuality"]["State"] == "unavailable"
+
+
+def test_discovered_local_dongle_is_assigned_by_inverter_serial() -> None:
+    local_dongles = {}
+    discovered: list[dict[str, object]] = []
+    _add_discovered_local_dongles(
+        local_dongles,
+        (
+            EG4LocalDongleIdentity(
+                host="192.168.3.14",
+                port=8000,
+                dongle_serial="DJ12345678",
+                inverter_serial="INV_MASTER",
+            ),
+            EG4LocalDongleIdentity(
+                host="192.168.3.241",
+                port=8000,
+                dongle_serial="GRID123456",
+                inverter_serial="INV_GRID",
+            ),
+        ),
+        {
+            "INV_MASTER": "flexboss_master",
+            "INV_GRID": "gridboss",
+        },
+        port=8000,
+        timeout=5.0,
+        source="portal_reported_ip",
+        discovered=discovered,
+    )
+
+    assert set(local_dongles) == {"flexboss_master"}
+    assert local_dongles["flexboss_master"].host == "192.168.3.14"
+    assert discovered[0]["Role"] == "flexboss_master"
+
+
+def test_local_bms_soc_authorizes_canonical_lead_acid_soc() -> None:
+    aggregate = {
+        "Battery": {"Type": "LEAD_ACID", "SOC": None, "PortalSOC": 85.0},
+    }
+    telemetry = EG4LocalTelemetry(
+        host="192.168.3.14",
+        port=8000,
+        dongle_serial="DJ12345678",
+        inverter_serial="INV1234567",
+        battery_voltage=52.3,
+        battery_soc=45.0,
+        battery_soh=100.0,
+        charge_power=6725.0,
+        discharge_power=0.0,
+        bms_parallel_count=5,
+        bms_capacity_ah=1400.0,
+        bms_current=25.0,
+        bms_max_cell_voltage=3.297,
+        bms_min_cell_voltage=3.278,
+        bms_max_cell_temperature=31.0,
+        bms_min_cell_temperature=29.0,
+        bms_cycle_count=18.0,
+        bms_available=True,
+    )
+
+    _apply_local_telemetry_snapshot(aggregate, {"flexboss_master": telemetry})
+    _apply_battery_data_quality_guards(aggregate)
+
+    battery = aggregate["Battery"]
+    assert battery["SOC"] == 45.0
+    assert battery["SOCSource"] == "local_bms"
+    assert battery["SOCQuality"] == "bms_reported"
+    assert battery["LocalSOC"] == 45.0
+    assert battery["LocalSOCSource"] == "local_inverter_unverified"
+    assert battery["LocalSOCQuality"] == "diagnostic_only"
+    assert battery["LocalBMSSOC"] == 45.0
+    assert battery["LocalBMSSource"] == "local_bms"
+    assert battery["LocalBMSQuality"] == "bms_reported"
+    assert battery["LocalDongleSerial"] == "DJ12345678"
+    assert battery["LocalVoltage"] == 52.3
+    assert battery["LocalPower"] == 6725.0
+    assert battery["LocalBMSCurrent"] == 25.0
+    assert battery["LocalBMSAvailable"] is True
+    assert aggregate["LocalTelemetry"]["ByRole"]["flexboss_master"]["DongleSerial"] == (
+        "DJ12345678"
+    )
+    assert aggregate["LocalTelemetry"]["BMSRole"] == "flexboss_master"
+
+
+def test_local_inverter_soc_stays_unverified_without_bms() -> None:
+    aggregate = {
+        "Battery": {"Type": "LEAD_ACID", "SOC": 85.0},
+    }
+    telemetry = EG4LocalTelemetry(
+        host="192.168.3.162",
+        port=8000,
+        dongle_serial="BJ44300373",
+        inverter_serial="INV1234567",
+        battery_voltage=52.3,
+        battery_soc=85.0,
+        battery_soh=100.0,
+        charge_power=0.0,
+        discharge_power=2500.0,
+        bms_parallel_count=0,
+        bms_capacity_ah=0.0,
+        bms_current=0.0,
+        bms_max_cell_voltage=None,
+        bms_min_cell_voltage=None,
+        bms_max_cell_temperature=0.0,
+        bms_min_cell_temperature=0.0,
+        bms_cycle_count=0.0,
+        bms_available=False,
+    )
+
+    _apply_local_telemetry_snapshot(aggregate, {"flexboss_slave": telemetry})
+    _apply_battery_data_quality_guards(aggregate)
+
+    battery = aggregate["Battery"]
+    assert battery["SOC"] is None
+    assert battery["SOCSource"] == "cloud_unverified"
+    assert battery["LocalSOC"] == 85.0
+    assert battery["LocalSOCSource"] == "local_inverter_unverified"
+    assert battery["LocalBMSSOC"] is None
+    assert battery["LocalBMSAvailable"] is False
+
+
+def test_lead_acid_portal_soc_is_not_authoritative() -> None:
+    aggregate = {
+        "Battery": {
+            "Type": "LEAD_ACID",
+            "SOC": 94.0,
+            "RemainingKWh": 131.6,
+            "Power": -9000.0,
+            "Voltage": 51.5,
+            "Current": 0.8,
+        }
+    }
+
+    _apply_battery_data_quality_guards(aggregate)
+
+    battery = aggregate["Battery"]
+    assert battery["SOC"] is None
+    assert battery["RemainingKWh"] is None
+    assert battery["PortalSOC"] == 94.0
+    assert battery["SOCSource"] == "cloud_unverified"
+    assert battery["SOCQuality"] == "unavailable"
+    assert battery["PortalSOCSource"] == "cloud_unverified"
+    assert battery["PortalSOCQuality"] == "diagnostic_only"
+    assert battery["Current"] == round(-9000.0 / 51.5, 2)
+    assert battery["PortalCurrent"] == 0.8
+    assert battery["CurrentSource"] == "power_voltage"
+
+
+def test_apply_parallel_day_snapshot_uses_negative_discharge_power() -> None:
+    aggregate = {
+        "source_serials": {},
+        "Grid": {},
+        "Load": {},
+        "Solar": {},
+        "Battery": {},
+    }
+    chart = {
+        "data": [
+            {
+                "batteryDischarging": 2500,
+            }
+        ]
+    }
+
+    _apply_parallel_day_snapshot(aggregate, chart)
+
+    assert aggregate["Battery"]["Power"] == -2500.0
+    assert aggregate["Battery"]["ChargePower"] == 0.0
+    assert aggregate["Battery"]["DischargePower"] == 2500.0
+    assert aggregate["Battery"]["Direction"] == "Discharging"
 
 
 def test_apply_parallel_day_snapshot_updates_site_values() -> None:

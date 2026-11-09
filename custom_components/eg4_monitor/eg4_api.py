@@ -11,6 +11,208 @@ import aiohttp
 
 _LOGGER = logging.getLogger(__name__)
 
+ENERGY_INFO_PATH = "/api/inverter/getInverterEnergyInfo"
+BATTERY_INFO_PATH = "/api/battery/getBatteryInfo"
+BATTERY_PARALLEL_INFO_PATH = "/api/inverter/getInverterBatteryInfoParallel"
+
+
+def _to_float_or_none(value: Any) -> float | None:
+    """Convert a portal value to a float without inventing a default."""
+    try:
+        if isinstance(value, str):
+            value = value.strip()
+            if not value or value == "--":
+                return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _text_number(value: Any) -> float | None:
+    """Parse the numeric portion of a portal display string."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text == "--":
+        return None
+    return _to_float_or_none(text.split()[0])
+
+
+def _energy_tenth_kwh(
+    payload: dict[str, Any], raw_key: str, text_key: str | None = None
+) -> float | None:
+    """Convert verified tenth-kWh portal counters to kWh."""
+    raw_value = _to_float_or_none(payload.get(raw_key))
+    if raw_value is not None:
+        return round(raw_value / 10.0, 3)
+    if text_key is not None:
+        return _text_number(payload.get(text_key))
+    return None
+
+
+def _normalize_energy_info(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize the verified getInverterEnergyInfo response."""
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        return None
+
+    return {
+        "Today": {
+            "Solar Generation": _energy_tenth_kwh(
+                payload, "todayYielding", "todayYieldingText"
+            ),
+            "Grid Import": _energy_tenth_kwh(
+                payload, "todayImport", "todayImportText"
+            ),
+            "Grid Export": _energy_tenth_kwh(
+                payload, "todayExport", "todayExportText"
+            ),
+            "Usage": _energy_tenth_kwh(payload, "todayUsage", "todayUsageText"),
+            "Battery Charge": _energy_tenth_kwh(
+                payload, "todayCharging", "todayChargingText"
+            ),
+            "Battery Discharge": _energy_tenth_kwh(
+                payload, "todayDischarging", "todayDischargingText"
+            ),
+        },
+        "Total": {
+            "Solar Generation": _energy_tenth_kwh(
+                payload, "totalYielding", "totalYieldingText"
+            ),
+            "Grid Import": _energy_tenth_kwh(
+                payload, "totalImport", "totalImportText"
+            ),
+            "Grid Export": _energy_tenth_kwh(
+                payload, "totalExport", "totalExportText"
+            ),
+            "Usage": _energy_tenth_kwh(payload, "totalUsage", "totalUsageText"),
+            "Battery Charge": _energy_tenth_kwh(
+                payload, "totalCharging", "totalChargingText"
+            ),
+            "Battery Discharge": _energy_tenth_kwh(
+                payload, "totalDischarging", "totalDischargingText"
+            ),
+        },
+        "Environmental": {
+            "CO2 Reduction": _text_number(payload.get("totalCo2ReductionText")),
+            "Coal Reduction": _text_number(payload.get("totalCoalReductionText")),
+        },
+    }
+
+
+def _normalize_battery_info(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize verified getBatteryInfo fields while preserving missing data."""
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        return None
+
+    voltage = _to_float_or_none(payload.get("vBat"))
+    return {
+        "Status": payload.get("batStatus") or payload.get("statusText"),
+        "Power": _to_float_or_none(payload.get("batPower")),
+        "ChargePower": _to_float_or_none(payload.get("pCharge")),
+        "DischargePower": _to_float_or_none(payload.get("pDisCharge")),
+        "SOC": _to_float_or_none(payload.get("soc")),
+        "Voltage": None if voltage is None else round(voltage / 10.0, 3),
+        "Current": _text_number(payload.get("currentText")),
+        "TotalVoltage": _text_number(payload.get("totalVoltageText")),
+        "TotalNumber": _to_float_or_none(payload.get("totalNumber")),
+        "CycleCount": _to_float_or_none(payload.get("bmsCycleCnt")),
+        "MaxCellTemperature": _text_number(payload.get("globalMaxCellTemp")),
+        "MinCellTemperature": _text_number(payload.get("globalMinCellTemp")),
+    }
+
+
+def _extract_battery_pack_voltages(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract individual battery pack voltages from known EG4 payload shapes."""
+    containers = (
+        "batteryList",
+        "batteryArray",
+        "battery_units",
+        "batList",
+        "batteryData",
+        "batteryInfo",
+        "bmsList",
+        "bmsData",
+        "packList",
+        "deviceArray",
+    )
+    voltage_keys = (
+        "voltage",
+        "volt",
+        "batVolt",
+        "batteryVoltage",
+        "packVoltage",
+        "totalVoltage",
+        "totalVoltageText",
+        "vBat",
+    )
+    id_keys = ("serialNum", "serial", "sn", "batterySn", "packSn", "id", "name")
+
+    packs: list[dict[str, Any]] = []
+    for container_key in containers:
+        raw_container = data.get(container_key)
+        if isinstance(raw_container, dict):
+            raw_items = raw_container.get("rows") or raw_container.get("data")
+        else:
+            raw_items = raw_container
+
+        if not isinstance(raw_items, list):
+            continue
+
+        for index, item in enumerate(raw_items, start=1):
+            if not isinstance(item, dict):
+                continue
+
+            voltage = None
+            voltage_key = None
+            for key in voltage_keys:
+                if key in item:
+                    scale = (
+                        10.0
+                        if key in {"batVolt", "vBat"}
+                        else 100.0
+                        if key == "totalVoltage"
+                        else 1.0
+                    )
+                    raw_voltage = (
+                        _text_number(item.get(key))
+                        if key.endswith("Text")
+                        else _to_float_or_none(item.get(key))
+                    )
+                    voltage = (
+                        None
+                        if raw_voltage is None
+                        else round(raw_voltage / scale, 2)
+                    )
+                    voltage_key = key
+                    break
+            if voltage is None:
+                continue
+
+            pack_id = None
+            for key in id_keys:
+                value = item.get(key)
+                if value not in (None, ""):
+                    pack_id = str(value)
+                    break
+            pack_id = pack_id or f"pack_{index}"
+
+            packs.append(
+                {
+                    "id": pack_id,
+                    "name": item.get("name") or item.get("batteryName") or pack_id,
+                    "serial": item.get("serialNum")
+                    or item.get("serial")
+                    or item.get("sn")
+                    or item.get("batterySn")
+                    or item.get("packSn"),
+                    "voltage": voltage,
+                    "source": container_key,
+                    "source_key": voltage_key,
+                }
+            )
+
+    return packs
+
 
 class EG4API:
     """API Client for EG4 Electronics."""
@@ -31,6 +233,121 @@ class EG4API:
             None  # Stores the primarily discovered/used serial number
         )
         self.plant_id: int | None = None  # Stores the discovered plant ID
+
+    def _mark_logged_out(self, reason: str) -> None:
+        """Mark cached authentication state stale after an auth response."""
+        if self.logged_in:
+            _LOGGER.warning("EG4 session marked logged out: %s", reason)
+        self.logged_in = False
+
+    @staticmethod
+    def _response_indicates_login(
+        response: aiohttp.ClientResponse,
+        response_text: str,
+    ) -> bool:
+        """Return whether a portal response is actually a login page."""
+        if response.status in {401, 403}:
+            return True
+
+        response_url = str(response.url).lower()
+        if "/web/login" in response_url:
+            return True
+
+        sample = response_text[:2000].lower()
+        return (
+            "<html" in sample
+            and "password" in sample
+            and ("account" in sample or "login" in sample)
+        )
+
+    def _api_headers(self) -> dict[str, str]:
+        """Build the authenticated headers used by portal JSON endpoints."""
+        cookies_dict = {
+            cookie.key: cookie.value for cookie in self.session.cookie_jar
+        }
+        cookies_str = "; ".join(f"{key}={value}" for key, value in cookies_dict.items())
+        return {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "keep-alive",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Cookie": cookies_str,
+            "Origin": "https://monitor.eg4electronics.com",
+            "Referer": "https://monitor.eg4electronics.com/WManage/web/monitor/inverter",
+            "User-Agent": "Mozilla/5.0",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+    async def _post_json(
+        self,
+        path: str,
+        serial_num: str | None,
+        operation: str,
+        form_data: dict[str, Any] | None = None,
+        *,
+        _retry_auth: bool = True,
+    ) -> dict[str, Any] | None:
+        """POST one authenticated portal endpoint and parse its JSON response."""
+        if not self.logged_in:
+            if not await self.login():
+                _LOGGER.error("Failed to login during %s", operation)
+                return None
+
+        try:
+            request_data = form_data or (
+                {"serialNum": serial_num} if serial_num is not None else {}
+            )
+            async with self.session.post(
+                f"{self.base_url}{path}",
+                headers=self._api_headers(),
+                data=urlencode(request_data),
+            ) as response:
+                body = await response.text()
+                if self._response_indicates_login(response, body):
+                    self._mark_logged_out(f"{operation} request requires login")
+                    response.release()
+                    if _retry_auth and await self.login():
+                        return await self._post_json(
+                            path,
+                            serial_num,
+                            operation,
+                            form_data,
+                            _retry_auth=False,
+                        )
+                    return None
+                if response.status != 200:
+                    _LOGGER.warning(
+                        "%s request failed for %s, status=%s body=%s",
+                        operation,
+                        serial_num,
+                        response.status,
+                        body[:300],
+                    )
+                    return None
+                data = json.loads(body)
+                if not isinstance(data, dict):
+                    _LOGGER.warning("%s returned a non-object payload", operation)
+                    return None
+                if data.get("success") is not True:
+                    _LOGGER.warning(
+                        "%s returned unsuccessful response for %s: %s",
+                        operation,
+                        serial_num,
+                        data,
+                    )
+                    return None
+                return data
+        except aiohttp.ClientError as err:
+            _LOGGER.error("Network error during %s for %s: %s", operation, serial_num, err)
+            return None
+        except json.JSONDecodeError as err:
+            self._mark_logged_out(f"non-JSON {operation} response: {err}")
+            return None
+        except Exception as err:
+            _LOGGER.exception(
+                "Unexpected error during %s for %s: %s", operation, serial_num, err
+            )
+            return None
 
     async def login(self) -> bool:
         """Login to EG4 portal."""
@@ -76,7 +393,7 @@ class EG4API:
             }
 
             encoded_data = urlencode(login_data)
-            _LOGGER.debug("Sending login request with data: %s", login_data)
+            _LOGGER.debug("Sending login request for account: %s", self.username)
             async with self.session.post(
                 login_url, data=encoded_data, headers=headers
             ) as response:
@@ -85,6 +402,10 @@ class EG4API:
                 _LOGGER.debug(
                     "Login response: %s", response_text[:500]
                 )  # Log first 500 chars
+
+                if self._response_indicates_login(response, response_text):
+                    self._mark_logged_out("login response remained on the login page")
+                    return False
 
                 # Check for redirect or success indicators
                 if response.status == 302 or response.status == 200:
@@ -132,7 +453,10 @@ class EG4API:
             return False
 
     async def get_system_data(
-        self, serial_to_fetch: str | None = None
+        self,
+        serial_to_fetch: str | None = None,
+        *,
+        _retry_auth: bool = True,
     ) -> dict[str, Any] | None:
         """Get current system data for a specific serial number or the default one."""
         if not self.logged_in:
@@ -260,15 +584,39 @@ class EG4API:
                 headers=headers,
                 data=urlencode({"serialNum": current_serial_to_use}),
             ) as response:
-                if response.status == 200:
-                    raw_runtime_data = await response.json()
-                    _LOGGER.debug(
-                        "Raw runtime data for %s from /api/inverter/getInverterRuntime: %s",
+                response_text = await response.text()
+                if self._response_indicates_login(response, response_text):
+                    self._mark_logged_out("runtime request requires login")
+                    response.release()
+                    if _retry_auth and await self.login():
+                        return await self.get_system_data(
+                            serial_to_fetch=serial_to_fetch,
+                            _retry_auth=False,
+                        )
+                    return None
+                if response.status != 200:
+                    _LOGGER.warning(
+                        "Runtime request failed for %s, status=%s body=%s",
                         current_serial_to_use,
-                        json.dumps(raw_runtime_data, indent=4),
+                        response.status,
+                        response_text[:300],
                     )
-                    data = raw_runtime_data
-                    if data.get("success"):
+                    return None
+                try:
+                    raw_runtime_data = json.loads(response_text)
+                except json.JSONDecodeError as err:
+                    self._mark_logged_out(f"non-JSON runtime response: {err}")
+                    return None
+                if not isinstance(raw_runtime_data, dict):
+                    _LOGGER.warning("Runtime endpoint returned a non-object payload")
+                    return None
+                _LOGGER.debug(
+                    "Raw runtime data for %s from /api/inverter/getInverterRuntime: %s",
+                    current_serial_to_use,
+                    json.dumps(raw_runtime_data, indent=4),
+                )
+                data = raw_runtime_data
+                if data.get("success"):
 
                         def to_float(value: Any, default: float = 0.0) -> float:
                             try:
@@ -470,42 +818,18 @@ class EG4API:
                                 ),
                                 "HasPEPSLNValue": data.get("haspEpsLNValue", False),
                             },
+                            "Raw": {"Runtime": data},
                         }
             _LOGGER.debug(
                 "Fetching energy statistics for serial: %s", current_serial_to_use
             )
-            async with self.session.post(
-                f"{self.base_url}/api/inverter/getInverterEnergy",
-                headers=headers,
-                data=urlencode({"serialNum": current_serial_to_use}),
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if data.get("success"):
-                        system_data["Energy"] = {
-                            "Today": {
-                                "Solar Generation": float(data.get("eToday", 0)) / 10,
-                                "Grid Import": float(data.get("eToGridToday", 0)) / 10,
-                                "Grid Export": float(data.get("eToUserToday", 0)) / 10,
-                                "Battery Charge": float(data.get("eChargeToday", 0))
-                                / 10,
-                                "Battery Discharge": float(
-                                    data.get("eDischargeToday", 0)
-                                )
-                                / 10,
-                            },
-                            "Total": {
-                                "Solar Generation": float(data.get("eTotal", 0)) / 10,
-                                "Grid Import": float(data.get("eToGridTotal", 0)) / 10,
-                                "Grid Export": float(data.get("eToUserTotal", 0)) / 10,
-                                "Battery Charge": float(data.get("eChargeTotal", 0))
-                                / 10,
-                                "Battery Discharge": float(
-                                    data.get("eDischargeTotal", 0)
-                                )
-                                / 10,
-                            },
-                        }
+            energy_info = await self.get_inverter_energy_info(current_serial_to_use)
+            if energy_info:
+                normalized_energy = _normalize_energy_info(energy_info)
+                if normalized_energy is not None:
+                    system_data["Energy"] = normalized_energy
+                    system_data.setdefault("Raw", {})["EnergyInfo"] = energy_info
+
             return system_data
         except aiohttp.ClientError as err:
             _LOGGER.error("Network error getting system data: %s", err)
@@ -514,7 +838,37 @@ class EG4API:
             _LOGGER.exception("Unexpected error getting system data: %s", err)
             return None
 
-    async def get_plant_info(self) -> dict[str, Any] | None:
+    async def get_inverter_energy_info(
+        self, serial_num: str
+    ) -> dict[str, Any] | None:
+        """Fetch the verified inverter energy information payload."""
+        return await self._post_json(
+            ENERGY_INFO_PATH, serial_num, "inverter energy info"
+        )
+
+    async def get_inverter_battery_info(
+        self, serial_num: str
+    ) -> dict[str, Any] | None:
+        """Fetch the verified aggregate battery information payload."""
+        return await self._post_json(
+            BATTERY_INFO_PATH, serial_num, "inverter battery info"
+        )
+
+    async def get_inverter_battery_info_parallel(
+        self, serial_num: str
+    ) -> dict[str, Any] | None:
+        """Fetch parallel battery/BMS detail rows for a serial number."""
+        return await self._post_json(
+            BATTERY_PARALLEL_INFO_PATH,
+            serial_num,
+            "parallel battery info",
+        )
+
+    async def get_plant_info(
+        self,
+        *,
+        _retry_auth: bool = True,
+    ) -> dict[str, Any] | None:
         """Fetch plant information, primarily to get the plantId."""
         if not self.logged_in:
             _LOGGER.debug("Not logged in for get_plant_info, attempting login")
@@ -558,6 +912,12 @@ class EG4API:
             ) as response:
                 _LOGGER.debug("Plant list response status: %s", response.status)
                 response_text = await response.text()
+                if self._response_indicates_login(response, response_text):
+                    self._mark_logged_out("plant list request requires login")
+                    response.release()
+                    if _retry_auth and await self.login():
+                        return await self.get_plant_info(_retry_auth=False)
+                    return None
                 if response.status == 200:
                     try:
                         data = json.loads(response_text)
@@ -624,7 +984,10 @@ class EG4API:
         ]
 
     async def get_all_inverters(
-        self, plant_id_to_fetch: int | None
+        self,
+        plant_id_to_fetch: int | None,
+        *,
+        _retry_auth: bool = True,
     ) -> list[dict[str, Any]] | None:
         """Fetch all inverter rows for a plant as raw dictionaries."""
         if not self.logged_in:
@@ -678,6 +1041,17 @@ class EG4API:
                     "Inverter list POST response status: %s", list_response.status
                 )
                 response_text_content = await list_response.text()
+                if self._response_indicates_login(
+                    list_response, response_text_content
+                ):
+                    self._mark_logged_out("inverter list request requires login")
+                    list_response.release()
+                    if _retry_auth and await self.login():
+                        return await self.get_all_inverters(
+                            plant_id_to_fetch,
+                            _retry_auth=False,
+                        )
+                    return None
                 if list_response.status == 200:
                     try:
                         data = json.loads(response_text_content)
@@ -757,65 +1131,11 @@ class EG4API:
         self, serial_num: str
     ) -> dict[str, Any] | None:
         """Fetch parallel group details for a serial number."""
-        if not self.logged_in:
-            _LOGGER.debug(
-                "Not logged in for get_parallel_group_details, attempting login"
-            )
-            if not await self.login():
-                _LOGGER.error("Failed to login during get_parallel_group_details")
-                return None
-
-        try:
-            cookies_dict: dict[str, str] = {}
-            for cookie in self.session.cookie_jar:
-                cookies_dict[cookie.key] = cookie.value
-            cookies_str = "; ".join([f"{k}={v}" for k, v in cookies_dict.items()])
-
-            headers = {
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Connection": "keep-alive",
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Cookie": cookies_str,
-                "Origin": "https://monitor.eg4electronics.com",
-                "Referer": "https://monitor.eg4electronics.com/WManage/web/monitor/inverter",
-                "User-Agent": "Mozilla/5.0",
-                "X-Requested-With": "XMLHttpRequest",
-            }
-
-            url = f"{self.base_url}/api/inverterOverview/getParallelGroupDetails"
-            async with self.session.post(
-                url,
-                headers=headers,
-                data=urlencode({"serialNum": serial_num}),
-            ) as response:
-                if response.status != 200:
-                    body = await response.text()
-                    _LOGGER.warning(
-                        "Parallel details request failed for %s, status=%s body=%s",
-                        serial_num,
-                        response.status,
-                        body[:300],
-                    )
-                    return None
-
-                data = await response.json()
-                if data.get("success"):
-                    return data
-                _LOGGER.warning(
-                    "Parallel details returned unsuccessful response for %s: %s",
-                    serial_num,
-                    data,
-                )
-                return None
-
-        except aiohttp.ClientError as err:
-            _LOGGER.error(
-                "Network error during get_parallel_group_details for %s: %s",
-                serial_num,
-                err,
-            )
-            return None
+        return await self._post_json(
+            "/api/inverterOverview/getParallelGroupDetails",
+            serial_num,
+            "parallel group details",
+        )
 
     async def get_day_multiline_parallel(
         self,
@@ -823,127 +1143,20 @@ class EG4API:
         date_text: str,
     ) -> dict[str, Any] | None:
         """Fetch parallel day chart data for a serial/date pair."""
-        if not self.logged_in:
-            _LOGGER.debug("Not logged in for day multiline, attempting login")
-            if not await self.login():
-                _LOGGER.error("Failed to login during get_day_multiline_parallel")
-                return None
-
-        try:
-            cookies_dict: dict[str, str] = {}
-            for cookie in self.session.cookie_jar:
-                cookies_dict[cookie.key] = cookie.value
-            cookies_str = "; ".join([f"{k}={v}" for k, v in cookies_dict.items()])
-
-            headers = {
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Connection": "keep-alive",
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Cookie": cookies_str,
-                "Origin": "https://monitor.eg4electronics.com",
-                "Referer": "https://monitor.eg4electronics.com/WManage/web/monitor/inverter",
-                "User-Agent": "Mozilla/5.0",
-                "X-Requested-With": "XMLHttpRequest",
-            }
-
-            url = f"{self.base_url}/api/analyze/chart/dayMultiLineParallel"
-            payload = urlencode({"serialNum": serial_num, "dateText": date_text})
-
-            async with self.session.post(
-                url, headers=headers, data=payload
-            ) as response:
-                if response.status != 200:
-                    body = await response.text()
-                    _LOGGER.warning(
-                        "Day multiline request failed for %s (%s), status=%s body=%s",
-                        serial_num,
-                        date_text,
-                        response.status,
-                        body[:300],
-                    )
-                    return None
-
-                data = await response.json()
-                if data.get("success"):
-                    return data
-
-                _LOGGER.warning(
-                    "Day multiline returned unsuccessful response for %s (%s): %s",
-                    serial_num,
-                    date_text,
-                    data,
-                )
-                return None
-
-        except aiohttp.ClientError as err:
-            _LOGGER.error(
-                "Network error during get_day_multiline_parallel for %s: %s",
-                serial_num,
-                err,
-            )
-            return None
+        return await self._post_json(
+            "/api/analyze/chart/dayMultiLineParallel",
+            serial_num,
+            "parallel day chart",
+            {"serialNum": serial_num, "dateText": date_text},
+        )
 
     async def get_midbox_runtime(self, serial_num: str) -> dict[str, Any] | None:
         """Fetch GridBoss midbox runtime payload for a serial number."""
-        if not self.logged_in:
-            _LOGGER.debug("Not logged in for get_midbox_runtime, attempting login")
-            if not await self.login():
-                _LOGGER.error("Failed to login during get_midbox_runtime")
-                return None
-
-        try:
-            cookies_dict: dict[str, str] = {}
-            for cookie in self.session.cookie_jar:
-                cookies_dict[cookie.key] = cookie.value
-            cookies_str = "; ".join([f"{k}={v}" for k, v in cookies_dict.items()])
-
-            headers = {
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Connection": "keep-alive",
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Cookie": cookies_str,
-                "Origin": "https://monitor.eg4electronics.com",
-                "Referer": "https://monitor.eg4electronics.com/WManage/web/monitor/inverter",
-                "User-Agent": "Mozilla/5.0",
-                "X-Requested-With": "XMLHttpRequest",
-            }
-
-            url = f"{self.base_url}/api/midbox/getMidboxRuntime"
-            async with self.session.post(
-                url,
-                headers=headers,
-                data=urlencode({"serialNum": serial_num}),
-            ) as response:
-                if response.status != 200:
-                    body = await response.text()
-                    _LOGGER.warning(
-                        "Midbox runtime request failed for %s, status=%s body=%s",
-                        serial_num,
-                        response.status,
-                        body[:300],
-                    )
-                    return None
-
-                data = await response.json()
-                if data.get("success"):
-                    return data
-
-                _LOGGER.warning(
-                    "Midbox runtime returned unsuccessful response for %s: %s",
-                    serial_num,
-                    data,
-                )
-                return None
-
-        except aiohttp.ClientError as err:
-            _LOGGER.error(
-                "Network error during get_midbox_runtime for %s: %s",
-                serial_num,
-                err,
-            )
-            return None
+        return await self._post_json(
+            "/api/midbox/getMidboxRuntime",
+            serial_num,
+            "midbox runtime",
+        )
 
     async def get_event_list(
         self,
@@ -952,85 +1165,12 @@ class EG4API:
         event_text: str = "_all",
     ) -> dict[str, Any] | None:
         """Fetch portal event list entries."""
-        if not self.logged_in:
-            _LOGGER.debug("Not logged in for get_event_list, attempting login")
-            if not await self.login():
-                _LOGGER.error("Failed to login during get_event_list")
-                return None
-
-        try:
-            cookies_dict: dict[str, str] = {}
-            for cookie in self.session.cookie_jar:
-                cookies_dict[cookie.key] = cookie.value
-            cookies_str = "; ".join([f"{k}={v}" for k, v in cookies_dict.items()])
-
-            headers = {
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Connection": "keep-alive",
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Cookie": cookies_str,
-                "Origin": "https://monitor.eg4electronics.com",
-                "Referer": "https://monitor.eg4electronics.com/WManage/web/analyze/event",
-                "User-Agent": "Mozilla/5.0",
-                "X-Requested-With": "XMLHttpRequest",
-            }
-
-            url = f"{self.base_url}/api/analyze/event/list"
-            payload = urlencode(
-                {
-                    "page": page,
-                    "rows": rows,
-                    "eventText": event_text,
-                }
-            )
-
-            async with self.session.post(
-                url, headers=headers, data=payload
-            ) as response:
-                if response.status != 200:
-                    body = await response.text()
-                    _LOGGER.warning(
-                        "Event list request failed status=%s body=%s",
-                        response.status,
-                        body[:300],
-                    )
-                    return None
-
-                data = await response.json()
-                if data.get("success"):
-                    return data
-
-                _LOGGER.warning("Event list returned unsuccessful response: %s", data)
-                return None
-
-        except aiohttp.ClientError as err:
-            _LOGGER.error("Network error during get_event_list: %s", err)
-            return None
-        except Exception as err:
-            _LOGGER.exception("Unexpected error during get_event_list: %s", err)
-            return None
-        except Exception as err:
-            _LOGGER.exception(
-                "Unexpected error during get_midbox_runtime for %s: %s",
-                serial_num,
-                err,
-            )
-            return None
-        except Exception as err:
-            _LOGGER.exception(
-                "Unexpected error during get_day_multiline_parallel for %s: %s",
-                serial_num,
-                err,
-            )
-            return None
-        except Exception as err:
-            _LOGGER.exception(
-                "Unexpected error during get_parallel_group_details for %s: %s",
-                serial_num,
-                err,
-            )
-            return None
+        return await self._post_json(
+            "/api/analyze/event/list",
+            None,
+            "event list",
+            {"page": page, "rows": rows, "eventText": event_text},
+        )
 
     async def close(self) -> None:
         """Close the session."""

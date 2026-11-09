@@ -5,8 +5,6 @@ from typing import Any
 
 import aiohttp
 import async_timeout
-from bs4 import BeautifulSoup
-
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -72,7 +70,7 @@ class EG4UpdateCoordinator(DataUpdateCoordinator):
 
     def _parse_monitor_page(self, html: str) -> dict[str, Any]:
         """Parse the monitor page HTML to extract relevant data."""
-        soup = BeautifulSoup(html, 'html.parser')
+        del html
         data = {}
         
         # TODO: Extract relevant data from the page

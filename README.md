@@ -21,9 +21,29 @@ This project was expanded from simple single-device polling to a site-aware mode
 - Battery telemetry improvements
   - charging power, discharging power, direction (`Idle/Charging/Discharging`)
   - battery energy remaining (kWh)
+  - verified battery status, current, voltage, cycle count, temperatures, BMS limits, and pack rows
+- Verified portal endpoint ingestion
+  - inverter energy counters from `getInverterEnergyInfo` (tenth-kWh normalization)
+  - battery details from `getBatteryInfo` and `getInverterBatteryInfoParallel`
+- Stability safeguards
+  - bounded per-device last-good cache with stale-data diagnostics
+  - persisted 24-hour grid-quality/outage metrics
+  - configurable runtime and battery-detail polling intervals
+- Automatic local telemetry discovery
+  - portal-reported local IPs are probed first after login
+  - Home Assistant local IPv4 segments are scanned as a bounded fallback
+  - manual FlexBOSS host fields remain optional role-specific overrides
+- Direct GridBOSS transfer diagnosis
+  - read-only GridBOSS input-register polling for grid/generator/UPS terminals
+  - same-sequence correlation with FlexBOSS local AC input/EPS telemetry
+  - bounded JSONL transition trace retaining raw register evidence
 - Uncleared error monitoring
   - active problem binary sensor
   - count + summary + top open event details
+- Read-only controller capture correction (2026-11-09)
+  - corrected GridBOSS local GPIO4500/10 and FlexBOSS warning60/61 observation
+  - both inverters now retain ordinary command/limiter/previous-state inputs142–145
+  - [deployed profiles, measured gaps and diagnostic limits](docs/mother-of-all-data-loggers.md#controller-diagnostics-deployed); no inverter firmware or power-setting changes
 
 ## Quick Start
 
@@ -35,10 +55,101 @@ This project was expanded from simple single-device polling to a site-aware mode
 ## Key Entities
 
 - Site power: `sensor.grid_power`, `sensor.load_power`, `sensor.grid_voltage`, `sensor.grid_frequency`, `sensor.eps_voltage`
+- Transfer diagnosis: `sensor.eg4_site_gridboss_generator_power`, `sensor.eg4_site_gridboss_generator_voltage`, `sensor.eg4_site_gridboss_ups_voltage`, `sensor.eg4_site_gridboss_transfer_observation`, `sensor.eg4_site_flexboss_local_ac_input_voltage`, `sensor.eg4_site_flexboss_local_eps_voltage`
 - Battery: `sensor.battery_state_of_charge`, `sensor.battery_power`, `sensor.battery_charging_power`, `sensor.battery_discharging_power`, `sensor.battery_power_direction`, `sensor.battery_energy_remaining`
-- Energy: `sensor.today_usage`, `sensor.total_usage`, `sensor.today_export`, `sensor.total_export`, `sensor.ups_usage_today`, `sensor.ups_usage_total`, `sensor.today_solar_yield`, `sensor.total_solar_yield`
+- Energy: `sensor.today_usage`, `sensor.total_usage`, `sensor.today_export`, `sensor.total_export`, `sensor.ups_usage_today`, `sensor.ups_usage_total`, `sensor.today_solar_yield`, `sensor.total_solar_yield`, `sensor.eg4_site_battery_charge_today`, `sensor.eg4_site_battery_discharge_today`
+- Diagnostics: `binary_sensor.eg4_site_eg4_data_stale`, `sensor.eg4_site_grid_quality_state`, `sensor.grid_outage_duration_24h`, `sensor.eg4_site_battery_estimated_runtime`
 - Generator: `binary_sensor.generator_running`, `binary_sensor.generator_supplying_power`, `sensor.generator_status_source`
+- Stateful logger: `sensor.eg4_site_generator_run_state`, `binary_sensor.eg4_site_generator_gridboss_supplying`, `sensor.eg4_site_charge_session_state`, `binary_sensor.eg4_site_battery_charge_session_active`
 - Active faults: `binary_sensor.uncleared_error_active`, `sensor.uncleared_error_count`, `sensor.uncleared_error_summary`
+
+### Battery SOC trust
+
+When the portal identifies the bank as `LEAD_ACID`, its cloud `soc`/capacity
+fields are not treated as authoritative: the portal payload has no BMS pack SOC
+rows (`batteryArray`/`remainCapacity` are empty), and the EG4 web UI hides SOC for
+this battery type. Without a validated local BMS snapshot,
+`sensor.battery_state_of_charge` is unavailable while the portal value is
+retained explicitly as **unverified**. When an auto-discovered or manually
+configured local FlexBOSS dongle returns a structurally valid BMS summary, the
+packed SOC is promoted as
+`SOCSource: local_bms`; this is the automation-grade path in this integration.
+
+### Local inverter telemetry discovery
+
+The installation also has three reachable EG4 Wi-Fi dongles on the IOT VLAN:
+
+- `192.168.3.14:8000` — FlexBOSS master `54700E0353`
+- `192.168.3.162:8000` — FlexBOSS slave `52842P0677`
+- `192.168.3.241:8000` — GridBOSS `4354850310`
+
+They speak the proprietary `A1 1A` LuxPower/EG4 TCP framing, not standard
+Modbus TCP. Read-only probes of the master returned battery voltage from input
+register 4 (0.1 V units), packed SOC/SOH from register 5, and populated BMS
+summary fields (parallel packs, current, cell-voltage extremes, temperatures,
+and cycle count). The master and portal have reported conflicting SOC values in
+successive samples. Because the master also returns the required BMS summary,
+the integration promotes its packed SOC as `SOCSource: local_bms`; the portal
+value remains diagnostic/unverified. If the BMS summary disappears, canonical
+SOC fails closed again. The slave and GridBOSS dongles do not currently expose
+populated BMS ranges.
+
+The integration polls FlexBOSS dongles read-only and exposes local
+voltage/power plus BMS summary diagnostics. Auto-discovery is enabled by default:
+it first probes private IP addresses reported by the authenticated portal, then
+falls back to bounded scans of Home Assistant's local IPv4 segments when no
+FlexBOSS is found. Public portal IPs are never scanned. The two host fields
+remain optional manual overrides (`192.168.3.14` and `192.168.3.162` for this
+installation).
+
+Trace logging is enabled by default: one bounded JSONL record per core poll
+(default 1 second), with BMS refreshes every 5 seconds. The files are
+under `/config/.eg4-investigation/local-dongle/<entry_id>/` on HAOS.
+The stateful logger also exposes high-rate generator AC-evidence and battery
+charging-session entities, restores its active session across restarts, retains
+up to 90 days/100 completed sessions, and fires accepted transition events:
+`eg4_monitor_generator_state_changed`,
+`eg4_monitor_generator_transfer_observation_changed`,
+`eg4_monitor_charging_session_started`, and
+`eg4_monitor_charging_session_ended`. Generator state is inferred from fresh
+GridBOSS terminal voltage/frequency/power; it is not a mechanical engine or
+relay-contact measurement. See
+[`docs/mother-of-all-data-loggers.md`](docs/mother-of-all-data-loggers.md) and
+the raw-editor dashboard template at
+[`docs/mother-of-all-data-loggers-dashboard.yaml`](docs/mother-of-all-data-loggers-dashboard.yaml).
+The live Trigo HA storage dashboard is **EG4 Mother of All Data** at
+`/eg4-data-logger`.
+Do not run a second persistent client against a dongle without accounting for
+the dongle's single-client limit. Discovery occurs during integration setup or
+reload; reload the integration after a dongle address or network change.
+
+The discovery diagnostic sensor exposes `Source`, `ManualHosts`,
+`PortalReportedIPs`, `PortalLocalIPs`, `ScannedNetworks`, `ScannedHostCount`,
+and `Discovered` attributes. The 2026-08-11 deployment validation used blank
+manual host overrides and found both FlexBOSS dongles through the local-LAN
+fallback.
+
+### WallMount 280Ah / five-module wiring and charge settings
+
+The current EG4 WallMount 280Ah manual documents internal battery busbars for
+up to four batteries with two inverters. A five-battery/two-inverter system
+requires the manual's external fused-positive and unfused-negative busbar
+arrangement, rated at least 200 A per battery. Verify the installed wiring with
+a qualified installer; unequal current sharing can create both voltage-drop and
+per-battery SOC divergence.
+
+For this five-module bank, the nominal capacity is 1,400 Ah / approximately
+71.7 kWh. A 9.7 kW discharge is only about 0.14C when current sharing is
+balanced, so 50.6 V should be interpreted with the local cell-extrema and
+wiring measurements—not as a standalone SOC lookup.
+
+Manufacturer PDFs and the detailed voltage-mode decision are retained in the
+local research copy, not distributed with this integration PR. The documented
+site operating decision remains voltage-mode AC charging: **52.0 V start**,
+**56.2 V stop**, and **54.0 V float**. The stop/float values follow EG4's
+[280Ah battery specification](https://eg4electronics.com/wp-content/uploads/2024/04/EG4%C2%AE-Indoor-280Ah-Battery-Specifications-Sheet.pdf);
+59 V is not a normal charge threshold. These are historical site settings,
+not changes authorized by the [host-recorder initiative](docs/host-recorder-mvp-spec.md).
 
 ## Automation Reference
 
@@ -77,8 +188,13 @@ Keep secrets out of git. `.gitignore` is set to ignore `.env`, `.env.local`, and
 
 ## Notes
 
-- This integration is cloud portal based today.
-- Local CAN/Modbus transport can be added later behind the same normalized site model.
+- Cloud portal data remains the site-wide diagnostic/energy source; optional local
+  dongle polling supplies automation-grade battery BMS telemetry when available.
+- Direct battery CAN/Modbus transport remains a future option behind the same
+  normalized site model.
+- Curated project knowledge is maintained under [`docs/okf/`](docs/okf/),
+  including the discovery integration and local-BMS SOC decision. Validate it
+  with `python3 ~/.agents/skills/okf-project-knowledge/scripts/validate-okf-bundle.py docs/okf --strict-links`.
 
 ## Disclaimer
 
