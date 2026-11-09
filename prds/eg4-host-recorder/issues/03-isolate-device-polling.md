@@ -2,7 +2,7 @@
 id: EG4REC-03
 title: Keep healthy devices recording when another device stalls
 type: AFK
-status: ready
+status: in-progress
 phase: delivery
 source_github: null
 source_business_need: conversation-provisional
@@ -47,3 +47,13 @@ Run independently scheduled role acquisition through the established transport a
 ## Blocked by
 
 - [02-correct-generator-and-charge-state.md](./02-correct-generator-and-charge-state.md)
+
+## Pull request stack
+
+Stack root: `main` at `c6a9cbdc16dd8766e1ac1de5ab3ab736c1c529b1`; the complete truthful-state slice is merged.
+
+| Key | Branch | Purpose | Predecessor / PR base | Acceptance advanced |
+| --- | --- | --- | --- | --- |
+| 3.1 | `codex/eg4-host-recorder-3.1-independent-polling` | One local capture owner with independent role loops, fixed dynamic/maintenance profiles, original per-block context and live diagnostic health | `main` at the stack root | All EG4REC-03 acceptance criteria and A3, preserving A1–A5 |
+
+Move the existing local acquisition/cache/scheduling policy out of the setup closure into one cohesive module, rather than adding another collector. Reuse the transport, decoder, writer and logger. The same start/close/snapshot interface is exercised by production and loopback tests; portal consumers use snapshots, not additional reads. One green entry avoids a layer-only refactor PR. Journal persistence/incident policy and deployment remain later tickets.

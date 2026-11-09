@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, TypeVar
 from uuid import uuid4
+from weakref import WeakValueDictionary
 
 from .const import LOCAL_DONGLE_TRACE_SCHEMA
 
@@ -29,6 +30,7 @@ _GRIDBOSS_FREQUENCY_REGISTER = 120
 _GRIDBOSS_FREQUENCY_COUNT = 12
 _MAX_PACKET_SIZE = 4096
 _MAX_TRANSACTION_BYTES = 256 * 1024
+_ROUTE_REQUEST_LOCKS: WeakValueDictionary[tuple[str, int], asyncio.Lock] = WeakValueDictionary()
 _Decoded = TypeVar("_Decoded")
 _VALID_STATUS_CODES = frozenset(
     {0x00, 0x04, 0x08, 0x0C, 0x10, 0x11, 0x14, 0x20, 0x28, 0x40, 0x80, 0xC0}
@@ -969,17 +971,9 @@ class EG4LocalDongle:
     """Short-lived, read-only client for one EG4 Wi-Fi dongle.
 
     A new TCP connection is used for each register range. An unsolicited cached
-    frame may arrive after connect. Request serialization is integration-local;
-    a hard hardware single-client limit has not been established.
+    frame may arrive after connect. Clients for the configured host/port share
+    request serialization; a hard hardware single-client limit is not established.
     """
-
-    # FAAB-27xx handlers 08042f80/08042c58 copy fully initialized ranges from
-    # serializers 0805c61c/0805e73c. These are not GridBOSS holding indices.
-    _DIAGNOSTIC_RANGES = (
-        (MODBUS_READ_INPUT, 40, 40),
-        (MODBUS_READ_HOLDING, 110, 125),
-        (MODBUS_READ_INPUT, 120, 26),
-    )
 
     def __init__(
         self,
@@ -999,7 +993,12 @@ class EG4LocalDongle:
         self.evidence_sink = evidence_sink
         self.role = role
         self.session_id = session_id or str(uuid4())
-        self._request_lock = asyncio.Lock()
+        route = (host, port)
+        request_lock = _ROUTE_REQUEST_LOCKS.get(route)
+        if request_lock is None:
+            request_lock = asyncio.Lock()
+            _ROUTE_REQUEST_LOCKS[route] = request_lock
+        self._request_lock = request_lock
         self._capture_context: ContextVar[dict[str, Any] | None] = ContextVar(
             f"eg4_capture_{id(self)}", default=None
         )
@@ -1238,6 +1237,20 @@ class EG4LocalDongle:
     ) -> tuple[DongleFrame, str, dict[str, Any]]:
         return await self._transaction(register, count, function=function, timeout=timeout)
 
+    async def async_read_register_block(
+        self,
+        register: int,
+        count: int,
+        *,
+        function: int = MODBUS_READ_INPUT,
+        timeout: float | None = None,
+    ) -> DongleFrame:
+        """Return one validated FC03/FC04 block after queuing its raw evidence."""
+        frame, _, _ = await self._read_registers(
+            register, count, function=function, timeout=timeout,
+        )
+        return frame
+
     async def async_read_core_snapshot(self) -> EG4LocalTelemetry:
         """Read the fast core range used for second-level tracing."""
         with self._acquisition():
@@ -1269,48 +1282,9 @@ class EG4LocalDongle:
             bms = await self.async_read_bms_snapshot()
             return merge_local_telemetry(core, bms)
 
-    async def async_read_diagnostics(self) -> list[dict]:
-        """Capture independent, read-only blocks without failing primary telemetry."""
-        with self._acquisition() as acquisition:
-            blocks: list[dict] = []
-            loop = asyncio.get_running_loop()
-            for function, register, count in self._DIAGNOSTIC_RANGES:
-                started = loop.time()
-                block: dict[str, Any] = {
-                    "function": function, "register": register, "count": count,
-                    "started_at": datetime.now(UTC).isoformat(),
-                    "acquisition_id": acquisition["acquisition_id"],
-                    "ok": False, "values": None,
-                }
-                transaction_index = len(acquisition["transaction_ids"])
-                try:
-                    frame, _, _ = await self._read_registers(
-                        register, count, function=function,
-                        timeout=min(self.timeout, 2.0),
-                    )
-                except (
-                    OSError, asyncio.TimeoutError, asyncio.IncompleteReadError,
-                    DongleFrameError,
-                ) as err:
-                    block["error"] = f"{type(err).__name__}: {err}"
-                else:
-                    block["ok"] = True
-                    block["values"] = frame.values
-                block["transaction_id"] = acquisition["transaction_ids"][transaction_index]
-                block["completed_at"] = datetime.now(UTC).isoformat()
-                block["duration_ms"] = (loop.time() - started) * 1000.0
-                blocks.append(block)
-            return blocks
-
 
 class EG4GridBossDongle(EG4LocalDongle):
     """Read-only client for the GridBOSS input-register telemetry ranges."""
-
-    # Local 0800e9b0 copies the 20-byte GPIO serializer at 2*(start-4500).
-    _DIAGNOSTIC_RANGES = (
-        (MODBUS_READ_INPUT, 500, 100),
-        (MODBUS_READ_HOLDING, 4500, 10),
-    )
 
     async def async_read_snapshot(self) -> EG4GridBossTelemetry:
         """Read source/output power ranges and classify the observed transfer."""

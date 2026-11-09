@@ -2,7 +2,7 @@
 id: EG4REC-02
 title: Make generator and charging states truthful through gaps
 type: AFK
-status: in-progress
+status: done
 phase: delivery
 source_github: null
 source_business_need: conversation-provisional
@@ -21,10 +21,10 @@ depends_on_story_ids:
 - 4
 slice_order: 2
 completion_evidence:
-  implementation_commit: null
-  red_evidence: null
-  green_evidence: null
-  alignment_verified: false
+  implementation_commit: ed7f5931fce83db5d2d4fce541be86aff7aaedb5
+  red_evidence: /tmp/eg4-host-recorder/2.1-red.txt
+  green_evidence: /tmp/eg4-host-recorder/2.1-green.txt
+  alignment_verified: true
 ---
 
 ## What to build
@@ -33,14 +33,14 @@ Feed the existing logger truthful acquisition identity, freshness and per-role c
 
 ## Acceptance criteria
 
-- [ ] A4:239 V / qualified0 Hz /0 W yields PresenceState=present, SupplyState=not_supplying, RunState=unknown, Quality=interrupted and Confidence=unknown, with a qualified-frequency reason and never generator_voltage_absent. Mechanical engine state remains unmeasured.
-- [ ] Terminal voltage, qualified-frequency validity, accepted power and inferred run state remain separate. Existing hysteresis for coherent normal readings is preserved rather than changing equipment protections or inventing interpretations for rejected data.
-- [ ] Only distinct successful source acquisitions contribute to debounce. Cached repeats retain their original identity/time/quality and age at consumption, even if processing time advances or another refresh is slow.
-- [ ] A complete charge total requires fresh observations from every configured participating inverter. Missing master plus zero-watt slave remains partial/unknown with per-role context, not a complete zero.
-- [ ] A5: partial/unknown samples keep an active charge session open and interrupted. No energy integration crosses an interval with an unknown endpoint; no stop dwell or pending transition carries through a gap/restart.
-- [ ] A restored active session is interrupted without a synthetic start event. Last-known transfer state survives a gap; a changed resumed observation carries intervening_unknown=true rather than an invented physical transition time.
-- [ ] Logger documentation distinguishes debounced state from immediate raw controller/transfer observations and does not claim either is physical contact feedback.
-- [ ] Focused sample/event and restoration regressions prove A4–A5, including cached duplicates and incomplete-role totals. Normal coherent transitions remain covered by relevant existing tests.
+- [x] A4:239 V / qualified0 Hz /0 W yields PresenceState=present, SupplyState=not_supplying, RunState=unknown, Quality=interrupted and Confidence=unknown, with a qualified-frequency reason and never generator_voltage_absent. Mechanical engine state remains unmeasured.
+- [x] Terminal voltage, qualified-frequency validity, accepted power and inferred run state remain separate. Existing hysteresis for coherent normal readings is preserved rather than changing equipment protections or inventing interpretations for rejected data.
+- [x] Only distinct successful source acquisitions contribute to debounce. Cached repeats retain their original identity/time/quality and age at consumption, even if processing time advances or another refresh is slow.
+- [x] A complete charge total requires fresh observations from every configured participating inverter. Missing master plus zero-watt slave remains partial/unknown with per-role context, not a complete zero.
+- [x] A5: partial/unknown samples keep an active charge session open and interrupted. No energy integration crosses an interval with an unknown endpoint; no stop dwell or pending transition carries through a gap/restart.
+- [x] A restored active session is interrupted without a synthetic start event. Last-known transfer state survives a gap; a changed resumed observation carries intervening_unknown=true rather than an invented physical transition time.
+- [x] Logger documentation distinguishes debounced state from immediate raw controller/transfer observations and does not claim either is physical contact feedback.
+- [x] Focused sample/event and restoration regressions prove A4–A5, including cached duplicates and incomplete-role totals. Normal coherent transitions remain covered by relevant existing tests.
 
 ## Blocked by
 
@@ -74,3 +74,7 @@ Standards review of `50667ac` found no actionable new findings. Spec found that 
 - Primary success/failure is now tracked separately from retained last-good values/provenance. Failure is fed to the logger immediately, before BMS/diagnostic work or a subsequent success can hide the interruption.
 - Offline real-TCP/HA/logger/storage replay compared the `50667ac` producer with its correction in both persistence modes: old code ended a session at recovery, integrated0.001→0.003kWh across the failed observation, and omitted resumed-transfer uncertainty. Corrected code kept the session open, held energy at0.001kWh until a new endpoint, and emitted `intervening_unknown=true`. Evidence: `/tmp/eg4-host-recorder/2.1-continuity-red-green.txt`.
 - After corrections:63 focused tests, Ruff and Pyright0 errors passed. The temporary replay script was removed. No live outage, equipment write, or deployment was performed.
+
+### Completion
+
+Both review axes found no remaining correction findings at `ed7f593`. GitHub verified PR3 head/base and the final incremental diff, then merged the complete entry as `c6a9cbdc16dd8766e1ac1de5ab3ab736c1c529b1`. Evidence: `/tmp/eg4-host-recorder/2.1-merged.json`. Acceptance, focused verification, review and merge are complete; no HA deployment yet.

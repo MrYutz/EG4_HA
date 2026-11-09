@@ -1281,6 +1281,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up EG4 sensors based on a config entry."""
     coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
+    logger_coordinator = hass.data[DOMAIN][entry.entry_id].get("logger_coordinator")
     device_info = {
         "identifiers": {(DOMAIN, f"{entry.entry_id}_site")},
         "name": "EG4 Site",
@@ -1297,7 +1298,15 @@ async def async_setup_entry(
             continue
         if entry.options.get(description.key, True):
             entities.append(
-                EG4Sensor(coordinator, description, entry.entry_id, device_info)
+                EG4Sensor(
+                    logger_coordinator
+                    if description.key == "local_dongle_count"
+                    and logger_coordinator is not None
+                    else coordinator,
+                    description,
+                    entry.entry_id,
+                    device_info,
+                )
             )
 
     if entry.options.get("battery_charging_energy_estimated", True):
@@ -1324,7 +1333,6 @@ async def async_setup_entry(
             )
         )
 
-    logger_coordinator = hass.data[DOMAIN][entry.entry_id].get("logger_coordinator")
     if logger_coordinator is not None:
         entities.extend(
             EG4LoggerSensor(
