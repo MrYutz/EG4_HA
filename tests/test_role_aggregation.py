@@ -2,6 +2,8 @@
 
 from datetime import UTC, datetime
 
+import pytest
+
 from custom_components.eg4_monitor.local_dongle import (
     EG4LocalDongleIdentity,
     EG4LocalTelemetry,
@@ -317,7 +319,9 @@ def test_local_bms_soc_authorizes_canonical_lead_acid_soc() -> None:
         bms_available=True,
     )
 
-    _apply_local_telemetry_snapshot(aggregate, {"flexboss_master": telemetry})
+    _apply_local_telemetry_snapshot(
+        aggregate, {"flexboss_master": telemetry}, configured_roles={"flexboss_master"}
+    )
     _apply_battery_data_quality_guards(aggregate)
 
     battery = aggregate["Battery"]
@@ -366,7 +370,9 @@ def test_local_inverter_soc_stays_unverified_without_bms() -> None:
         bms_available=False,
     )
 
-    _apply_local_telemetry_snapshot(aggregate, {"flexboss_slave": telemetry})
+    _apply_local_telemetry_snapshot(
+        aggregate, {"flexboss_slave": telemetry}, configured_roles={"flexboss_slave"}
+    )
     _apply_battery_data_quality_guards(aggregate)
 
     battery = aggregate["Battery"]
@@ -376,6 +382,49 @@ def test_local_inverter_soc_stays_unverified_without_bms() -> None:
     assert battery["LocalSOCSource"] == "local_inverter_unverified"
     assert battery["LocalBMSSOC"] is None
     assert battery["LocalBMSAvailable"] is False
+
+
+@pytest.mark.parametrize(
+    ("charge_by_role", "expected_charge", "missing_roles"),
+    [
+        ({}, None, ["flexboss_master", "flexboss_slave"]),
+        ({"flexboss_slave": 0.0}, None, ["flexboss_master"]),
+        ({"flexboss_master": None, "flexboss_slave": 0.0}, None, []),
+        ({"flexboss_master": float("nan"), "flexboss_slave": 0.0}, None, []),
+        ({"flexboss_master": 1500.0, "flexboss_slave": 0.0}, 1500.0, []),
+        ({"flexboss_master": 0.0, "flexboss_slave": 0.0}, 0.0, []),
+    ],
+)
+def test_local_charge_total_requires_every_configured_role(
+    charge_by_role: dict[str, float | None],
+    expected_charge: float | None,
+    missing_roles: list[str],
+) -> None:
+    aggregate = {"Battery": {}}
+    snapshots = {
+        role: EG4LocalTelemetry(
+            host="127.0.0.1", port=8000,
+            dongle_serial="DJ12345678", inverter_serial=role,
+            battery_voltage=52.0, battery_soc=None, battery_soh=None,
+            charge_power=power, discharge_power=0.0,
+            bms_parallel_count=None, bms_capacity_ah=None, bms_current=None,
+            bms_max_cell_voltage=None, bms_min_cell_voltage=None,
+            bms_max_cell_temperature=None, bms_min_cell_temperature=None,
+            bms_cycle_count=None, bms_available=False,
+        )
+        for role, power in charge_by_role.items()
+    }
+
+    _apply_local_telemetry_snapshot(
+        aggregate, snapshots,
+        configured_roles={"flexboss_master", "flexboss_slave"},
+    )
+
+    assert aggregate["Battery"]["LocalChargePower"] == expected_charge
+    assert aggregate["LocalTelemetry"]["MissingRoles"] == missing_roles
+    assert set(aggregate["LocalTelemetry"]["ByRole"]) == set(charge_by_role)
+    if "flexboss_slave" in charge_by_role:
+        assert aggregate["LocalTelemetry"]["ByRole"]["flexboss_slave"]["ChargePower"] == 0.0
 
 
 def test_lead_acid_portal_soc_is_not_authoritative() -> None:

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from ipaddress import IPv4Address, IPv4Network, ip_network
+from ipaddress import IPv4Address, IPv4Network
 import re
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 _IPV4_PATTERN = re.compile(r"(?<![0-9.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9.])")
 _DEFAULT_MAX_HOSTS = 254
@@ -75,22 +75,22 @@ def _bounded_network(
     max_hosts: int,
 ) -> IPv4Network:
     """Return an interface network, narrowing oversized segments to /24."""
-    network = ip_network(f"{address}/{prefix}", strict=False)
+    network = IPv4Network(f"{address}/{prefix}", strict=False)
     if network.num_addresses - 2 <= max_hosts:
         return network
     narrowed_prefix = max(prefix, 24)
-    return ip_network(f"{address}/{narrowed_prefix}", strict=False)
+    return IPv4Network(f"{address}/{narrowed_prefix}", strict=False)
 
 
 def local_networks_from_adapters(
-    adapters: Iterable[dict[str, Any]],
+    adapters: Iterable[Mapping[str, Any]],
     *,
     max_hosts: int = _DEFAULT_MAX_HOSTS,
 ) -> tuple[IPv4Network, ...]:
     """Build bounded IPv4 networks from Home Assistant network adapters."""
     networks: set[IPv4Network] = set()
     for adapter in adapters:
-        if not isinstance(adapter, dict) or not adapter.get("enabled", False):
+        if not isinstance(adapter, Mapping) or not adapter.get("enabled", False):
             continue
         for info in adapter.get("ipv4") or ():
             if not isinstance(info, dict):
