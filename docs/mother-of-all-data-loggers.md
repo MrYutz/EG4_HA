@@ -9,17 +9,23 @@ The integration now has a stateful logger for the local telemetry path:
 - Generator state is inferred from GridBOSS generator voltage/frequency and power.
   It is explicitly **AC evidence**, not proof of the mechanical engine state or
   transfer-relay position.
-- Generator transitions use hysteresis and two consecutive samples before an
-  accepted state change.
-- Battery charging sessions use all available FlexBOSS local charge-power samples.
-  If no local dongle exists, the portal battery charge-power sample is used at the
-  normal integration polling cadence.
+- Normal generator transitions use hysteresis and two distinct successful source
+  acquisitions. Reprocessing a cached value under a new loop sequence cannot
+  confirm a transition or make its acquisition timestamp fresh.
+- A complete charging total requires fresh charge-power evidence from **every
+  configured participating inverter**. Missing master plus zero-watt slave is
+  partial/unknown, not a complete zero. Per-role identity, age and power remain
+  available as context. Portal-only sites use explicitly identified portal
+  observations at their normal polling cadence.
 - Charging sessions use hysteresis, two-sample start/stop debounce plus a
   ten-second minimum stop dwell (the portal-only fallback naturally resolves
   on its next coordinator sample), an estimated energy accumulator, and a
   90-day/100-session bounded ledger.
 - Unknown or stale samples do not end an active charge session. The session remains
   open and is marked `interrupted`.
+- Unknown endpoints and restart gaps break energy-integration continuity and
+  reset pending debounce/stop dwell. A resumed known sample establishes a new
+  endpoint; it cannot integrate the preceding unobserved interval.
 - State is restored from Home Assistant `Store` across restarts. Restore itself
   does not fire a synthetic start event; the first fresh sample reconciles state.
 - Accepted transitions fire HA bus events and are exposed through high-rate logger
@@ -124,7 +130,8 @@ image's identity.
 
 ## New HA event contract
 
-Events fire only after debounce acceptance:
+Generator state and charge-session events use their documented state-machine
+acceptance rules. Raw controller/transfer observations are separate and immediate:
 
 - `eg4_monitor_generator_state_changed`
 - `eg4_monitor_generator_transfer_observation_changed`
@@ -136,6 +143,14 @@ Event data includes `event_id`, `entry_id`, `source_serial`, `source`,
 `to`, `reason`, and the state/session evidence relevant to that event. The
 transfer event remains an observation; it must not be treated as relay-contact
 truth.
+Missing observations retain the last-known transfer state. A changed resumed
+observation carries `intervening_unknown=true`; it does not locate a physical
+switching event inside the gap.
+
+For239 V terminal voltage, qualified0 Hz and0 W accepted power, the generator
+evidence is `PresenceState=present`, `SupplyState=not_supplying`,
+`RunState=unknown`, `Quality=interrupted`, `Confidence=unknown`. The reason names
+unavailable/invalid qualified frequency—not absent voltage or a stopped engine.
 
 Example automation trigger:
 
@@ -291,7 +306,7 @@ HA-owned configuration if90-day entity history is required.
    Do not start/stop, load/unload or fault equipment to test this recorder.
 4. Confirm a charging session exposes start, end, duration, quality, and estimated
    session energy.
-5. Stop/restart HA during an active charging session and verify it returns as
-   `interrupted` rather than generating a synthetic start.
+5. Replay saved active-session state offline and verify restoration is
+   `interrupted` without a synthetic start; do not add a production restart.
 6. Confirm the `TracePath` attribute on `sensor.eg4_site_local_eg4_dongles_available` and
    inspect the JSONL record sequence when diagnosing a transfer.

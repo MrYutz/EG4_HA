@@ -2,7 +2,7 @@
 id: EG4REC-02
 title: Make generator and charging states truthful through gaps
 type: AFK
-status: ready
+status: in-progress
 phase: delivery
 source_github: null
 source_business_need: conversation-provisional
@@ -45,3 +45,23 @@ Feed the existing logger truthful acquisition identity, freshness and per-role c
 ## Blocked by
 
 - [01-preserve-raw-dongle-evidence.md](./01-preserve-raw-dongle-evidence.md)
+
+## Pull request stack
+
+Stack root: `main` at `4d56dfc127001a1f23c1de100976e20f90f8abb0`; EG4REC-01's complete stack is merged and its acceptance evidence recorded.
+
+| Key | Branch | Purpose | Predecessor / PR base | Acceptance advanced |
+| --- | --- | --- | --- | --- |
+| 2.1 | `codex/eg4-host-recorder-2.1-truthful-state` | Correct logger classification/gap continuity and feed original source identities, freshness and complete-role totals from the integration | `main` at the stack root | All EG4REC-02 acceptance criteria, A4–A5 |
+
+One green entry is sufficient; no layer-only PR. Existing approved seams: logger samples/events/restoration and integration aggregation with controlled source observations. Preserve coherent-sample hysteresis, entity IDs and source uncertainty. No scheduling redesign, power settings, firmware changes or production deployment in this slice.
+
+### Verification progress
+
+- Red:239 V / qualified0 Hz /0 W produced `PresenceState=off` instead of `present` before correction. Evidence: `/tmp/eg4-host-recorder/2.1-red.txt`.
+- Logger-only green:24 public sample/event/restore regressions passed; Ruff passed; logger Pyright0 errors. Integration producer verification and two-axis review remain required.
+- HA input type compatibility: read-only adapter/options mappings are accepted without copying or changing configured values; IPv4 construction and optional fuel values now express their existing narrowed contracts. Existing discovery/normalization11 tests and helper Pyright passed; a real read-only mapping smoke produced `192.168.3.0/24` and50% fuel from50/100 gallons. Evidence: `/tmp/eg4-host-recorder/2.1-readonly-inputs.txt`. No equipment settings or runtime profile change is included.
+
+- Integrated green:63 focused logger/aggregation/discovery/normalization tests passed, Ruff passed, and Pyright on all four changed production modules reported0 errors.
+- Offline production-closure smoke used real loopback TCP, HomeAssistant/Store/coordinator, logger and optional trace writer. Both persistence-enabled and disabled runs preserved original source times/IDs, rejected cached repeats, retained partial missing-master/zero-slave totals and rejected an aged GridBOSS source window. Evidence: `/tmp/eg4-host-recorder/2.1-source-green.txt`. Time separation was controlled by an offline UTC clock, not a live wall-clock device stall. This is not full HA setup/coordinator proof; production loading remains EG4REC-06.
+- An additional public assertion confirms an interrupted partial charge session remains active/open. The temporary smoke script was removed after proof; results remain outside Git.

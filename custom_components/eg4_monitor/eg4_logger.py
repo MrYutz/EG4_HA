@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-import hashlib
-import json
 import math
 from typing import Any
 from uuid import uuid4
@@ -88,37 +86,16 @@ def _nonnegative_int(value: Any, default: int = 0) -> int:
     return max(parsed, 0)
 
 
-def _sample_fingerprint(sample: "LoggerSample") -> str:
-    """Build a stable fingerprint for duplicate sequence suppression."""
-    payload = {
-        key: getattr(sample, key)
-        for key in (
-            "sequence",
-            "source_serial",
-            "charge_source_serial",
-            "generator_source_available",
-            "generator_input_registers_valid",
-            "generator_voltage",
-            "generator_frequency",
-            "generator_power",
-            "transfer_state",
-            "charge_source_available",
-            "charge_power_w",
-            "charge_source",
-            "process_generator",
-            "process_charge",
-        )
-    }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-
-
 @dataclass(frozen=True)
 class LoggerSample:
     """One correlated local sample used by both state machines."""
 
     observed_at: datetime
+    generator_acquisition_id: str | None
+    generator_acquired_at: datetime | None
+    charge_acquisition_id: str | None
+    charge_acquired_at: datetime | None
+    charge_role_context: dict[str, dict[str, Any]]
     sequence: int | None = None
     source_serial: str | None = None
     charge_source_serial: str | None = None
@@ -156,16 +133,24 @@ class GeneratorStateMachine:
         self.last_transition_event_id: str | None = None
         self.transition_count = 0
         self.last_observed_at: datetime | None = None
-        self.last_sample_age_seconds: float | None = None
+        self.last_acquisition_id: str | None = None
+        self.last_acquired_at: datetime | None = None
         self.last_voltage: float | None = None
         self.last_frequency: float | None = None
         self.last_power: float | None = None
         self.last_transfer_state: str | None = None
+        self.last_transfer_acquisition_id: str | None = None
+        self.last_transfer_at: datetime | None = None
+        self.transfer_intervening_unknown = False
 
     @staticmethod
     def _classify(sample: LoggerSample) -> tuple[str, str, str, str]:
         """Classify one fresh sample, preserving unknown/conflict states."""
-        if not sample.generator_source_available:
+        if (
+            not sample.generator_source_available
+            or sample.generator_acquisition_id is None
+            or sample.generator_acquired_at is None
+        ):
             return "unknown", "unknown", "unknown", "gridboss_unavailable"
         if not sample.generator_input_registers_valid:
             return "unknown", "unknown", "unknown", "gridboss_registers_invalid"
@@ -173,12 +158,11 @@ class GeneratorStateMachine:
         voltage = _finite_float(sample.generator_voltage)
         frequency = _finite_float(sample.generator_frequency)
         power = _finite_float(sample.generator_power)
-        if voltage is None or frequency is None:
-            return "unknown", "unknown", "unknown", "generator_voltage_or_frequency_missing"
-
-        if voltage >= GENERATOR_ON_VOLTAGE and frequency >= GENERATOR_ON_FREQUENCY:
+        if voltage is None:
+            presence = "unknown"
+        elif voltage >= GENERATOR_ON_VOLTAGE:
             presence = "present"
-        elif voltage <= GENERATOR_OFF_VOLTAGE or frequency <= GENERATOR_OFF_FREQUENCY:
+        elif voltage <= GENERATOR_OFF_VOLTAGE:
             presence = "off"
         else:
             presence = "unknown"
@@ -192,8 +176,19 @@ class GeneratorStateMachine:
         else:
             supply = "unknown"
 
+        if presence == "present" and (
+            frequency is None or frequency < GENERATOR_ON_FREQUENCY
+        ):
+            return (
+                "unknown", presence, supply,
+                "generator_qualified_frequency_invalid_or_unavailable",
+            )
+        if voltage is None or frequency is None:
+            return "unknown", presence, supply, "generator_voltage_or_frequency_missing"
         if presence == "unknown" or supply == "unknown":
             return "unknown", presence, supply, "generator_signal_between_hysteresis_bands"
+        if presence == "off" and frequency > GENERATOR_OFF_FREQUENCY:
+            return "unknown", presence, supply, "generator_voltage_frequency_conflict"
         if presence == "off" and supply == "not_supplying":
             return "off", presence, supply, "generator_voltage_absent"
         if presence == "present" and supply == "supplying":
@@ -209,26 +204,49 @@ class GeneratorStateMachine:
         self.last_voltage = _finite_float(sample.generator_voltage)
         self.last_frequency = _finite_float(sample.generator_frequency)
         self.last_power = _finite_float(sample.generator_power)
-        self.last_transfer_state = sample.transfer_state
+        distinct = (
+            sample.generator_source_available
+            and sample.generator_acquisition_id is not None
+            and sample.generator_acquired_at is not None
+            and sample.generator_acquisition_id != self.last_acquisition_id
+        )
+        gap = _seconds_between(sample.generator_acquired_at, self.last_acquired_at)
+        if distinct:
+            self.last_acquisition_id = sample.generator_acquisition_id
+            self.last_acquired_at = sample.generator_acquired_at
+        if gap is not None and gap > MAX_SAMPLE_GAP_SECONDS:
+            self.candidate_state = None
+            self.candidate_count = 0
+            self.unknown_count = 0
         target, presence, supply, reason = self._classify(sample)
         self.presence_state = presence
         self.supply_state = supply
         self.reason = reason
-        self.quality = "good" if target != "unknown" else "interrupted"
-        self.unknown_count = self.unknown_count + 1 if target == "unknown" else 0
-
-        if target != self.candidate_state:
-            self.candidate_state = target
-            self.candidate_count = 1
+        if target == "unknown":
+            self.quality = "interrupted"
+        elif distinct:
+            self.quality = "good"
+        if target == "unknown":
+            # An interruption invalidates normal debounce immediately. Unknown
+            # itself retains its existing debounce rather than implying a stop.
+            self.candidate_state = None
+            self.candidate_count = 0
+            if distinct or not sample.generator_source_available:
+                self.unknown_count += 1
+            if self.unknown_count < UNKNOWN_DEBOUNCE_SAMPLES:
+                return None
         else:
-            self.candidate_count += 1
-
-        required = (
-            UNKNOWN_DEBOUNCE_SAMPLES
-            if target == "unknown"
-            else GENERATOR_DEBOUNCE_SAMPLES
-        )
-        if self.candidate_count < required or target == self.run_state:
+            self.unknown_count = 0
+            if not distinct:
+                return None
+            if target != self.candidate_state:
+                self.candidate_state = target
+                self.candidate_count = 1
+            else:
+                self.candidate_count += 1
+            if self.candidate_count < GENERATOR_DEBOUNCE_SAMPLES:
+                return None
+        if target == self.run_state:
             return None
 
         previous = self.run_state
@@ -252,12 +270,43 @@ class GeneratorStateMachine:
         }
         return transition
 
+    def update_transfer(self, sample: LoggerSample) -> dict[str, Any] | None:
+        """Observe raw controller state, not debounced state or contact feedback."""
+        if (
+            not sample.generator_source_available
+            or sample.generator_acquisition_id is None
+            or sample.generator_acquired_at is None
+            or sample.transfer_state is None
+        ):
+            self.transfer_intervening_unknown = True
+            return None
+        if sample.generator_acquisition_id == self.last_transfer_acquisition_id:
+            return None
+        gap = _seconds_between(sample.generator_acquired_at, self.last_transfer_at)
+        if gap is not None and gap > MAX_SAMPLE_GAP_SECONDS:
+            self.transfer_intervening_unknown = True
+        previous = self.last_transfer_state
+        self.last_transfer_state = sample.transfer_state
+        self.last_transfer_acquisition_id = sample.generator_acquisition_id
+        self.last_transfer_at = sample.generator_acquired_at
+        intervening_unknown = self.transfer_intervening_unknown
+        self.transfer_intervening_unknown = False
+        if previous is None or previous == sample.transfer_state:
+            return None
+        return {
+            "event_type": EVENT_GENERATOR_TRANSFER_CHANGED,
+            "from": previous,
+            "to": sample.transfer_state,
+            "reason": "gridboss_transfer_observation_changed",
+            "intervening_unknown": intervening_unknown,
+        }
+
     def snapshot(self, now: datetime) -> dict[str, Any]:
         """Return an HA-friendly view of generator state."""
         duration = None
         if self.run_state in {"on_not_supplying", "running_supplying"}:
             duration = _seconds_between(now, self.last_on_at)
-        age = _seconds_between(now, self.last_observed_at)
+        age = _seconds_between(now, self.last_acquired_at)
         return {
             "RunState": self.run_state,
             "PresenceState": self.presence_state,
@@ -272,6 +321,8 @@ class GeneratorStateMachine:
             "GeneratorFrequency": self.last_frequency,
             "GeneratorPower": self.last_power,
             "TransferObservation": self.last_transfer_state,
+            "AcquisitionId": self.last_acquisition_id,
+            "AcquiredAt": _iso(self.last_acquired_at),
             "SampleAgeSeconds": round(age, 3) if age is not None else None,
             "RunDurationSeconds": round(duration, 3) if duration is not None else None,
             "LastTransition": _iso(self.last_transition_at),
@@ -299,19 +350,20 @@ class GeneratorStateMachine:
             "last_known_run_state": self.last_known_run_state,
             "quality": self.quality,
             "reason": self.reason,
-            "candidate_state": self.candidate_state,
-            "candidate_count": self.candidate_count,
-            "unknown_count": self.unknown_count,
             "last_transition_at": _iso(self.last_transition_at),
             "last_on_at": _iso(self.last_on_at),
             "last_off_at": _iso(self.last_off_at),
             "last_transition_event_id": self.last_transition_event_id,
             "transition_count": self.transition_count,
             "last_observed_at": _iso(self.last_observed_at),
+            "last_acquisition_id": self.last_acquisition_id,
+            "last_acquired_at": _iso(self.last_acquired_at),
             "last_voltage": self.last_voltage,
             "last_frequency": self.last_frequency,
             "last_power": self.last_power,
             "last_transfer_state": self.last_transfer_state,
+            "last_transfer_acquisition_id": self.last_transfer_acquisition_id,
+            "last_transfer_at": _iso(self.last_transfer_at),
         }
 
     def restore(self, raw: Any) -> None:
@@ -324,21 +376,26 @@ class GeneratorStateMachine:
         self.last_known_run_state = str(
             raw.get("last_known_run_state") or self.run_state
         )
-        self.quality = str(raw.get("quality") or "unknown")
-        self.reason = str(raw.get("reason") or "restored")
-        self.candidate_state = raw.get("candidate_state")
-        self.candidate_count = _nonnegative_int(raw.get("candidate_count"))
-        self.unknown_count = _nonnegative_int(raw.get("unknown_count"))
+        self.quality = "interrupted"
+        self.reason = "restored_across_unknown_gap"
+        self.candidate_state = None
+        self.candidate_count = 0
+        self.unknown_count = 0
         self.last_transition_at = _datetime(raw.get("last_transition_at"))
         self.last_on_at = _datetime(raw.get("last_on_at"))
         self.last_off_at = _datetime(raw.get("last_off_at"))
         self.last_transition_event_id = raw.get("last_transition_event_id")
         self.transition_count = _nonnegative_int(raw.get("transition_count"))
         self.last_observed_at = _datetime(raw.get("last_observed_at"))
+        self.last_acquisition_id = raw.get("last_acquisition_id")
+        self.last_acquired_at = _datetime(raw.get("last_acquired_at"))
         self.last_voltage = _finite_float(raw.get("last_voltage"))
         self.last_frequency = _finite_float(raw.get("last_frequency"))
         self.last_power = _finite_float(raw.get("last_power"))
         self.last_transfer_state = raw.get("last_transfer_state")
+        self.last_transfer_acquisition_id = raw.get("last_transfer_acquisition_id")
+        self.last_transfer_at = _datetime(raw.get("last_transfer_at"))
+        self.transfer_intervening_unknown = True
 
 
 class ChargingSessionMachine:
@@ -352,6 +409,7 @@ class ChargingSessionMachine:
         self.candidate_state: str | None = None
         self.candidate_count = 0
         self.candidate_started_at: datetime | None = None
+        self.unknown_count = 0
         self.active_session: dict[str, Any] | None = None
         self.last_session: dict[str, Any] | None = None
         self.completed_sessions: list[dict[str, Any]] = []
@@ -359,10 +417,17 @@ class ChargingSessionMachine:
         self.last_observed_at: datetime | None = None
         self.last_sample_at: datetime | None = None
         self.last_charge_power_w: float | None = None
+        self.last_acquisition_id: str | None = None
+        self.last_acquired_at: datetime | None = None
+        self.role_context: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _classify(sample: LoggerSample) -> tuple[str, str]:
-        if not sample.charge_source_available:
+        if (
+            not sample.charge_source_available
+            or sample.charge_acquisition_id is None
+            or sample.charge_acquired_at is None
+        ):
             return "unknown", "charge_source_unavailable"
         power = _finite_float(sample.charge_power_w)
         if power is None:
@@ -375,19 +440,17 @@ class ChargingSessionMachine:
 
     def _integrate(self, sample: LoggerSample) -> None:
         """Integrate only fresh, known charge power into the active session."""
-        if self.active_session is None or self.last_sample_at is None:
+        if (
+            self.active_session is None
+            or self.last_sample_at is None
+            or sample.charge_acquired_at is None
+        ):
             return
-        delta = (sample.observed_at - self.last_sample_at).total_seconds()
-        if delta <= 0:
-            return
-        if delta > MAX_SAMPLE_GAP_SECONDS:
-            self.active_session["interrupted"] = True
-            self.active_session["quality"] = "interrupted"
+        delta = (sample.charge_acquired_at - self.last_sample_at).total_seconds()
+        if delta <= 0 or delta > MAX_SAMPLE_GAP_SECONDS:
             return
         power = _finite_float(sample.charge_power_w)
         if power is None:
-            self.active_session["interrupted"] = True
-            self.active_session["quality"] = "interrupted"
             return
         self.active_session["energy_estimated_kwh"] = round(
             float(self.active_session.get("energy_estimated_kwh", 0.0))
@@ -398,13 +461,34 @@ class ChargingSessionMachine:
     def update(self, sample: LoggerSample) -> dict[str, Any] | None:
         """Apply one sample and return a start/end event candidate."""
         now = sample.observed_at
-        self._integrate(sample)
         self.last_observed_at = now
-        self.last_sample_at = now
         self.last_charge_power_w = _finite_float(sample.charge_power_w)
         self.source = sample.charge_source or self.source
+        self.role_context = {
+            role: dict(context) for role, context in sample.charge_role_context.items()
+        }
+        distinct = (
+            sample.charge_source_available
+            and sample.charge_acquisition_id is not None
+            and sample.charge_acquired_at is not None
+            and sample.charge_acquisition_id != self.last_acquisition_id
+        )
+        gap = _seconds_between(sample.charge_acquired_at, self.last_acquired_at)
+        if distinct:
+            self.last_acquisition_id = sample.charge_acquisition_id
+            self.last_acquired_at = sample.charge_acquired_at
         target, reason = self._classify(sample)
         self.reason = reason
+        if target == "unknown" or (
+            gap is not None and gap > MAX_SAMPLE_GAP_SECONDS
+        ):
+            self.candidate_state = None
+            self.candidate_count = 0
+            self.candidate_started_at = None
+            self.last_sample_at = None
+            if self.active_session is not None:
+                self.active_session["interrupted"] = True
+                self.active_session["quality"] = "interrupted"
         self.quality = (
             "interrupted"
             if target == "unknown"
@@ -414,28 +498,37 @@ class ChargingSessionMachine:
             )
             else "good"
         )
+        if target == "unknown":
+            # Unknown supplies neither an energy endpoint nor normal debounce.
+            if distinct or not sample.charge_source_available:
+                self.unknown_count += 1
+            if self.unknown_count >= UNKNOWN_DEBOUNCE_SAMPLES:
+                self.state = "unknown"
+            return None
+        self.unknown_count = 0
+        if not distinct:
+            return None
+        self._integrate(sample)
+        self.last_sample_at = sample.charge_acquired_at
         if target != self.candidate_state:
             self.candidate_state = target
             self.candidate_count = 1
-            self.candidate_started_at = now
+            self.candidate_started_at = sample.charge_acquired_at
         else:
             self.candidate_count += 1
         required = (
             CHARGE_START_DEBOUNCE_SAMPLES
             if target == "charging"
             else CHARGE_STOP_DEBOUNCE_SAMPLES
-            if target == "not_charging"
-            else UNKNOWN_DEBOUNCE_SAMPLES
         )
-        candidate_age = _seconds_between(now, self.candidate_started_at) or 0.0
+        candidate_age = _seconds_between(
+            sample.charge_acquired_at, self.candidate_started_at
+        ) or 0.0
         stop_dwell_met = (
             target != "not_charging"
             or candidate_age >= CHARGE_STOP_MIN_DWELL_SECONDS
         )
         if self.candidate_count < required or not stop_dwell_met or target == self.state:
-            if target == "unknown" and self.active_session is not None:
-                self.active_session["interrupted"] = True
-                self.active_session["quality"] = "interrupted"
             return None
 
         previous = self.state
@@ -515,7 +608,7 @@ class ChargingSessionMachine:
                 "interrupted" if active.get("interrupted") else self.quality
             )
         last = dict(self.last_session) if self.last_session else None
-        age = _seconds_between(now, self.last_observed_at)
+        age = _seconds_between(now, self.last_acquired_at)
         return {
             "State": self.state,
             "Active": self.state == "charging" and active is not None,
@@ -526,6 +619,11 @@ class ChargingSessionMachine:
             "Reason": self.reason,
             "ChargePowerW": self.last_charge_power_w,
             "SampleAgeSeconds": round(age, 3) if age is not None else None,
+            "AcquisitionId": self.last_acquisition_id,
+            "AcquiredAt": _iso(self.last_acquired_at),
+            "RoleContext": {
+                role: dict(context) for role, context in self.role_context.items()
+            },
             "ActiveSession": active,
             "LastSession": last,
             "SessionCount": self.session_count,
@@ -549,15 +647,17 @@ class ChargingSessionMachine:
             "quality": self.quality,
             "reason": self.reason,
             "source": self.source,
-            "candidate_state": self.candidate_state,
-            "candidate_count": self.candidate_count,
-            "candidate_started_at": _iso(self.candidate_started_at),
             "active_session": self.active_session,
             "last_session": self.last_session,
             "completed_sessions": self.completed_sessions[-MAX_COMPLETED_SESSIONS:],
             "session_count": self.session_count,
             "last_observed_at": _iso(self.last_observed_at),
             "last_sample_at": _iso(self.last_sample_at),
+            "last_acquisition_id": self.last_acquisition_id,
+            "last_acquired_at": _iso(self.last_acquired_at),
+            "role_context": {
+                role: dict(context) for role, context in self.role_context.items()
+            },
             "last_charge_power_w": self.last_charge_power_w,
         }
 
@@ -569,9 +669,10 @@ class ChargingSessionMachine:
         self.quality = str(raw.get("quality") or "unknown")
         self.reason = str(raw.get("reason") or "restored")
         self.source = str(raw.get("source") or "unknown")
-        self.candidate_state = raw.get("candidate_state")
-        self.candidate_count = _nonnegative_int(raw.get("candidate_count"))
-        self.candidate_started_at = _datetime(raw.get("candidate_started_at"))
+        self.candidate_state = None
+        self.candidate_count = 0
+        self.candidate_started_at = None
+        self.unknown_count = 0
         self.active_session = (
             dict(raw["active_session"])
             if isinstance(raw.get("active_session"), dict)
@@ -599,7 +700,19 @@ class ChargingSessionMachine:
         ][-MAX_COMPLETED_SESSIONS:]
         self.session_count = _nonnegative_int(raw.get("session_count"))
         self.last_observed_at = _datetime(raw.get("last_observed_at"))
-        self.last_sample_at = _datetime(raw.get("last_sample_at"))
+        self.last_sample_at = None
+        self.last_acquisition_id = raw.get("last_acquisition_id")
+        self.last_acquired_at = _datetime(raw.get("last_acquired_at"))
+        context = raw.get("role_context")
+        self.role_context = (
+            {
+                role: dict(value)
+                for role, value in context.items()
+                if isinstance(value, dict)
+            }
+            if isinstance(context, dict)
+            else {}
+        )
         self.last_charge_power_w = _finite_float(raw.get("last_charge_power_w"))
         if self.active_session is not None:
             # A restart is an unknown gap by definition. Keep the session open,
@@ -619,41 +732,18 @@ class EG4TelemetryLogger:
         self.charging = ChargingSessionMachine()
         self.recent_events: list[dict[str, Any]] = []
         self.last_sequence: int | None = None
-        self.last_fingerprint: str | None = None
         self.last_observed_at: datetime | None = None
 
     def process(self, sample: LoggerSample) -> list[dict[str, Any]]:
         """Process a correlated sample and return accepted HA events."""
-        fingerprint = _sample_fingerprint(sample)
-        if (
-            sample.sequence is not None
-            and sample.sequence == self.last_sequence
-            and fingerprint == self.last_fingerprint
-        ):
-            return []
         self.last_sequence = sample.sequence
-        self.last_fingerprint = fingerprint
         self.last_observed_at = sample.observed_at
-        previous_transfer = self.generator.last_transfer_state
         candidates: list[dict[str, Any] | None] = []
         if sample.process_generator:
             candidates.append(self.generator.update(sample))
+            candidates.append(self.generator.update_transfer(sample))
         if sample.process_charge:
             candidates.append(self.charging.update(sample))
-        if (
-            sample.process_generator
-            and sample.transfer_state is not None
-            and sample.transfer_state != previous_transfer
-            and previous_transfer is not None
-        ):
-            candidates.append(
-                {
-                    "event_type": EVENT_GENERATOR_TRANSFER_CHANGED,
-                    "from": previous_transfer,
-                    "to": sample.transfer_state,
-                    "reason": "gridboss_transfer_observation_changed",
-                }
-            )
         events: list[dict[str, Any]] = []
         for candidate in candidates:
             if candidate is None:
@@ -707,6 +797,14 @@ class EG4TelemetryLogger:
                 "observed_at": _iso(sample.observed_at),
                 "received_at": _iso(datetime.now(UTC)),
                 "sequence": sample.sequence,
+                "generator_acquisition_id": sample.generator_acquisition_id,
+                "generator_acquired_at": _iso(sample.generator_acquired_at),
+                "charge_acquisition_id": sample.charge_acquisition_id,
+                "charge_acquired_at": _iso(sample.charge_acquired_at),
+                "charge_role_context": {
+                    role: dict(context)
+                    for role, context in sample.charge_role_context.items()
+                },
                 "generator_voltage": _finite_float(sample.generator_voltage),
                 "generator_frequency": _finite_float(sample.generator_frequency),
                 "generator_power": _finite_float(sample.generator_power),
@@ -744,7 +842,6 @@ class EG4TelemetryLogger:
             "entry_id": self.entry_id,
             "source_serial": self.source_serial,
             "last_sequence": self.last_sequence,
-            "last_fingerprint": self.last_fingerprint,
             "last_observed_at": _iso(self.last_observed_at),
             "generator": self.generator.to_dict(),
             "charging": self.charging.to_dict(),
@@ -763,7 +860,6 @@ class EG4TelemetryLogger:
         self.source_serial = raw.get("source_serial") or self.source_serial
         sequence = raw.get("last_sequence")
         self.last_sequence = int(sequence) if isinstance(sequence, int) else None
-        self.last_fingerprint = raw.get("last_fingerprint")
         self.last_observed_at = _datetime(raw.get("last_observed_at"))
         self.generator.restore(raw.get("generator"))
         self.charging.restore(raw.get("charging"))

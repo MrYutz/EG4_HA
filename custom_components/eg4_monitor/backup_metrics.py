@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 from .const import (
     CONF_BATTERY_CRITICAL_VOLTAGE,
@@ -50,7 +50,7 @@ def _float_or_none(value: Any) -> float | None:
 
 
 def _option_float(
-    options: dict[str, Any],
+    options: Mapping[str, Any],
     key: str,
     default: float,
 ) -> float:
@@ -111,7 +111,7 @@ def estimate_battery_runtime_hours(
 def estimate_generator_fuel(
     generator_running: Any,
     generator_power_w: Any,
-    options: dict[str, Any],
+    options: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Estimate diesel fuel status from manual tank level and generator load."""
     tank_capacity = _float_or_none(options.get(CONF_DIESEL_TANK_CAPACITY_GALLONS))
@@ -133,7 +133,7 @@ def estimate_generator_fuel(
     fuel_configured = bool(tank_capacity and tank_capacity > 0 and fuel_level is not None)
     fuel_percent = None
     reorder_needed = None
-    if fuel_configured:
+    if fuel_configured and tank_capacity is not None:
         fuel_level = max(min(fuel_level or 0.0, tank_capacity or 0.0), 0.0)
         fuel_percent = round((fuel_level / tank_capacity) * 100.0, 1)
         reorder_needed = fuel_percent <= reorder_percent
@@ -154,7 +154,7 @@ def estimate_generator_fuel(
 
     return {
         "FuelConfigured": fuel_configured,
-        "FuelLevelGallons": round(fuel_level, 2) if fuel_configured else None,
+        "FuelLevelGallons": round(fuel_level, 2) if fuel_configured and fuel_level is not None else None,
         "FuelPercent": fuel_percent,
         "FuelReorderNeeded": reorder_needed,
         "BurnRateGPH": round(burn_rate, 3),
@@ -166,7 +166,7 @@ def estimate_generator_fuel(
 
 def build_backup_metrics(
     aggregate: dict[str, Any],
-    options: dict[str, Any],
+    options: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Build derived metrics that span battery, load, grid, and generator data."""
     battery = _safe_get(aggregate, ("Battery",))

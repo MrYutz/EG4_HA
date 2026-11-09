@@ -2,7 +2,7 @@
 id: EG4REC-01
 title: Preserve raw dongle evidence through invalid and interleaved responses
 type: AFK
-status: in-progress
+status: done
 phase: delivery
 source_github: null
 source_business_need: conversation-provisional
@@ -22,10 +22,10 @@ depends_on_story_ids:
 - 7
 slice_order: 1
 completion_evidence:
-  implementation_commit: null
-  red_evidence: null
-  green_evidence: null
-  alignment_verified: false
+  implementation_commit: 35d5fc1aa9b5f6952e38ecbd900d1d8115c967f9
+  red_evidence: /tmp/eg4-host-recorder/1.2-red.txt
+  green_evidence: /tmp/eg4-host-recorder/1.2-green.txt
+  alignment_verified: true
 ---
 
 ## What to build
@@ -34,15 +34,15 @@ Make an actual device acquisition produce inspectable forensic evidence even whe
 
 ## Acceptance criteria
 
-- [ ] Every transaction attempt queues a versioned forensic result before semantic decoding or the next request. R1 metadata includes session/role/acquisition/transaction identity, requested and observed route/device, request bytes when sent, received bytes/obtainable words, separate validation outcomes, acquisition UTC interval/monotonic duration, error stage and truncation. Derived role samples reference contributing transactions; processing/persistence times do not replace acquisition time.
-- [ ] A1: unknown status33280, inconsistent voltage/frequency and interrupted responses retain received evidence while remaining rejected as trustworthy telemetry. Successful GridBOSS power/voltage survives a subsequent frequency timeout and the aggregate is explicitly partial.
-- [ ] A primary semantic rejection does not skip otherwise scheduled diagnostics when the transport is usable; remaining work and failures stay bounded and explicit. Missing/error, zero and cached previous values remain distinguishable.
-- [ ] A2: unsolicited history before identity and a matching reply after nine unrelated valid frames succeed within the transaction deadline. These frames are preserved without activating or clearing history.
-- [ ] CRC, device identity, function, range and length checks remain strict. Bad CRC/identity, malformed framing, timeout and traffic-limit exhaustion remain distinct failures with already-received bytes retained.
-- [ ] Endless traffic is bounded by the total transaction deadline, existing frame-size ceiling and initial256 KiB transaction-traffic cap, with explicit exhaustion/truncation. No second polling owner or concurrent same-device request is introduced.
-- [ ] The actual analyzer CLI streams a saved new-format acquisition and a historical trace without rewriting evidence; its output exposes partial/rejected transactions and their acquisition intervals rather than assigning invented values or modes.
-- [ ] The live capture path emits one versioned representation, not duplicate legacy/new records, and excludes unrelated HA/light dumps, credentials and tokens. Affected record-format documentation and callers are updated.
-- [ ] Focused missing behavioral regressions and actual loopback/CLI evidence prove A1–A2 and the new raw-record consumer path. No source-text, forwarding-only or mock-echo assertions substitute for these outcomes.
+- [x] Every transaction attempt queues a versioned forensic result before semantic decoding or the next request. R1 metadata includes session/role/acquisition/transaction identity, requested and observed route/device, request bytes when sent, received bytes/obtainable words, separate validation outcomes, acquisition UTC interval/monotonic duration, error stage and truncation. Derived role samples reference contributing transactions; processing/persistence times do not replace acquisition time.
+- [x] A1: unknown status33280, inconsistent voltage/frequency and interrupted responses retain received evidence while remaining rejected as trustworthy telemetry. Successful GridBOSS power/voltage survives a subsequent frequency timeout and the aggregate is explicitly partial.
+- [x] A primary semantic rejection does not skip otherwise scheduled diagnostics when the transport is usable; remaining work and failures stay bounded and explicit. Missing/error, zero and cached previous values remain distinguishable.
+- [x] A2: unsolicited history before identity and a matching reply after nine unrelated valid frames succeed within the transaction deadline. These frames are preserved without activating or clearing history.
+- [x] CRC, device identity, function, range and length checks remain strict. Bad CRC/identity, malformed framing, timeout and traffic-limit exhaustion remain distinct failures with already-received bytes retained.
+- [x] Endless traffic is bounded by the total transaction deadline, existing frame-size ceiling and initial256 KiB transaction-traffic cap, with explicit exhaustion/truncation. No second polling owner or concurrent same-device request is introduced.
+- [x] The actual analyzer CLI streams a saved new-format acquisition and a historical trace without rewriting evidence; its output exposes partial/rejected transactions and their acquisition intervals rather than assigning invented values or modes.
+- [x] The live capture path emits one versioned representation, not duplicate legacy/new records, and excludes unrelated HA/light dumps, credentials and tokens. Affected record-format documentation and callers are updated.
+- [x] Focused missing behavioral regressions and actual loopback/CLI evidence prove A1–A2 and the new raw-record consumer path. No source-text, forwarding-only or mock-echo assertions substitute for these outcomes.
 
 ## Blocked by
 
@@ -87,3 +87,7 @@ Public seams and the full focused acceptance contract were approved during ticke
 
 - Correction review: both axes confirmed their original findings resolved. Spec additionally identified a processing timestamp mislabeled `acquired_at`; it is now explicitly `cached_at`. Original BMS acquisition intervals remain on the referenced transaction, not replaced by cache/queue time.
 - Integration-boundary Pyright additionally reports two pre-existing cross-module annotation mismatches at the unchanged adapter-discovery and backup-options calls. These are not claimed green: focused transport/trace/analyzer checking has0 errors; the two integration annotation debts remain separately classified.
+
+### Completion
+
+Both planned entries are merged in order: PR1 as `d77222f5481683c897015db0a9bd1699b3017bcb`, then PR2 as `4d56dfc127001a1f23c1de100976e20f90f8abb0`. GitHub confirmed the final head `35d5fc1aa9b5f6952e38ecbd900d1d8115c967f9` and merge. Evidence: `/tmp/eg4-host-recorder/1.2-merged.json`. Acceptance, focused checks, review and merge are complete; HA deployment remains EG4REC-06.
