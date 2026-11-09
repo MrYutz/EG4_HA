@@ -143,13 +143,13 @@ For this five-module bank, the nominal capacity is 1,400 Ah / approximately
 balanced, so 50.6 V should be interpreted with the local cell-extrema and
 wiring measurements—not as a standalone SOC lookup.
 
-The pinned current manufacturer documents are in
-[`docs/references/eg4/`](docs/references/eg4/). Because the previously observed
-SOC reported 100% near 51 V, the current operating decision keeps AC charging in
-voltage mode: **52.0 V start**, **56.2 V stop**, and **54.0 V float**. The 56.2 V
-stop follows EG4's current 280Ah recommendation; 59 V is not a normal charge
-threshold. See the [voltage-mode AC-charge decision](docs/okf/decisions/voltage-mode-ac-charge-settings.md)
-for evidence and revisit conditions.
+Manufacturer PDFs and the detailed voltage-mode decision are retained in the
+local research copy, not distributed with this integration PR. The documented
+site operating decision remains voltage-mode AC charging: **52.0 V start**,
+**56.2 V stop**, and **54.0 V float**. The stop/float values follow EG4's
+[280Ah battery specification](https://eg4electronics.com/wp-content/uploads/2024/04/EG4%C2%AE-Indoor-280Ah-Battery-Specifications-Sheet.pdf);
+59 V is not a normal charge threshold. These are historical site settings,
+not changes authorized by the [host-recorder initiative](docs/host-recorder-mvp-spec.md).
 
 ## Automation Reference
 

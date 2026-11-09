@@ -34,9 +34,10 @@ the live dashboard in HA.
 ## Controller diagnostics: deployed
 
 Read-only controller observations are deployed alongside the existing raw trace.
-Initial deployment was verified on2026-11-08. The approved November9 correction
-and expansion was verified after one HA Core restart; see
-[current deployment evidence](../investigations/2026-11-08-firmware-reverse-engineering/capture-upgrade/README.md).
+Initial deployment was verified on2026-11-08. Historical November9 correction
+evidence is retained outside Git at
+`investigations/2026-11-08-firmware-reverse-engineering/capture-upgrade/README.md`;
+it is not evidence that the new host-recorder initiative has been deployed.
 The debounced AC-evidence logger remains separate; controller decision words are
 never debounced or labeled as physical contact transitions.
 
@@ -61,8 +62,9 @@ history-upload/erase action or holding111 history-selector polling is added.
 The current profile uses4500/10. Real Flex warnings60/61 now trigger controller
 observations;64/65 remains raw analog context, not a discrete trigger. Both roles
 also collect ordinary input120..145. Continuous Q1 or another polling client
-was not added. [Native proof](../investigations/2026-11-08-firmware-reverse-engineering/direct-session/README.md)
-and [live upgrade verification](../investigations/2026-11-08-firmware-reverse-engineering/capture-upgrade/README.md).
+was not added. Historical native proof and live verification remain in the local
+research copy under `direct-session/README.md` and `capture-upgrade/README.md`;
+these reports and their raw evidence are not bundled with the integration.
 
 These are additional serialized network requests, not free background reads.
 Each diagnostic stage is limited to `min(client.timeout, 2.0)` seconds; multiple
@@ -247,11 +249,11 @@ HA-owned configuration if90-day entity history is required.
 
 ## Validation checklist
 
-1. Reload the EG4 integration after installing the updated component.
+1. After a successful `ha core check`, restart HA Core once to load changed Python.
 2. Confirm `sensor.eg4_site_generator_run_state` and
    `binary_sensor.eg4_site_generator_gridboss_state_unknown` in Developer Tools -> States.
-3. Start/stop or load/unload the generator and verify the state event in Developer
-   Tools -> Events.
+3. Validate state events with offline controlled inputs or passive observations.
+   Do not start/stop, load/unload or fault equipment to test this recorder.
 4. Confirm a charging session exposes start, end, duration, quality, and estimated
    session energy.
 5. Stop/restart HA during an active charging session and verify it returns as

@@ -60,3 +60,11 @@ Stack root: `main` at `ddd2fd69e3a8570a05995bc261617d30c6364da0` (the published 
 Greg explicitly approved adopting the pre-existing local integration and unpublished telemetry changes. The original local `main` commit `4fee9cbeec4e277468a074e72feec18d986137eb` remains preserved; its content is included in 1.1 above the published root. Firmware downloads, raw investigation dumps, spreadsheet and agent state remain excluded. The prerequisite does not deploy or claim the known recorder defects are corrected.
 
 Public seams and the full focused acceptance contract were approved during ticket generation. Red/green evidence is stored outside Git and referenced here when each entry completes. The only deployment occurs after the complete initiative passes its release checks.
+
+### Entry 1.1 evidence
+
+- PR: <https://github.com/MrYutz/EG4_HA/pull/1>.
+- Adopted baseline commit: `4d0cf5d437eac838d7b7f34c2d4a4296484f32f0`; annotation correction: `d19bc55`.
+- Green: 73 focused existing tests; after annotation changes, transport/trace34 tests, Pyright0 errors and Ruff passed. Evidence: `/tmp/eg4-host-recorder/baseline-verification.txt` (outside Git).
+- Two-axis review: Standards found two non-blocking existing catalogue/constants debts and a large-setup-closure smell; no additional annotation defect. Spec found two documentation hazards: prohibited equipment-manipulation instructions and links to unpublished supporting evidence. Both are corrected in this entry by passive/offline verification instructions and explicit external-retention labels.
+- These baseline maintainability debts do not widen the recorder initiative. No R1/R2 acceptance or production rollout is claimed; entry1.2 owns the correction. Merge evidence will be recorded before slice completion.
