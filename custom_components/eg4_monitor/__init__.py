@@ -1489,6 +1489,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         else None
     )
     controller_observations = ControllerObservationTracker()
+
+    async def _record_acquisition_evidence(evidence: dict[str, Any]) -> object:
+        """Queue received bytes before decoding, without filesystem IO on HA."""
+        if local_trace_writer is None:
+            return None
+        return await local_trace_writer.async_write(evidence, wait=False)
+
+    if local_trace_writer is not None:
+        for role, dongle in (
+            *local_dongles.items(),
+            *((("gridboss", gridboss_dongle),) if gridboss_dongle is not None else ()),
+        ):
+            dongle.evidence_sink = _record_acquisition_evidence
+            dongle.role = role
+            dongle.session_id = local_trace_writer.session_id
+        if controller_trace_writer is not None:
+            controller_trace_writer.session_id = local_trace_writer.session_id
     logger_store: Store[dict[str, Any]] = Store(
         hass,
         1,
@@ -1517,6 +1534,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     local_snapshot_times: dict[str, datetime] = {}
     local_bms_cache: dict[str, EG4LocalBMSData] = {}
     local_bms_times: dict[str, datetime] = {}
+    local_bms_sources: dict[str, dict[str, Any]] = {}
     local_poll_lock = asyncio.Lock()
     local_trace_task: asyncio.Task[None] | None = None
     local_trace_sequence = 0
@@ -1689,33 +1707,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             telemetry_logger.snapshot(observed_at)
         )
 
-    def _ha_trace_states() -> dict[str, Any]:
-        """Snapshot related HA states without copying arbitrary attributes."""
-        entity_ids = (
-            "binary_sensor.generator_running",
-            "binary_sensor.generator_supplying_power",
-            "binary_sensor.grid_outage_active",
-            "sensor.generator_power",
-            "sensor.generator_status_source",
-            "sensor.grid_power",
-            "sensor.grid_voltage",
-            "sensor.battery_power",
-            "sensor.battery_charging_power",
-            "sensor.battery_discharging_power",
-        )
-        states = {
-            entity_id: (
-                hass.states.get(entity_id).state
-                if hass.states.get(entity_id) is not None
-                else None
-            )
-            for entity_id in entity_ids
-        }
-        states["lights"] = {
-            state.entity_id: state.state
-            for state in hass.states.async_all("light")
-        }
-        return states
 
     async def _record_controller_observation(record: dict[str, Any]) -> None:
         """Retain discrete controller evidence independently of full raw rotation."""
@@ -1739,12 +1730,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         dongle: EG4LocalDongle,
         sequence: int,
     ) -> dict[str, Any]:
+        """Group all received blocks under one acquisition identity."""
+        with dongle.capture() as acquisition:
+            return await _poll_local_acquisition(role, dongle, sequence, acquisition)
+
+    async def _poll_local_acquisition(
+        role: str,
+        dongle: EG4LocalDongle,
+        sequence: int,
+        acquisition: dict[str, Any],
+    ) -> dict[str, Any]:
         """Poll one dongle core range and periodically refresh its BMS range."""
         started_at = datetime.now(UTC)
         started_monotonic = time.monotonic()
         previous_monotonic = local_trace_last_sample_monotonic.get(role)
         local_trace_last_sample_monotonic[role] = started_monotonic
         record: dict[str, Any] = {
+            **acquisition,
             "sequence": sequence,
             "role": role,
             "sample_started_at": started_at.isoformat(timespec="milliseconds"),
@@ -1758,66 +1760,73 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 started_monotonic - previous_monotonic, 3
             )
 
-        bms_error: str | None = None
-        bms_sampled = False
+        core: EG4LocalTelemetry | None = None
+        core_completed_at: datetime | None = None
         try:
             core = await asyncio.wait_for(
                 dongle.async_read_core_snapshot(),
                 timeout=max(3.0, dongle.timeout * 2.0),
             )
-            now = datetime.now(UTC)
-            bms = local_bms_cache.get(role)
-            bms_at = local_bms_times.get(role)
-            bms_age = (
-                (now - bms_at).total_seconds() if bms_at is not None else None
-            )
-            if bms is None or bms_age is None or bms_age >= local_trace_bms_interval:
-                try:
-                    bms = await asyncio.wait_for(
-                        dongle.async_read_bms_snapshot(),
-                        timeout=max(3.0, dongle.timeout * 2.0),
-                    )
-                    local_bms_cache[role] = bms
-                    local_bms_times[role] = datetime.now(UTC)
-                    bms_sampled = True
-                    bms_age = 0.0
-                except Exception as err_bms:
-                    bms_error = f"{type(err_bms).__name__}: {err_bms}"
-
-            if bms is not None and bms_age is not None and bms_age <= local_trace_max_age:
-                snapshot = merge_local_telemetry(core, bms)
-            else:
-                snapshot = core
-            local_snapshot_cache[role] = snapshot
-            local_snapshot_times[role] = now
-            record.update(
-                {
-                    "ok": True,
-                    "bms_sampled": bms_sampled,
-                    "ha_states": _ha_trace_states(),
-                    "bms_age_seconds": (
-                        round(max(0.0, bms_age), 3)
-                        if bms_age is not None
-                        else None
-                    ),
-                    "telemetry": telemetry_to_record(snapshot),
-                    "primary_sample_completed_at": now.isoformat(
-                        timespec="milliseconds"
-                    ),
-                }
-            )
-            if bms_error is not None:
-                record["bms_error"] = bms_error
-            if local_trace_writer is not None:
-                record["diagnostics"] = await dongle.async_read_diagnostics()
+            core_completed_at = datetime.now(UTC)
         except Exception as err_local:
             record["error"] = f"{type(err_local).__name__}: {err_local}"
             _LOGGER.warning(
                 "Local EG4 trace read failed for role %s (%s): %s",
-                role,
-                dongle.host,
-                err_local,
+                role, dongle.host, err_local,
             )
+
+        # BMS is an independent scheduled acquisition, not conditional on decoding
+        # the core. Its original transaction references survive cache reuse.
+        bms = local_bms_cache.get(role)
+        bms_at = local_bms_times.get(role)
+        bms_age = (
+            (datetime.now(UTC) - bms_at).total_seconds()
+            if bms_at is not None else None
+        )
+        record["bms_sampled"] = False
+        if bms is None or bms_age is None or bms_age >= local_trace_bms_interval:
+            transaction_offset = len(acquisition["transaction_ids"])
+            try:
+                bms = await asyncio.wait_for(
+                    dongle.async_read_bms_snapshot(),
+                    timeout=max(3.0, dongle.timeout * 2.0),
+                )
+            except Exception as err_bms:
+                record["bms_error"] = f"{type(err_bms).__name__}: {err_bms}"
+            else:
+                bms_at = datetime.now(UTC)
+                local_bms_cache[role] = bms
+                local_bms_times[role] = bms_at
+                local_bms_sources[role] = {
+                    "acquisition_id": acquisition["acquisition_id"],
+                    "transaction_ids": list(acquisition["transaction_ids"][transaction_offset:]),
+                    "cached_at": bms_at.isoformat(),
+                }
+                record["bms_sampled"] = True
+        bms_age = (
+            max(0.0, (datetime.now(UTC) - bms_at).total_seconds())
+            if bms_at is not None else None
+        )
+        bms_usable = bms is not None and bms_age is not None and bms_age <= local_trace_max_age
+        record["bms_age_seconds"] = bms_age
+        record["bms_source"] = {
+            **local_bms_sources.get(role, {}),
+            "used_in_telemetry": core is not None and bms_usable,
+        }
+        if core is not None and core_completed_at is not None:
+            snapshot = merge_local_telemetry(core, bms) if bms_usable else core
+            local_snapshot_cache[role] = snapshot
+            local_snapshot_times[role] = core_completed_at
+            record.update({
+                "ok": True,
+                "telemetry": telemetry_to_record(snapshot),
+                "primary_sample_completed_at": core_completed_at.isoformat(timespec="milliseconds"),
+            })
+        if local_trace_writer is not None:
+            record["diagnostics"] = await dongle.async_read_diagnostics()
+        record["partial"] = bool(acquisition["successful_transaction_ids"]) and (
+            not record["ok"] or bool(acquisition["failed_transaction_ids"])
+        )
         record["duration_ms"] = round(
             (time.monotonic() - started_monotonic) * 1000.0, 1
         )
@@ -1847,6 +1856,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def _poll_gridboss_once(
         *, record: bool, sequence: int | None = None
     ) -> EG4GridBossTelemetry | None:
+        """Group power/frequency and diagnostic evidence, including failed reads."""
+        if gridboss_dongle is None:
+            return None
+        with gridboss_dongle.capture() as acquisition:
+            return await _poll_gridboss_acquisition(
+                record=record, sequence=sequence, acquisition=acquisition
+            )
+
+    async def _poll_gridboss_acquisition(
+        *,
+        record: bool,
+        sequence: int | None,
+        acquisition: dict[str, Any],
+    ) -> EG4GridBossTelemetry | None:
         """Poll GridBOSS directly without sharing a socket with HA/cloud code."""
         nonlocal gridboss_snapshot_cache, gridboss_snapshot_time
         nonlocal gridboss_snapshot_sequence, gridboss_snapshot_error
@@ -1857,6 +1880,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             started_at = datetime.now(UTC)
             started_monotonic = time.monotonic()
             record_data: dict[str, Any] = {
+                **acquisition,
                 "sequence": sequence,
                 "role": "gridboss",
                 "sample_started_at": started_at.isoformat(timespec="milliseconds"),
@@ -1865,6 +1889,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "ok": False,
                 "diagnostics": [],
             }
+            cancelled = False
             try:
                 snapshot = await asyncio.wait_for(
                     gridboss_dongle.async_read_snapshot(),
@@ -1893,11 +1918,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         ),
                     }
                 )
-                if record and local_trace_writer is not None:
-                    record_data["diagnostics"] = (
-                        await gridboss_dongle.async_read_diagnostics()
-                    )
                 return snapshot
+            except asyncio.CancelledError:
+                cancelled = True
+                record_data["error"] = "CancelledError: acquisition cancelled"
+                raise
             except Exception as err_gridboss:
                 gridboss_snapshot_error = (
                     f"{type(err_gridboss).__name__}: {err_gridboss}"
@@ -1910,14 +1935,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 )
                 return None
             finally:
+                if record and local_trace_writer is not None and not cancelled:
+                    record_data["diagnostics"] = (
+                        await gridboss_dongle.async_read_diagnostics()
+                    )
+                record_data["partial"] = bool(acquisition["successful_transaction_ids"]) and (
+                    not record_data["ok"] or bool(acquisition["failed_transaction_ids"])
+                )
                 record_data["duration_ms"] = round(
                     (time.monotonic() - started_monotonic) * 1000.0, 1
                 )
                 record_data["sample_completed_at"] = datetime.now(UTC).isoformat(
                     timespec="milliseconds"
                 )
-                if record:
-                    record_data["ha_states"] = _ha_trace_states()
                 if local_trace_writer is not None:
                     try:
                         await local_trace_writer.async_write(record_data, wait=False)

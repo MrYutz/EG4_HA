@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import struct
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 
 import pytest
@@ -637,3 +638,371 @@ def test_read_packet_rejects_non_read_functions(function: int) -> None:
             count=1,
             function=function,
         )
+
+
+@asynccontextmanager
+async def _evidence_loopback(handle, *, client_type=EG4LocalDongle, timeout=0.2):
+    """Exercise the public client over TCP and collect its actual sink records."""
+    rows = []
+    handlers = set()
+
+    async def record(row):
+        rows.append(row)
+
+    async def connection(reader, writer):
+        task = asyncio.current_task()
+        handlers.add(task)
+        try:
+            await handle(reader, writer, rows)
+        except (ConnectionError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            writer.close()
+            with suppress(ConnectionError):
+                await writer.wait_closed()
+            handlers.discard(task)
+
+    server = await asyncio.start_server(connection, "127.0.0.1", 0)
+    client = client_type(
+        host="127.0.0.1", port=server.sockets[0].getsockname()[1],
+        timeout=timeout, evidence_sink=record, role="master", session_id="test-session",
+    )
+    try:
+        yield client, rows
+    finally:
+        server.close()
+        await server.wait_closed()
+        for task in tuple(handlers):
+            task.cancel()
+        await asyncio.gather(*tuple(handlers), return_exceptions=True)
+
+
+def _identity_response() -> bytes:
+    return _fixture_response(
+        dongle_serial="DJ12345678", inverter_serial="INV1234567",
+        register=127, values=[0],
+    )
+
+
+def _history_response() -> bytes:
+    # Genuine preserved native history payload; only its TCP envelope is synthetic.
+    payload = bytes.fromhex(
+        "a5a519060c0604130000a40999091400d704c904d104c20408000800a600e000"
+        "11000b0004000f00a700de0014000800030001000400010004000100bc07870a"
+        "0000000000000000c207750a0000000000000000000000000000000000000000"
+        "5901000000000000620100000000000000000000000000000000000000000000"
+        "000000000000000000000000000000000000000000000000c7c8000000000000"
+        "010000000000000034ce00000000000000000000000000000000000000000000"
+        "0000000000000000000000000000000000000000000000000000000000000000"
+        "00000000000000000000000000000000000000000000000000000007a000c308"
+    )
+    return (
+        b"\xa1\x1a" + struct.pack("<HH", 5, 14 + len(payload))
+        + bytes([1, 0xC2]) + b"DJ12345678"
+        + struct.pack("<H", len(payload)) + payload
+    )
+
+
+@pytest.mark.asyncio
+async def test_history_before_discovery_identity_is_retained_without_requests() -> None:
+    requests = []
+    request_done = asyncio.Event()
+
+    async def handle(reader, writer, rows):
+        writer.write(_history_response() + _identity_response())
+        await writer.drain()
+        requests.append(await reader.read())
+        request_done.set()
+
+    async with _evidence_loopback(handle) as (client, rows):
+        identity = await client.async_discover_identity()
+        await asyncio.wait_for(request_done.wait(), timeout=1)
+        assert identity.inverter_serial == "INV1234567"
+        transaction, = rows
+        assert transaction["ok"] is True
+        assert transaction["request"]["bytes_hex"] is None
+        assert [frame["classification"] for frame in transaction["frames"]] == [
+            "history", "identity",
+        ]
+        assert transaction["acquisition_id"]
+        assert transaction["transaction_id"]
+    assert requests == [b""]
+
+
+@pytest.mark.asyncio
+async def test_history_first_and_nine_unrelated_frames_do_not_hide_reply() -> None:
+    async def handle(reader, writer, rows):
+        writer.write(_history_response() + _identity_response())
+        await writer.drain()
+        await reader.readexactly(38)
+        values = [0] * 40
+        values[4] = 531
+        writer.write(
+            _identity_response() * 9
+            + _fixture_response(
+                dongle_serial="DJ12345678", inverter_serial="INV1234567",
+                register=0, values=values,
+            )
+        )
+        await writer.drain()
+
+    async with _evidence_loopback(handle) as (client, rows):
+        telemetry = await client.async_read_core_snapshot()
+        assert telemetry.battery_voltage == 53.1
+        transaction, interpretation = rows
+        assert len(transaction["frames"]) == 12
+        assert transaction["frames"][0]["classification"] == "history"
+        assert transaction["frames"][0]["validation"]["crc"] == "passed"
+        assert transaction["frames"][0]["values"] is None
+        assert all(
+            frame["validation"]["range"] == "failed"
+            for frame in transaction["frames"][2:-1]
+        )
+        assert transaction["frames"][-1]["validation"] == {
+            "framing": "passed", "crc": "passed", "identity": "passed",
+            "function": "passed", "range": "passed",
+        }
+        assert all(frame["semantic"] == "not_evaluated" for frame in transaction["frames"])
+        assert interpretation["semantic"] == "accepted"
+        assert interpretation["transaction_id"] == transaction["transaction_id"]
+        assert interpretation["started_at"] == transaction["started_at"]
+        assert interpretation["completed_at"] == transaction["completed_at"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_crc,bad_identity", [(True, False), (False, True), (True, True)])
+async def test_failed_response_retains_words_and_independent_validation(
+    bad_crc, bad_identity,
+) -> None:
+    async def handle(reader, writer, rows):
+        writer.write(_identity_response())
+        await writer.drain()
+        await reader.readexactly(38)
+        values = [0] * 40
+        values[4] = 531
+        frame = _fixture_response(
+            dongle_serial="WRONG12345" if bad_identity else "DJ12345678",
+            inverter_serial="INV1234567", register=0, values=values,
+        )
+        if bad_crc:
+            frame = frame[:-1] + bytes([frame[-1] ^ 0xFF])
+        writer.write(frame)
+        await writer.drain()
+
+    async with _evidence_loopback(handle) as (client, rows):
+        with pytest.raises(DongleFrameError, match="CRC mismatch|dongle mismatch"):
+            await client.async_read_core_snapshot()
+        transaction, = rows
+        assert transaction["ok"] is False
+        frame = transaction["frames"][-1]
+        assert frame["values"][4] == 531
+        assert frame["validation"] == {
+            "framing": "passed",
+            "crc": "failed" if bad_crc else "passed",
+            "identity": "failed" if bad_identity else "passed",
+            "function": "passed", "range": "passed",
+        }
+        assert frame["semantic"] == "not_evaluated"
+        assert transaction["error"]["stage"] == "response"
+
+
+@pytest.mark.asyncio
+async def test_configured_identity_rejection_records_unsolicited_words() -> None:
+    async def handle(reader, writer, rows):
+        writer.write(_identity_response())
+        await writer.drain()
+        assert await reader.read() == b""
+
+    async with _evidence_loopback(handle) as (client, rows):
+        client.inverter_serial = "OTHER12345"
+        with pytest.raises(DongleFrameError, match="serial mismatch"):
+            await client.async_discover_identity()
+        transaction, = rows
+        assert transaction["configured_inverter_serial"] == "OTHER12345"
+        assert transaction["frames"][0]["values"] == (0,)
+        assert transaction["frames"][0]["validation"]["identity"] == "failed"
+        assert transaction["error"]["stage"] == "identity"
+        assert transaction["request"]["bytes_hex"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["identity", "response"])
+async def test_unsolicited_traffic_has_one_transaction_byte_limit(stage) -> None:
+    async def handle(reader, writer, rows):
+        if stage == "response":
+            writer.write(_identity_response())
+            await writer.drain()
+            await reader.readexactly(38)
+        writer.write(_history_response() * 1000)
+        await writer.drain()
+        await reader.read()
+
+    async with _evidence_loopback(handle, timeout=2.0) as (client, rows):
+        with pytest.raises(DongleFrameError, match="received-traffic limit"):
+            await client.async_read_core_snapshot()
+        transaction, = rows
+        assert transaction["received_bytes"] == 256 * 1024
+        assert sum(len(bytes.fromhex(frame["bytes_hex"])) for frame in transaction["frames"]) == 256 * 1024
+        assert transaction["truncated"] is True
+        assert transaction["ok"] is False
+        assert transaction["error"]["stage"] == stage
+
+
+@pytest.mark.asyncio
+async def test_oversized_frame_retains_header_and_reports_truncation() -> None:
+    header = b"\xa1\x1a\x01\x00\xff\xff"
+
+    async def handle(reader, writer, rows):
+        writer.write(header)
+        await writer.drain()
+        await reader.read()
+
+    async with _evidence_loopback(handle) as (client, rows):
+        with pytest.raises(DongleFrameError, match="oversized"):
+            await client.async_read_core_snapshot()
+        transaction, = rows
+        assert transaction["frames"][0]["bytes_hex"] == header.hex()
+        assert transaction["frames"][0]["validation"]["framing"] == "failed"
+        assert transaction["received_bytes"] == 6
+        assert transaction["truncated"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["eof", "timeout", "cancel"])
+@pytest.mark.parametrize("length", [3, 42])
+async def test_interrupted_response_preserves_partial_bytes(failure, length) -> None:
+    sent = asyncio.Event()
+    partial = _fixture_response(
+        dongle_serial="DJ12345678", inverter_serial="INV1234567",
+        register=0, values=[0, 531] + [0] * 38,
+    )[:length]
+
+    async def handle(reader, writer, rows):
+        writer.write(_identity_response())
+        await writer.drain()
+        await reader.readexactly(38)
+        writer.write(partial)
+        await writer.drain()
+        sent.set()
+        if failure != "eof":
+            await reader.read()
+
+    async with _evidence_loopback(handle) as (client, rows):
+        task = asyncio.create_task(client.async_read_core_snapshot())
+        await asyncio.wait_for(sent.wait(), timeout=1)
+        if failure == "cancel":
+            # Give the transport a scheduling turn to consume the delivered bytes.
+            await asyncio.sleep(0.01)
+            task.cancel()
+        error = {
+            "eof": asyncio.IncompleteReadError,
+            "timeout": TimeoutError,
+            "cancel": asyncio.CancelledError,
+        }[failure]
+        with pytest.raises(error):
+            await task
+        transaction, = rows
+        frame = transaction["frames"][-1]
+        assert frame["bytes_hex"] == partial.hex()
+        assert frame["validation"]["framing"] == "failed"
+        assert frame["validation"]["crc"] == "not_evaluated"
+        assert transaction["ok"] is False
+        assert transaction["truncated"] is True
+        assert transaction["error"]["type"] == error.__name__
+        assert transaction["received_bytes"] == len(_identity_response()) + length
+        if length == 42:
+            assert frame["values"] == (0, 531, 0)
+
+
+@pytest.mark.asyncio
+async def test_deadline_includes_identity_wait_and_requested_response() -> None:
+    async def handle(reader, writer, rows):
+        await asyncio.sleep(0.08)
+        writer.write(_identity_response())
+        await writer.drain()
+        await reader.readexactly(38)
+        await asyncio.sleep(0.08)
+        writer.write(_fixture_response(
+            dongle_serial="DJ12345678", inverter_serial="INV1234567",
+            register=0, values=[0] * 40,
+        ))
+        await writer.drain()
+
+    async with _evidence_loopback(handle, timeout=0.12) as (client, rows):
+        with pytest.raises(TimeoutError):
+            await client.async_read_core_snapshot()
+        transaction, = rows
+        assert transaction["error"]["stage"] == "response"
+        assert len(transaction["frames"]) == 1
+        assert transaction["request"]["bytes_hex"] is not None
+
+
+@pytest.mark.asyncio
+async def test_capture_groups_wait_for_reads_and_serializes_same_client() -> None:
+    active = 0
+    peak = 0
+    acquired = []
+
+    async def handle(reader, writer, rows):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            writer.write(_identity_response())
+            await writer.drain()
+            request = await reader.readexactly(38)
+            register, count = struct.unpack("<HH", request[32:36])
+            acquired.append(register)
+            # Prior transaction must be queued before this request starts.
+            assert len([row for row in rows if row["kind"] == "transaction"]) == len(acquired) - 1
+            await asyncio.sleep(0.01)
+            writer.write(_fixture_response(
+                dongle_serial="DJ12345678", inverter_serial="INV1234567",
+                register=register, values=[0] * count, function=request[21],
+            ))
+            await writer.drain()
+        finally:
+            active -= 1
+        await reader.read()
+
+    async with _evidence_loopback(handle, timeout=1) as (client, rows):
+        with client.capture() as acquisition:
+            await asyncio.gather(
+                asyncio.wait_for(client.async_read_core_snapshot(), timeout=1),
+                asyncio.wait_for(client.async_read_bms_snapshot(), timeout=1),
+            )
+            await asyncio.wait_for(client.async_read_diagnostics(), timeout=1)
+        transactions = [row for row in rows if row["kind"] == "transaction"]
+        assert len(transactions) == 5
+        assert peak == 1
+        assert {row["acquisition_id"] for row in rows} == {acquisition["acquisition_id"]}
+        assert acquisition["transaction_ids"] == [row["transaction_id"] for row in transactions]
+        assert acquisition["successful_transaction_ids"] == acquisition["transaction_ids"]
+        assert acquisition["failed_transaction_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_public_snapshot_assigns_one_acquisition_without_explicit_capture() -> None:
+    async def handle(reader, writer, rows):
+        writer.write(_identity_response())
+        await writer.drain()
+        request = await reader.readexactly(38)
+        register, count = struct.unpack("<HH", request[32:36])
+        writer.write(_fixture_response(
+            dongle_serial="DJ12345678", inverter_serial="INV1234567",
+            register=register, values=[0] * count,
+        ))
+        await writer.drain()
+
+    async with _evidence_loopback(handle) as (client, rows):
+        await client.async_read_snapshot()
+        await client.async_read_snapshot()
+        transactions = [row for row in rows if row["kind"] == "transaction"]
+        assert len(transactions) == 4
+        first, second, third, fourth = transactions
+        assert first["acquisition_id"] == second["acquisition_id"]
+        assert third["acquisition_id"] == fourth["acquisition_id"]
+        assert first["acquisition_id"] != third["acquisition_id"]
+        assert len({row["transaction_id"] for row in transactions}) == 4
+        assert all(row["role"] == "master" for row in rows)
+        assert all(row["session_id"] == "test-session" for row in rows)

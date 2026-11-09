@@ -12,11 +12,12 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
+from .const import LOCAL_DONGLE_TRACE_SCHEMA
 from .local_dongle import EG4GridBossTelemetry, EG4LocalTelemetry
 
 
-TRACE_SCHEMA = "eg4_local_dongle_trace.v1"
 DEFAULT_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_MAX_FILES = 8
 CONTROLLER_OBSERVATION_SCHEMA = "eg4_controller_observation.v1"
@@ -302,6 +303,7 @@ class LocalDongleTraceWriter:
         max_files: int = DEFAULT_MAX_FILES,
     ) -> None:
         self.root = Path(root)
+        self.session_id = str(uuid4())
         self.max_bytes = max(64 * 1024, int(max_bytes))
         self.max_files = max(2, int(max_files))
         self._queue: queue.Queue[
@@ -327,8 +329,10 @@ class LocalDongleTraceWriter:
     ) -> Path | None:
         """Queue one record without blocking the HA event loop."""
         enriched = {
-            "schema": TRACE_SCHEMA,
-            "written_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
+            "schema": LOCAL_DONGLE_TRACE_SCHEMA,
+            "kind": "acquisition",
+            "session_id": self.session_id,
+            "queued_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
             **record,
         }
         try:
@@ -386,6 +390,9 @@ class LocalDongleTraceWriter:
                     result.set_result(path)
 
     def _write_sync(self, line: bytes) -> Path:
+        # This timestamps the filesystem attempt, not queue acceptance or fsync.
+        persisted = datetime.now(UTC).isoformat(timespec="milliseconds").encode("ascii")
+        line = b'{"persistence_started_at":"' + persisted + b'",' + line[1:]
         self.root.mkdir(parents=True, exist_ok=True)
         active = self.active_path
         if active.exists() and active.stat().st_size + len(line) > self.max_bytes:

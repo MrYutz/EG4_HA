@@ -232,6 +232,41 @@ optional: they show `unavailable` when those sources are not configured or fresh
 The canonical SOC gauge likewise becomes unavailable rather than silently falling
 back to an unverified SOC source.
 
+## Versioned raw acquisition evidence
+
+The host-recorder release writes `eg4_local_dongle_trace.v2` records. Deployment
+is a separate, explicitly verified step; this format description is not evidence
+that the release is already active on HA. Historical v1 traces stay unchanged.
+
+- `transaction` records preserve request bytes, received frames/partials,
+  structurally obtainable words, separate validation outcomes and bounded
+  errors before semantic decoding or the next request. Unknown status33280 or
+  invalid voltage/frequency evidence remains inspectable but invalid for sensors.
+- `interpretation` records reference the raw transaction and its original
+  acquisition interval, labeling semantic acceptance/rejection separately.
+- `acquisition` summaries reference contributing transaction IDs and explicitly
+  mark partial results. A later GridBOSS frequency failure cannot erase the
+  earlier power/voltage transaction. Scheduled diagnostics still run after a
+  primary semantic rejection, within their existing bounded requests.
+  This includes a due BMS refresh: core rejection does not suppress Input80/40.
+  `bms_source` retains the cached block's original acquisition/transaction IDs
+  and time, so reuse is not confused with the failed or current transaction.
+- Session/acquisition/transaction IDs identify observations; UTC start/end and
+  monotonic duration describe capture, not an atomic snapshot. `queued_at` and
+  `persistence_started_at` separately describe host processing/filesystem work;
+  enqueue is not a durability acknowledgment. Monotonic time is session-local.
+
+Unsolicited/history frames are retained while awaiting identity or a strict
+matching response. The whole transaction has a deadline, existing4096-byte frame
+limit and256 KiB received-traffic cap, rather than an eight-frame matching limit.
+No history activation/erase or second device client is used. New raw summaries
+omit unrelated HA/light state dumps, credentials and tokens.
+
+Run `python scripts/analyze_local_dongle_trace.py <trace-file>` (optionally
+`--role <role>`) to stream historical or v2 evidence. Rejected/partial records are
+reported with acquisition intervals; the analyzer does not turn them into valid
+telemetry or engine/contact claims.
+
 ## Operational retention
 
 The raw trace and independent `controller-observations/` history each use the

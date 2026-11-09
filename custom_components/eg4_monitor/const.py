@@ -1,6 +1,7 @@
 """Constants for the EG4 Monitor integration."""
 
 DOMAIN = "eg4_monitor"
+LOCAL_DONGLE_TRACE_SCHEMA = "eg4_local_dongle_trace.v2"
 
 CONF_MASTER_SERIAL = "master_serial"
 CONF_SLAVE_SERIAL = "slave_serial"
