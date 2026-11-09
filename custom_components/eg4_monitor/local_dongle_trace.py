@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .const import LOCAL_DONGLE_TRACE_SCHEMA
 from .local_dongle import EG4GridBossTelemetry, EG4LocalTelemetry
 
 
-TRACE_SCHEMA = "eg4_local_dongle_trace.v2"
 DEFAULT_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_MAX_FILES = 8
 CONTROLLER_OBSERVATION_SCHEMA = "eg4_controller_observation.v1"
@@ -329,7 +329,7 @@ class LocalDongleTraceWriter:
     ) -> Path | None:
         """Queue one record without blocking the HA event loop."""
         enriched = {
-            "schema": TRACE_SCHEMA,
+            "schema": LOCAL_DONGLE_TRACE_SCHEMA,
             "kind": "acquisition",
             "session_id": self.session_id,
             "queued_at": datetime.now(UTC).isoformat(timespec="milliseconds"),

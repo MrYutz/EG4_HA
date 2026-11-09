@@ -12,6 +12,8 @@ from datetime import UTC, datetime
 from typing import Any, TypeVar
 from uuid import uuid4
 
+from .const import LOCAL_DONGLE_TRACE_SCHEMA
+
 PACKET_PREFIX = b"\xa1\x1a"
 PROTOCOL_VERSION = 1
 TCP_FUNC_TRANSLATED = 0xC2
@@ -27,7 +29,6 @@ _GRIDBOSS_FREQUENCY_REGISTER = 120
 _GRIDBOSS_FREQUENCY_COUNT = 12
 _MAX_PACKET_SIZE = 4096
 _MAX_TRANSACTION_BYTES = 256 * 1024
-_TRACE_SCHEMA = "eg4_local_dongle_trace.v2"
 _Decoded = TypeVar("_Decoded")
 _VALID_STATUS_CODES = frozenset(
     {0x00, 0x04, 0x08, 0x0C, 0x10, 0x11, 0x14, 0x20, 0x28, 0x40, 0x80, 0xC0}
@@ -1020,6 +1021,7 @@ class EG4LocalDongle:
 
     @contextlib.contextmanager
     def _acquisition(self) -> Iterator[dict[str, Any]]:
+        """Reuse the caller's task-local scope or create one for a standalone read."""
         existing = self._capture_context.get()
         if existing is not None:
             yield existing
@@ -1028,6 +1030,7 @@ class EG4LocalDongle:
                 yield acquisition
 
     async def _emit(self, record: dict[str, Any]) -> None:
+        """Queue evidence without replacing a device result with recorder failure."""
         if self.evidence_sink is not None:
             # Recorder failures must not replace device errors or measurements.
             # The queue-based writer owns loss/error accounting.
@@ -1039,6 +1042,7 @@ class EG4LocalDongle:
         transactions: tuple[dict[str, Any], ...],
         decode: Callable[[], _Decoded],
     ) -> _Decoded:
+        """Record decoding outcomes separately from the immutable raw transactions."""
         error = None
         try:
             result = decode()
@@ -1048,7 +1052,7 @@ class EG4LocalDongle:
         finally:
             for transaction in transactions:
                 interpretation = {
-                    "schema": _TRACE_SCHEMA,
+                    "schema": LOCAL_DONGLE_TRACE_SCHEMA,
                     "kind": "interpretation",
                     "session_id": transaction["session_id"],
                     "role": transaction["role"],
@@ -1081,7 +1085,7 @@ class EG4LocalDongle:
             started = loop.time()
             deadline = started + (self.timeout if timeout is None else timeout)
             transaction: dict[str, Any] = {
-                "schema": _TRACE_SCHEMA,
+                "schema": LOCAL_DONGLE_TRACE_SCHEMA,
                 "kind": "transaction",
                 "session_id": self.session_id,
                 "role": self.role,

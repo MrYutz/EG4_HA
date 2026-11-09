@@ -248,6 +248,9 @@ that the release is already active on HA. Historical v1 traces stay unchanged.
   mark partial results. A later GridBOSS frequency failure cannot erase the
   earlier power/voltage transaction. Scheduled diagnostics still run after a
   primary semantic rejection, within their existing bounded requests.
+  This includes a due BMS refresh: core rejection does not suppress Input80/40.
+  `bms_source` retains the cached block's original acquisition/transaction IDs
+  and time, so reuse is not confused with the failed or current transaction.
 - Session/acquisition/transaction IDs identify observations; UTC start/end and
   monotonic duration describe capture, not an atomic snapshot. `queued_at` and
   `persistence_started_at` separately describe host processing/filesystem work;
