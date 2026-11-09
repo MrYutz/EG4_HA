@@ -113,7 +113,10 @@ def telemetry_to_record(telemetry: EG4LocalTelemetry) -> dict[str, Any]:
         "inverter_serial": telemetry.inverter_serial,
         "core": {
             "status_code": telemetry.status_code,
-            "status_name": _STATUS_NAMES.get(telemetry.status_code, "unknown"),
+            "status_name": (
+                _STATUS_NAMES.get(telemetry.status_code, "unknown")
+                if telemetry.status_code is not None else "unknown"
+            ),
             "battery_voltage_v": telemetry.battery_voltage,
             "soc_percent": telemetry.battery_soc,
             "soh_percent": telemetry.battery_soh,
@@ -189,7 +192,9 @@ class ControllerObservationTracker:
             ((4, 500, 100), (3, 4500, 10)) if gridboss
             else ((4, 40, 40), (3, 110, 125), (4, 120, 26))
         )
-        blocks = {f"{fn}:{start}:{count}": None for fn, start, count in expected}
+        blocks: dict[str, bool | None] = {
+            f"{fn}:{start}:{count}": None for fn, start, count in expected
+        }
         for block in record.get("diagnostics") or ():
             function = block["function"]
             start = block["register"]
@@ -197,13 +202,13 @@ class ControllerObservationTracker:
             values = block.get("values")
             ok = block.get("ok") is True and values is not None
             blocks[f"{function}:{start}:{count}"] = ok
-            if ok:
+            if ok and values is not None:
                 registers.update(
                     ((function, start + offset), value)
                     for offset, value in enumerate(values)
                 )
 
-        controller = {
+        controller: dict[str, Any] = {
             "input": {str(reg): registers.get((4, reg)) for reg in inputs},
             "holding": {str(reg): registers.get((3, reg)) for reg in holdings},
         }

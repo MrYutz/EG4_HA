@@ -965,7 +965,7 @@ class EG4LocalDongle:
         bms, dongle_serial = await self._read_registers(_BMS_REGISTER, _BMS_COUNT)
         return _decode_bms_data(bms, dongle_serial)
 
-    async def async_read_snapshot(self) -> EG4LocalTelemetry:
+    async def async_read_snapshot(self) -> EG4LocalTelemetry | EG4GridBossTelemetry:
         """Read core inverter values and the BMS diagnostic range."""
         core = await self.async_read_core_snapshot()
         bms = await self.async_read_bms_snapshot()
