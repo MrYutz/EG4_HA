@@ -332,20 +332,70 @@ limit and256 KiB received-traffic cap, rather than an eight-frame matching limit
 No history activation/erase or second device client is used. New raw summaries
 omit unrelated HA/light state dumps, credentials and tokens.
 
-Run `python scripts/analyze_local_dongle_trace.py <trace-file>` (optionally
-`--role <role>`) to stream historical or v2 evidence. Rejected/partial records are
-reported with acquisition intervals; the analyzer does not turn them into valid
-telemetry or engine/contact claims.
+Run `python scripts/analyze_local_dongle_trace.py <file-or-directory>` (optionally
+`--role <role>` and `--gap-seconds <seconds>`) to stream historical or v2 evidence.
+A recorder root reports rolling capture, controller journal and each incident
+separately; copied incident rows are not counted as additional rolling acquisitions.
+An incident directory verifies manifest references, retained file sizes and final
+SHA256 hashes. Growing, missing, evicted or modified files remain explicitly incomplete.
+
+The analyzer reports source coverage, failures/partials, session changes, acquisition
+gaps, raw controller/protection changes and configuration age. Output anomalies are
+examined throughout the input, not only during low generator power. A structurally
+received UPS/EPS word can still be reported when a later block or semantic decode
+fails: it is labeled `structural_raw_register`, never promoted into valid telemetry.
+Cached blocks from another acquisition cannot manufacture a new voltage observation.
+Onset/recovery brackets retain original read intervals and unresolved overlapping
+ordering. No zero-fill, interpolation, engine/contact claim or continuous house-outage
+duration is inferred.
 
 ## Operational retention
 
-The raw trace and independent `controller-observations/` history each use the
-existing JSONL rotation convention: 25 MiB per file, at most eight files including
-the active `local-dongle.jsonl`. Limits are **bytes/files, not days**; controller
-change frequency and record size determine the available time span, and neither
-trace promises complete retention of a particular incident. Awaiting a writer's
-close drains accepted queued records and flushes them before returning; this does
-not make disk failures, a process crash, or queue-full rejection durable.
+The release owns only
+`/config/.eg4-investigation/host-recorder-v2/<entry-id>/`, identified by `recorder.json`.
+Its `raw/` and `controller-observations/` directories contain rolling JSONL;
+`incidents/incident-<id>/` contains plain JSONL and an atomic `manifest.json`.
+Historical `local-dongle/` captures, sealed investigations, deployment backups and
+unrelated HA files remain outside this retention owner.
+
+| Stream | Default age ceiling | Default byte ceiling | Advanced config-entry option |
+| --- | --- | --- | --- |
+| Raw |72h|2 GiB|`local_trace_raw_max_bytes`|
+| Controller journal |14 days|200 MiB|`local_trace_journal_max_bytes`|
+| Incidents, including open segments |14 days|1 GiB|`local_trace_incident_max_bytes`|
+
+Segments target25 MiB. Positive integer byte overrides affect host storage only
+and survive ordinary integration-options saves; they have no additional UI controls.
+Limits are ceilings, not preallocation or promised days. The recorder rejects writes
+that would cross its1 GiB free-space reserve; unrelated HA writes can still change
+free space. Ordinary raw expires before incident evidence under pressure. Forced
+incident eviction leaves incomplete/lost-coverage metadata rather than a plausible
+complete bundle. Existing diagnostic `RecorderHealth.Incidents` reports actual raw
+coverage/bytes, free space, estimated retention, active/latest paths and truncation.
+
+Immediate source edges preserve the preceding ten minutes, bounded to16 MiB, plus
+ten quiet minutes after the latest trigger/recovery. Startup warmup and memory
+truncation are explicit. Overlapping reasons share one incident; identical failures
+do not create an incident each poll, and an active anomaly keeps the window open.
+Triggers include accepted-power loss with voltage present regardless of qualified
+frequency, inconsistent V/F, output anomalies, discrete controller/protection
+changes, primary/diagnostic loss or resumption, semantic rejection and recorder loss.
+The240 V capture limits are below180 V/above264 V for GridBOSS total UPS voltage
+and this site's FlexBOSS EPS-r report. Low output requires a previously live channel;
+overvoltage does not. Never apply these limits to120 V legs or equipment settings.
+
+The manifest retains session/build identity, source coverage, all reason/time events,
+missing roles, errors/gaps and aged all-role configuration context. Only synchronized,
+immutable files receive final hashes. An unfinished window becomes `interrupted`
+on close/restart; the next session has a gap and a new warming buffer, not invented
+continuity. Copy a closed/interrupted incident directory off-host and pass that
+directory to the same analyzer. Active rolling files are moving evidence, not atomic
+snapshots. Graceful close drains accepted output and synchronizes it off the HA loop;
+it cannot make queue rejection, disk failure or abrupt power loss durable.
+Core shutdown, entry unload and failed setup share the capture-close path. HA does
+not call integration unload when Core stops; an explicit stop listener joins the
+role tasks, settles incident custody, closes both rolling writers and saves logger
+state before returning. Stopping collection is not evidence of an electrical outage.
 
 The logger state store separately retains the active session, last session,
 recent events, and up to90 days/100 completed sessions. Long-term trends still

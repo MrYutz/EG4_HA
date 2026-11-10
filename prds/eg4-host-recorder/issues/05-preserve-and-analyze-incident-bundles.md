@@ -2,7 +2,7 @@
 id: EG4REC-05
 title: Freeze, retain and reconstruct complete incident bundles
 type: AFK
-status: ready
+status: in-progress
 phase: delivery
 source_github: null
 source_business_need: conversation-provisional
@@ -54,3 +54,13 @@ Use the existing all-role acquisition and recoverable journal to preserve bounde
 
 - [03-isolate-device-polling.md](./03-isolate-device-polling.md)
 - [04-recover-controller-journal-and-health.md](./04-recover-controller-journal-and-health.md)
+
+## Pull request stack
+
+Stack root: `main` at `1a1bec20a41e237dc61dbd0575d7cbdeb00067f2`; independent acquisition and recoverable persistence are merged.
+
+| Key | Branch | Purpose | Predecessor / PR base | Acceptance advanced |
+| --- | --- | --- | --- | --- |
+| 5.1 | `codex/eg4-host-recorder-5.1-incident-bundles` | Preserve immediate all-role pre/post incidents, bounded owned storage and crash/pressure metadata, then reconstruct the saved evidence through the existing streaming CLI | `main` at the stack root | All EG4REC-05 acceptance criteria and A7–A8, preserving A1–A6 |
+
+One complete vertical entry joins capture, plain-directory export, atomic manifests, safe retention, existing health and its offline consumer. Reuse the existing writer/journal and do not add another device reader, upload service, compression service or dashboard. Move the new release into a distinct recorder-owned root; old investigations/backups remain outside pruning. Capacity overrides are host-recorder options, not controller operating/protection settings. Production installation and the fixed live window remain EG4REC-06.

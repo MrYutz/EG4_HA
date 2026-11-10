@@ -28,6 +28,9 @@ CONF_LOCAL_AUTO_DISCOVERY = "local_auto_discovery"
 CONF_LOCAL_TRACE_ENABLED = "local_trace_enabled"
 CONF_LOCAL_TRACE_INTERVAL = "local_trace_interval"
 CONF_LOCAL_TRACE_BMS_INTERVAL = "local_trace_bms_interval"
+CONF_LOCAL_TRACE_RAW_MAX_BYTES = "local_trace_raw_max_bytes"
+CONF_LOCAL_TRACE_JOURNAL_MAX_BYTES = "local_trace_journal_max_bytes"
+CONF_LOCAL_TRACE_INCIDENT_MAX_BYTES = "local_trace_incident_max_bytes"
 
 # Base URLs
 BASE_URL = "https://monitor.eg4electronics.com/WManage"
