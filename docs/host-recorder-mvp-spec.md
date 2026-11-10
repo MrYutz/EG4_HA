@@ -27,6 +27,8 @@ Reuse current discovery/manual routes, transport framing, JSONL storage, logger,
 
 No Q1 activation, Q3/QD/QS, flash-history upload/erase, arbitrary-register probing, generator/load/breaker experiment, or second device collector. No automated off-host replication service: incident directories must be copyable through the existing SSH route, and deployment must preserve an off-host evidence copy.
 
+**2026-11-10 approved extension:** R7 below permits one Plucky-side, file-only archival job and its isolated SFTP dependency. After actual HA persistence stopped at the1GiB reserve, Greg additionally approved smaller recorder-only HA ceilings and one safe Core restart after preserving the source. HA component code/dependencies, sampling, device-reader ownership and equipment restrictions remain unchanged.
+
 “All data” means the defined stock-register profiles and bytes received by this integration, including failures. It cannot mean unpublished controller RAM, all CAN traffic, waveforms or measurements while HA itself is unpowered.
 
 ## R1 — Save first; decode second
@@ -222,3 +224,20 @@ External device timeouts need not block delivery if captured honestly and health
 Implementation is complete only when R1–R6 and A1–A8 have evidence, the release is pushed and active on HA, all three roles are recording with visible health, incident export works, and backup/rollback are usable. No controller firmware or operating settings have changed.
 
 This release is not a promise to expose unpublished latches or prevent the next dropout. It must preserve a trustworthy account of what each controller reported, when it was acquired, and exactly where observation failed.
+
+## R7 — Plucky raw retention and incident snapshots
+
+Greg approved one AFK storage slice after requesting Plucky storage, at least one week of raw logs and preserved incident snapshots. Plucky is the current Linux host with ZFS-backed home storage and roughly2.28TiB free at discovery. HA has only about1.3GiB free; do not increase its pressure or put network storage in its acquisition path.
+
+- Pull only the existing entry's recorder files over authenticated, host-key-verified SFTP. No device sockets, HA state publication, equipment firmware/settings changes or new HA dependency. One optional SFTP library and one user-systemd timer live on Plucky; normal archival needs no HA restart.
+- **Approved storage-pressure correction:** preserve and hash-verify current evidence on Plucky first, then reduce only HA recorder ceilings to256MiB raw,32MiB controller and128MiB incidents, keeping the1GiB reserve. Greg separately authorized Core stop/configuration backup/three-option update/check/start because the existing options API cannot edit these advanced limits. Reclaim only preserved recorder-owned excess, never unrelated data/backups. Record lost persistence and restart gaps; verify actual recovery. The smaller raw outage buffer estimates2.9h at the earlier measured rate, not guaranteed retention.
+- Run every minute without overlapping runs. Backfill currently available files, then copy only new bytes/files; a source active-file rename/rotation or recorder restart must not overwrite older archived bytes or duplicate the same source prefix.
+- Retain raw and controller streams for eight days after their last newly received bytes, providing at least a full week. Do not prune recent evidence to satisfy a byte ceiling; fail visibly on insufficient space instead. Never prune unrelated files or incident snapshots.
+- Mirror open incidents honestly as moving/incomplete received evidence. Preserve finalized or interrupted incident snapshots indefinitely, independently of HA retention and without later source pruning/metadata changes overwriting a sealed snapshot. Verify stable source manifests, retained-file sizes and every available final hash before sealing; never change source completeness or firmware meanings.
+- An unavailable source/network must leave prior archives intact, report a failed transfer and retry on the next timer. HA continues its existing local spool independently. Catch-up cannot recover history already evicted from that spool; record missing/interrupted evidence honestly. Eight days fills as new data arrives, not fabricated historical backfill.
+- Use a private, narrowly owned Plucky archive root; atomic metadata/status writes, same-root locking, bounded streaming copies and synchronized receipts distinguish received bytes from merely planned work. The existing read-only analyzer must consume archived raw/controller files and preserved incident directories with original record bytes/IDs/intervals.
+- Publish the scoped source before installing a coherent immutable script release and timer. Prove actual Plucky backfill, an incremental scheduled run, byte/hash custody, incident preservation and continued HA capture. Verify retention/rotation/disconnection behavior offline; do not inject faults into live devices or HA storage.
+
+### A9 — Archive acceptance
+
+The approved public seams are `archive_once` with real temporary local/SFTP source files, the actual archival CLI, saved archive/incident directories and the existing analyzer CLI. Prove raw survival through source rotation/deletion, minimum-age retention without deleting recent/unrelated evidence, frozen incident survival after source pruning, interrupted transfer/resume without false success, and real scheduled Plucky ingestion. Raw logs, keys and operational receipts stay outside Git. This is a storage extension, not a second collector or a new diagnosis of the historical power failure.

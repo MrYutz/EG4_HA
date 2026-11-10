@@ -4,6 +4,13 @@ Custom Home Assistant integration for EG4 portal-backed systems, tuned for moder
 
 ## What Changed
 
+### Plucky recorder archive
+
+- File-only SFTP pulls preserve eight days of raw/controller logs on Plucky, without changing device sampling or making HA depend on network storage.
+- Incident snapshots have no automatic expiry; moving or incomplete source evidence stays explicitly incomplete.
+- The minute timer, private storage, failure status and recovery limits are documented in the [off-host archive guide](docs/mother-of-all-data-loggers.md#plucky-off-host-archive).
+- Installed source, actual scheduled transfers and the approved HA disk-pressure correction: [Plucky deployment evidence](docs/plucky-recorder-archive-deployment-2026-11-10.md).
+
 ### Host recorder 0.2.2
 
 - Independent read-only schedules keep healthy FlexBOSS/GridBOSS roles recording when another request stalls.

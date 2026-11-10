@@ -1,0 +1,16 @@
+[Unit]
+Description=Pull existing EG4 recorder evidence into the private Plucky archive
+
+[Service]
+Type=oneshot
+UMask=0077
+NoNewPrivileges=true
+# Nonsecret paths/identifiers only. The existing private key stays at IDENTITY.
+# Keep this operator-created file private (0600); do not put key material here.
+Environment=EG4_ARCHIVE_PORT=22 EG4_ARCHIVE_RAW_DAYS=8 EG4_ARCHIVE_MIN_FREE_BYTES=10737418240
+EnvironmentFile=%h/.config/eg4-recorder-archive/environment
+# current selects one immutable releases/<commit>/ tree, including its own venv.
+ExecStart=%h/.local/libexec/eg4-recorder-archive/current/venv/bin/python %h/.local/libexec/eg4-recorder-archive/current/scripts/pull_eg4_archive.py --source ${EG4_ARCHIVE_SOURCE} --destination ${EG4_ARCHIVE_DESTINATION} --entry-id ${EG4_ARCHIVE_ENTRY_ID} --host ${EG4_ARCHIVE_HOST} --user ${EG4_ARCHIVE_USER} --identity ${EG4_ARCHIVE_IDENTITY} --known-hosts ${EG4_ARCHIVE_KNOWN_HOSTS} --port ${EG4_ARCHIVE_PORT} --raw-days ${EG4_ARCHIVE_RAW_DAYS} --min-free-bytes ${EG4_ARCHIVE_MIN_FREE_BYTES}
+# Backfill may take longer than the systemd default; resume on the next activation
+# if this whole-job deadline expires. A oneshot cannot overlap itself.
+TimeoutStartSec=15min

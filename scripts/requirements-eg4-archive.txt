@@ -1,0 +1,2 @@
+# Plucky archival venv only; never install into Home Assistant.
+paramiko==5.1.0

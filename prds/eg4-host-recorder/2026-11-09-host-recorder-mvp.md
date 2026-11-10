@@ -18,6 +18,10 @@ The existing Home Assistant custom integration is the **host recorder**: it acqu
 
 Greg wants useful capture operating before another power problem, potentially tomorrow—not a new observability platform or a controller-firmware experiment. This initiative must deliver, test, push and immediately deploy the minimum complete host-only correction.
 
+On2026-11-10 Greg additionally requested Plucky log storage with at least one week of raw data and preserved incident snapshots. He approved one further AFK slice, eight-day raw/controller retention, indefinite incident snapshots, a minute-by-minute file-only pull job and actual CLI/local/SFTP verification seams. This later requirement extends the completed original six slices; it does not weaken their capture or equipment constraints.
+
+During delivery, actual HA persistence exhausted its1GiB free-space reserve. Greg approved preserving current files on Plucky, reducing only recorder ceilings to256MiB raw/32MiB controller/128MiB incidents, and separately approved a safe Core stop/update/start because these advanced limits have no options API. Keep the reserve, preserve all unrelated data and record the capture gap. This operational correction does not change sampling, integration code or equipment settings.
+
 ## Solution
 
 Ship one release of the existing integration that preserves received evidence before decoding, isolates device collection, reports truthful freshness/state, recovers its journal after loss, preserves bounded incident context and exposes enough health to know whether capture works. Reconstruct what each controller reported and when it was acquired without inventing continuity, physical contacts or precise causality.
@@ -36,6 +40,7 @@ Use existing routes, JSONL, entities, logger, analyzer and tests. Preserve entit
 6. As an investigator, I want bounded all-role pre/post-event bundles with configuration context, explicit truncation and restart/disk-pressure handling, so that important evidence survives without endangering HA storage. Covers R5 and A7.
 7. As an operator and investigator, I want visible capture health and streaming analysis of old/new files or incident directories, so that I can distinguish a quiet system from a dead recorder and reconstruct supported event brackets rather than invented continuity. Covers R6 and A8, integrated with stories 1, 3, 5 and 6.
 8. As the site operator, I want the tested release pushed, installed immediately and verified using genuine and separately designated synthetic evidence, so that tomorrow's event is captured and a rollback is available. Covers the complete immediate delivery checklist and Done criteria.
+9. As the site operator, I want at least one week of raw/controller evidence archived on Plucky and incident snapshots preserved beyond HA's local limits, so that a later investigation does not lose records to the small HA disk while network outages cannot stall device polling. Covers approved R7 and A9.
 
 Story numbers are stable identifiers. A story may span multiple vertical slices; partial coverage in one issue does not waive its remaining requirements.
 
@@ -50,6 +55,7 @@ Story numbers are stable identifiers. A story may span multiple vertical slices;
 - **Bounded incident preservation:** use existing collected records; ten-minute pretrigger buffer capped at16 MiB and ten-minute post-trigger quiet period, merged edge triggers, continued active anomalies, bounded segments, atomic manifests and finalized hashes. Honor all R5 storage ceilings, the1 GiB free-space reserve, owned-file-only pruning and explicit lost coverage. Governing authority: [R5](../../docs/host-recorder-mvp-spec.md).
 - **Observable loss and cautious reconstruction:** expose existing-entity health and persisted health records, stream historical/new evidence, enumerate anomalies outside known dropout windows and bracket event times using acquisition intervals. No interpolation, zero-fill, physical-contact claims or continuous house-outage durations inferred across gaps. Governing authority: [R6](../../docs/host-recorder-mvp-spec.md).
 - **Immediate reversible rollout:** focused checks, documentation/version, normal push, preserved existing work/evidence, installed-file hashes, backup, HA configuration check, one restart, fixed ten-minute observation and separate synthetic verification. Genuine external timeouts may remain honestly degraded; new integration/write/profile defects block success. Governing authority: [immediate delivery checklist and Done](../../docs/host-recorder-mvp-spec.md).
+- **Approved Plucky storage extension:** one file-only SFTP pull timer on Plucky, optional dependency isolated from HA, eight-day raw/controller retention and indefinite sealed incidents. Preserve honest open/interrupted coverage, incremental byte identity and available final hashes; the archive client performs no source deletion, reduced sampling or new device reads. The separately approved HA storage-pressure correction changes only three recorder ceilings after preservation, with one Core restart and explicit gaps. Governing authority: [R7/A9](../../docs/host-recorder-mvp-spec.md).
 
 **Authority gaps and limits:** installed controller firmware identity and exact physical meanings of candidate-mapped protection bits remain unverified (`firmware-identity`, `protection-bit-semantics`). Reverse-engineered candidate behavior is evidence, not authority to claim that an internal latch or contact physically changed on this installation. Preserve raw values, identity and uncertainty; do not turn these gaps into guessed labels, firmware changes or additional probing. They do not block host-only recording. No separate ADR or independent test contract is invented: the explicitly accepted design and its acceptance checks govern this initiative.
 
@@ -65,6 +71,7 @@ Greg explicitly approved these public seams alongside the six-slice proposal. Ex
 | Recorder append/observe/close against temporary storage and persisted health | Input6/reason-only changes and unchanged recovery baselines survive; enqueue/disk failures and cumulative loss remain visible | R4, A6; [trace tests](../../tests/test_local_dongle_trace.py) |
 | Saved incident directories and streaming analyzer CLI | All-role pre/post context, pressure/restart gaps, owned-file retention and completeness match manifests without false causal claims | R5–R6, A7–A8; [existing analyzer](../../scripts/analyze_local_dongle_trace.py) |
 | Actual HA API, installed recorder files and independently copied evidence | Correct build loaded, three roles collecting, observed cadence/storage/health, isolated synthetic incident and usable rollback | Immediate delivery checklist; no electrical fault injection |
+| Plucky archive public function/CLI with real local/SFTP files, saved archive directories and existing analyzer | Prefix/rotation identity, eight-day minimum-age retention, source-loss resume, stable hash-verified incident sealing and genuine scheduled Plucky backfill without device polling | R7/A9; explicitly approved with EG4REC-07 on2026-11-10 |
 
 Each slice demonstrates an end-to-end behavior, not merely a layer or mock wiring. Use a failing behavioral regression for a missing defect path, implement only the relevant correction, then run the narrow covering check. Reuse tests that already cover the behavior; do not add duplicate, source-text or argument-echo tests. Run focused changed-module checks together after integration, plus Ruff on changed Python, actual loopback TCP and analyzer CLI. Record only checks actually exercised; do not claim an unrun full suite passed.
 
@@ -75,7 +82,7 @@ All A1–A8 proofs remain mandatory before deployment completion. Raw evidence s
 - Controller/custom power firmware, operating/protection settings or attempts to prevent a dropout before establishing trustworthy evidence.
 - Re-litigating independently verified generator health, electrical experiments, generator/load/breaker cycling or induced physical dropouts.
 - Flash-history activation/upload/erase, Q1/Q3/QD/QS, arbitrary register probes, inaccessible engineering surfaces or another device collector.
-- New dashboards, databases, brokers, dependencies, persistent-socket redesign, configuration wizard, compression/upload service or automatic off-host replication.
+- For the original HA release: new dashboards, databases, brokers, dependencies, persistent-socket redesign, configuration wizard, compression/upload service or automatic off-host replication. The explicitly approved R7 Plucky file-only archive and isolated dependency are the sole later exception.
 - Claims to capture unpublished RAM, all CAN traffic, waveforms or observations while HA is unpowered; guaranteed72-hour retention regardless of byte limits; power-loss-proof persistence of queued records.
 - GitHub ticket publication, unrelated investigation cleanup or changes to equipment registries/dashboards.
 
@@ -91,7 +98,7 @@ The delivery is complete only when R1–R6 and A1–A8 have evidence, the pushed
 
 ## Implementation Issues
 
-Approved six-slice breakdown: [Implementation issue board](./issues/README.md). All slices are AFK; dependencies and delivery status are owned by issue frontmatter and the derived board.
+Approved original six-slice breakdown plus the later approved Plucky storage extension: [Implementation issue board](./issues/README.md). All slices are AFK; dependencies and delivery status are owned by issue frontmatter and the derived board.
 
 1. [EG4REC-01 — Preserve raw dongle evidence through invalid and interleaved responses](./issues/01-preserve-raw-dongle-evidence.md).
 2. [EG4REC-02 — Make generator and charging states truthful through gaps](./issues/02-correct-generator-and-charge-state.md).
@@ -99,3 +106,4 @@ Approved six-slice breakdown: [Implementation issue board](./issues/README.md). 
 4. [EG4REC-04 — Preserve protection changes and recover the journal after write failures](./issues/04-recover-controller-journal-and-health.md).
 5. [EG4REC-05 — Freeze, retain and reconstruct complete incident bundles](./issues/05-preserve-and-analyze-incident-bundles.md).
 6. [EG4REC-06 — Push, deploy and verify the recorder on Home Assistant](./issues/06-deploy-and-verify-recorder.md).
+7. [EG4REC-07 — Archive one week of raw evidence and preserve incident snapshots on Plucky](./issues/07-archive-evidence-on-plucky.md).

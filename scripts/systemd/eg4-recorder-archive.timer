@@ -1,0 +1,11 @@
+[Unit]
+Description=Pull EG4 recorder evidence once per minute without overlapping jobs
+
+[Timer]
+OnStartupSec=60s
+OnUnitInactiveSec=60s
+AccuracySec=1s
+Unit=eg4-recorder-archive.service
+
+[Install]
+WantedBy=timers.target
