@@ -1125,3 +1125,71 @@ async def test_shutdown_health_survives_full_outstanding_queue(tmp_path, monkeyp
         assert shutdown["PendingObservations"] == 0
         assert shutdown["PersistedRecords"] == 1
         assert journal_writer.health["DroppedRecords"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gridboss", [False, True])
+async def test_filtered_measurements_do_not_manufacture_incident_recoveries(tmp_path, gridboss):
+    """Identical raw evidence and decoded masking cannot alternate availability."""
+    role = "gridboss" if gridboss else "flexboss_master"
+    incidents = IncidentRecorder(
+        tmp_path / "capture", entry_id="synthetic-filtered",
+        session_id="filtered-session", build_id="filtered-build", roles={role},
+        limits=RecorderLimits(min_free_bytes=0), evidence_class="synthetic",
+    )
+    raw = LocalDongleTraceWriter(
+        incidents.raw_root, max_files=None, write_guard=incidents.write_guard("raw"),
+    )
+    journal_writer = LocalDongleTraceWriter(
+        incidents.journal_root, max_files=None, write_guard=incidents.write_guard("journal"),
+    )
+    journal = ControllerObservationJournal(journal_writer)
+
+    async def respond(shape):
+        values = _words(shape, gridboss=gridboss)
+        if shape == (4, 0, 40):
+            if gridboss:
+                values[4] = 65535  # One invalid leg masks otherwise valid aggregates.
+            else:
+                values[20], values[23] = 3300, 6000  # Raw overvoltage, decoded unavailable.
+        return values
+
+    def triggers():
+        root = Path(incidents.health["LatestIncidentPath"])
+        manifest = json.loads((root / "manifest.json").read_text())
+        return [
+            json.loads(line)
+            for item in manifest["files"] if item["kind"] == "triggers" and item["retained"]
+            for line in (root / item["path"]).read_text().splitlines()
+        ]
+
+    async with _endpoint(respond, gridboss=gridboss) as (device, _, _):
+        consumer = _LoggerConsumer()
+        recorder = consumer.recorder = EG4LocalRecorder(
+            devices={role: device}, configured_inverter_roles=set() if gridboss else {role},
+            writer=raw, journal=journal, incidents=incidents, on_update=consumer,
+            interval=0.005, build_id="filtered-build",
+        )
+        try:
+            await recorder.async_start()
+            await consumer.next()
+            await incidents.async_tick()
+            before = triggers()
+            consumer.advance()
+            _, snapshot, _ = await consumer.next()
+            await incidents.async_tick()
+            assert [row["reason"] for row in triggers()] == [row["reason"] for row in before]
+            if gridboss:
+                assert snapshot.gridboss.input_registers_valid is False
+                assert snapshot.gridboss.ups_voltage is None
+            else:
+                assert snapshot.inverters[role].eps_voltage_r is None
+                assert any(
+                    row["reason"] == "output_voltage_anomaly"
+                    and row["details"]["reported_voltage_v"] == 330
+                    for row in before
+                )
+        finally:
+            await recorder.async_close()
+            await raw.async_close()
+            await journal_writer.async_close()

@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 ANALYZER = Path(__file__).resolve().parents[1] / "scripts/analyze_local_dongle_trace.py"
 
@@ -957,3 +960,190 @@ def test_cli_recovers_raw_only_output_and_deduplicates_its_later_summary(tmp_pat
             assert '"value_source": "structural_raw_register"' in events[0]
             assert "raw-power" in events[0] and "12:00:01" in events[0]
             assert trace.read_bytes() == original
+
+
+def _controller_transaction(role, function, register, count, offset, word, sequence):
+    """Represent one successful stock-profile read, not decoded telemetry."""
+    values = [0] * count
+    values[offset] = word
+    started = datetime.fromisoformat("2026-11-09T12:00:00+00:00") + timedelta(seconds=sequence * 2)
+    return {
+        "schema": "eg4_local_dongle_trace.v2", "kind": "transaction",
+        "role": role, "session_id": "synthetic-raw-controller",
+        "acquisition_id": f"acq-{sequence}", "transaction_id": f"tx-{sequence}",
+        "started_at": started.isoformat(),
+        "completed_at": (started + timedelta(seconds=1)).isoformat(),
+        "ok": True, "request": {
+            "function": function, "register": register, "count": count,
+        },
+        "frames": [{
+            "classification": "matching", "values": values,
+            "validation": {name: "passed" for name in (
+                "framing", "crc", "identity", "function", "range",
+            )},
+        }],
+    }
+
+
+def _controller_summary(transaction, *, cached=False):
+    block = {
+        **transaction["request"], "ok": True,
+        **{name: transaction[name] for name in (
+            "acquisition_id", "transaction_id", "started_at", "completed_at",
+        )},
+        "values": transaction["frames"][0]["values"],
+        "current_acquisition": not cached,
+    }
+    return {
+        "schema": "eg4_local_dongle_trace.v2", "kind": "acquisition",
+        "role": transaction["role"], "session_id": transaction["session_id"],
+        "acquisition_id": "later-acquisition" if cached else transaction["acquisition_id"],
+        "sample_started_at": "2026-11-09T12:00:10+00:00",
+        "sample_completed_at": "2026-11-09T12:00:11+00:00",
+        "ok": True, "diagnostics": [block],
+    }
+
+
+@pytest.mark.parametrize(
+    "role,function,register,count,offset,before,after,expected",
+    [
+        ("gridboss", 4, 500, 100, 19, 0x0101, 0x0201, {"input.519": (257, 513)}),
+        ("gridboss", 4, 500, 100, 19, 0x0101, 0x0102, {"input.519": (257, 258)}),
+        ("flexboss_master", 4, 0, 40, 6, 0, 3,
+         {"input.6": (0, 3), "input.6.bits_0_1": (0, 3)}),
+        ("flexboss_master", 4, 40, 40, 20, 0, 8, {"input.60": (0, 8)}),
+        ("flexboss_slave", 4, 120, 26, 24, 0, 4, {"input.144": (0, 4)}),
+        ("flexboss_master", 3, 110, 125, 60, 0, 2, {"holding.170": (0, 2)}),
+        ("gridboss", 3, 4500, 10, 0, 0, 1, {"holding.4500": (0, 1)}),
+        ("gridboss", 3, 2000, 108, 102, 0, 16, {"holding.2102": (0, 16)}),
+    ],
+)
+@pytest.mark.parametrize("summaries", ["absent", "immediate", "delayed_cached"])
+def test_cli_recovers_raw_controller_changes_without_summary_replay(
+    tmp_path, role, function, register, count, offset, before, after, expected, summaries,
+):
+    first = _controller_transaction(role, function, register, count, offset, before, 0)
+    changed = _controller_transaction(role, function, register, count, offset, after, 1)
+    rows = [first, changed]
+    if summaries == "immediate":
+        rows = [first, _controller_summary(first), changed, _controller_summary(changed)]
+    elif summaries == "delayed_cached":
+        rows.extend([_controller_summary(first, cached=True), _controller_summary(changed)])
+    output = _analyze(tmp_path, rows)
+    events = [line for line in output.splitlines() if "controller_protection_change " in line]
+    assert len(events) == 1
+    event = events[0]
+    details = json.loads(event.split(" details=", 1)[1])
+    assert details["changed"] == {
+        key: {"previous": old, "current": new} for key, (old, new) in expected.items()
+    }
+    assert "acquisition=acq-1 transaction=tx-1" in event
+    assert f"start={changed['started_at']} end={changed['completed_at']}" in event
+    assert details["authority"] == "raw_words"
+    assert "status_run=" not in output
+
+
+@pytest.mark.parametrize("rejection", [
+    "identity", "unrelated", "crc", "range", "partial", "short", "negative", "overflow", "boolean",
+])
+def test_cli_does_not_promote_rejected_or_invalid_controller_frames(tmp_path, rejection):
+    baseline = _controller_transaction("flexboss_master", 4, 0, 40, 6, 0, 0)
+    rejected = _controller_transaction("flexboss_master", 4, 0, 40, 6, 3, 1)
+    frame = rejected["frames"][0]
+    if rejection in ("identity", "unrelated"):
+        frame["classification"] = rejection
+    elif rejection in ("crc", "range"):
+        frame["validation"][rejection] = "failed"
+    elif rejection == "partial":
+        frame["partial"] = True
+    elif rejection == "short":
+        frame["values"] = frame["values"][:7]
+    else:
+        frame["values"][6] = {"negative": -1, "overflow": 65536, "boolean": True}[rejection]
+    output = _analyze(tmp_path, [baseline, rejected])
+    assert "controller_protection_change " not in output
+
+
+def test_cli_resets_controller_comparison_and_source_dedup_at_session_change(tmp_path):
+    rows = []
+    for session, words in (("before-restart", (0, 3)), ("after-restart", (8, 1))):
+        for sequence, word in enumerate(words):
+            transaction = _controller_transaction("flexboss_master", 4, 0, 40, 6, word, sequence)
+            transaction["session_id"] = session
+            rows.extend([transaction, _controller_summary(transaction)])
+    output = _analyze(tmp_path, rows)
+    events = [line for line in output.splitlines() if "controller_protection_change " in line]
+    assert len(events) == 2
+    assert '"input.6": {"current": 3, "previous": 0}' in events[0]
+    assert '"input.6": {"current": 1, "previous": 8}' in events[1]
+    assert "session_change " in output
+    assert '"previous_session": "before-restart"' in output
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_cli_does_not_regress_to_older_uncaptured_summary_sources(tmp_path, cached):
+    baseline = _controller_transaction("gridboss", 4, 500, 100, 19, 0, 0)
+    changed = _controller_transaction("gridboss", 4, 500, 100, 19, 256, 1)
+    uncaptured = {
+        **baseline, "transaction_id": "uncaptured-old-transaction",
+        "acquisition_id": "uncaptured-old-acquisition",
+    }
+    resumed = _controller_transaction("gridboss", 4, 500, 100, 19, 257, 2)
+    output = _analyze(tmp_path, [
+        baseline, changed, _controller_summary(uncaptured, cached=cached), resumed,
+    ])
+    events = [line for line in output.splitlines() if "controller_protection_change " in line]
+    assert len(events) == 2
+    assert '"input.519": {"current": 256, "previous": 0}' in events[0]
+    assert '"input.519": {"current": 257, "previous": 256}' in events[1]
+    assert "transaction=tx-2" in events[1]
+
+
+def test_cli_does_not_replay_old_controller_facts_after_long_capture(tmp_path):
+    """An hour of intervening transactions cannot make an old summary current."""
+    rows = [
+        _controller_transaction("gridboss", 4, 500, 100, 19, 0, sequence)
+        for sequence in range(2100)
+    ]
+    rows.append(_controller_transaction("gridboss", 4, 500, 100, 19, 256, 2100))
+    rows.append(_controller_summary(rows[0], cached=True))
+    output = _analyze(tmp_path, rows)
+    events = [line for line in output.splitlines() if "controller_protection_change " in line]
+    assert len(events) == 1
+    assert '"input.519": {"current": 256, "previous": 0}' in events[0]
+    assert "transaction=tx-2100" in events[0]
+
+
+def test_cli_keeps_historical_raw_controller_changes(tmp_path):
+    rows = []
+    for sequence, word in enumerate((257, 513)):
+        transaction = _controller_transaction("gridboss", 4, 500, 100, 19, word, sequence)
+        rows.append({
+            "schema": "eg4_local_dongle_trace.v1", "role": "gridboss", "ok": True,
+            "sample_started_at": transaction["started_at"],
+            "sample_completed_at": transaction["completed_at"],
+            "telemetry": {"raw": {
+                "input_registers_start_500": transaction["frames"][0]["values"],
+            }},
+        })
+    output = _analyze(tmp_path, rows)
+    events = [line for line in output.splitlines() if "controller_protection_change " in line]
+    assert len(events) == 1
+    assert '"input.519": {"current": 513, "previous": 257}' in events[0]
+    assert "session=unavailable acquisition=unavailable transaction=unavailable" in events[0]
+
+
+def test_cli_keeps_new_raw_controller_changes_across_host_clock_regression(tmp_path):
+    """A new transaction remains evidence when UTC moves backward within a session."""
+    first = _controller_transaction("gridboss", 4, 500, 100, 19, 257, 0)
+    changed = _controller_transaction("gridboss", 4, 500, 100, 19, 513, 1)
+    changed["started_at"] = "2026-11-09T11:59:58+00:00"
+    changed["completed_at"] = "2026-11-09T11:59:59+00:00"
+    output = _analyze(tmp_path, [first, changed, _controller_summary(changed)])
+    events = [line for line in output.splitlines() if "controller_protection_change " in line]
+    assert len(events) == 1
+    details = json.loads(events[0].split(" details=", 1)[1])
+    assert details["changed"]["input.519"] == {"previous": 257, "current": 513}
+    assert details["observation_brackets"]["input.519"]["ordering"] == "unresolved"
+    assert "transaction=tx-1" in events[0]
+    assert "start=2026-11-09T11:59:58+00:00" in events[0]

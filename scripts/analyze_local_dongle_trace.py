@@ -19,6 +19,7 @@ from typing import Any, BinaryIO, TypeGuard
 MAX_RECORD_BYTES = 4 * 1024 * 1024
 MAX_DIRECTORY_ENTRIES = 16384
 MAX_ROLES = 64
+MAX_CONTROLLER_SOURCES = 2048
 
 
 def _safe_path(path: Path, root: Path | None = None) -> Path:
@@ -274,19 +275,30 @@ def _controller_words(row: dict[str, Any]) -> dict[str, Any]:
             for register in inputs:
                 offset = register - int(start)
                 if 0 <= offset < len(values):
-                    result[f"input.{register}"] = values[offset]
+                    word = values[offset]
+                    if type(word) is int and 0 <= word <= 65535:
+                        result[f"input.{register}"] = word
     for block in (*(row.get("primary_blocks") or []), *(row.get("diagnostics") or [])):
         if not isinstance(block, dict) or block.get("ok") is not True:
             continue
+        if (block.get("partial") is True
+                or any(value != "passed" for value in _mapping(block.get("validation")).values())
+                or _mapping(block.get("quality")).get("structural") == "rejected"):
+            continue
         values, start = block.get("values"), block.get("register")
-        if not isinstance(values, list) or not isinstance(start, int):
+        if not isinstance(values, list) or type(start) is not int:
+            continue
+        count = block.get("count")
+        if count is not None and (type(count) is not int or count <= 0 or len(values) != count):
             continue
         function = block.get("function")
         for register in inputs if function == 4 else holdings if function == 3 else ():
             offset = register - start
             if 0 <= offset < len(values):
-                result[f"{'input' if function == 4 else 'holding'}.{register}"] = values[offset]
-    if not gridboss and isinstance(result.get("input.6"), int):
+                word = values[offset]
+                if type(word) is int and 0 <= word <= 65535:
+                    result[f"{'input' if function == 4 else 'holding'}.{register}"] = word
+    if not gridboss and type(result.get("input.6")) is int:
         result["input.6.bits_0_1"] = result["input.6"] & 3
     return result
 
@@ -328,6 +340,8 @@ class RoleSummary:
     source_last: datetime | None = None
     outputs: dict[str, tuple[bool, str, tuple[Any, Any], str | None]] = field(default_factory=dict)
     controller: dict[str, Any] = field(default_factory=dict)
+    controller_sources: dict[tuple[Any, ...], None] = field(default_factory=dict)
+    controller_provenance: dict[str, tuple[Any, Any, tuple[Any, Any]]] = field(default_factory=dict)
 
     def _outputs(self, row: dict[str, Any], telemetry: dict[str, Any]) -> None:
         """Inspect reported 240-V output, including raw words from failed decodes."""
@@ -421,9 +435,96 @@ class RoleSummary:
                     _event("interval_order_unresolved", row, bracket=_bracket(self.source_interval, interval))
         self.source_interval = interval
 
-    def _controller(self, row: dict[str, Any]) -> None:
-        """Report discrete raw/protection changes without assigning meanings."""
-        current = _controller_words(row)
+    def _controller_values(
+        self, row: dict[str, Any], current: dict[str, Any], *,
+        shape: tuple[Any, ...] = (), cached: bool = False,
+    ) -> None:
+        """Deduplicate source facts without discarding new raw evidence on clock jumps."""
+        transaction = row.get("transaction_id")
+        acquisition = row.get("acquisition_id")
+        transaction = transaction if isinstance(transaction, str) and transaction else None
+        acquisition = acquisition if isinstance(acquisition, str) and acquisition else None
+        source = (
+            ("transaction", transaction, *shape) if transaction else
+            ("acquisition", acquisition, *shape) if acquisition else None
+        )
+        if source is not None:
+            if source in self.controller_sources:
+                return
+            self.controller_sources[source] = None
+            if len(self.controller_sources) > MAX_CONTROLLER_SOURCES:
+                del self.controller_sources[next(iter(self.controller_sources))]
+        interval = _interval(row)
+        observed_at = _timestamp(interval[1]) or _timestamp(interval[0])
+        accepted = {}
+        brackets = {}
+        for key, value in current.items():
+            previous = self.controller_provenance.get(key)
+            if previous is not None:
+                prior_transaction, prior_acquisition, prior_interval = previous
+                if ((transaction and transaction == prior_transaction)
+                        or (not transaction and acquisition and acquisition == prior_acquisition)):
+                    continue
+                prior_time = _timestamp(prior_interval[1]) or _timestamp(prior_interval[0])
+                if observed_at is not None and prior_time is not None:
+                    if observed_at <= prior_time and row.get("kind") != "transaction":
+                        continue
+                elif cached:
+                    # Undated cached context cannot establish a newer observation.
+                    continue
+            if key in self.controller and self.controller[key] != value:
+                brackets[key] = _bracket(previous[2] if previous else None, interval)
+            accepted[key] = value
+            self.controller_provenance[key] = transaction, acquisition, interval
+        changed = {
+            key: {"previous": self.controller[key], "current": value}
+            for key, value in accepted.items()
+            if key in self.controller and self.controller[key] != value
+        }
+        if changed:
+            _event(
+                "controller_protection_change", row, changed=changed, authority="raw_words",
+                observation_brackets=brackets,
+            )
+        self.controller.update(accepted)
+
+    def _controller(self, row: dict[str, Any], *, availability: bool = True) -> None:
+        """Compare raw blocks at their own source times, not summary publication times."""
+        blocks = [
+            block for block in (*(row.get("primary_blocks") or []), *(row.get("diagnostics") or []))
+            if isinstance(block, dict)
+        ]
+        for block in blocks:
+            current = _controller_words({"role": row.get("role"), "primary_blocks": [block]})
+            if not current:
+                continue
+            event_row = {**row}
+            if any(block.get(name) is not None for name in (
+                "acquisition_id", "transaction_id", "started_at", "completed_at",
+            )):
+                event_row.update({
+                    name: block.get(name) for name in (
+                        "acquisition_id", "transaction_id", "started_at", "completed_at",
+                    )
+                })
+                # Missing block times remain missing, never summary/persistence times.
+                event_row.pop("sample_started_at", None)
+                event_row.pop("sample_completed_at", None)
+            if block.get("session_id") is not None:
+                if block["session_id"] != row.get("session_id"):
+                    continue
+                event_row["session_id"] = block["session_id"]
+            self._controller_values(
+                event_row, current,
+                shape=tuple(block.get(name) for name in ("function", "register", "count")),
+                cached=block.get("current_acquisition") is False,
+            )
+        if not blocks and row.get("ok") is True:
+            # Historical records have raw telemetry but no source block metadata.
+            self._controller_values(row, _controller_words(row))
+        if not availability:
+            return
+        current = {}
         if isinstance(row.get("ok"), bool):
             current["availability.primary"] = row["ok"]
         for block in row.get("diagnostics") or []:
@@ -436,14 +537,7 @@ class RoleSummary:
             )
             if key in self.controller or len(self.controller) + len(current) < 128:
                 current[key] = block["ok"]
-        changed = {
-            key: {"previous": self.controller[key], "current": value}
-            for key, value in current.items()
-            if key in self.controller and self.controller[key] != value
-        }
-        if changed:
-            _event("controller_protection_change", row, changed=changed, authority="raw_words")
-        self.controller.update(current)
+        self._controller_values(row, current, shape=("availability",))
 
     def _close_status(self) -> None:
         """Finish one compact status run at a discontinuity."""
@@ -482,6 +576,8 @@ class RoleSummary:
             self.session_segments += 1
             self.outputs.clear()
             self.controller.clear()
+            self.controller_sources.clear()
+            self.controller_provenance.clear()
             self.source_interval = None
             if self.previous_session is None:
                 _event("session_start", row)
@@ -541,18 +637,32 @@ class RoleSummary:
                     truncated=row.get("truncated", False), partial=partial, frames=frames,
                 )
             request = _mapping(row.get("request"))
-            if request.get("function") == 4:
+            if (request.get("function") in (3, 4)
+                    and type(request.get("register")) is int
+                    and type(request.get("count")) is int and request["count"] > 0):
                 source = {
                     name: row.get(name) for name in (
                         "acquisition_id", "transaction_id", "started_at", "completed_at",
                     )
                 }
                 blocks = [
-                    {**source, **request, "ok": True, "values": frame.get("values")}
+                    {
+                        **source, **request, "ok": True, "values": frame.get("values"),
+                        "validation": frame.get("validation"), "partial": frame.get("partial"),
+                    }
                     for frame in frames if frame.get("classification") == "matching"
+                    and frame.get("partial") is not True
+                    and not any(
+                        value != "passed" for value in _mapping(frame.get("validation")).values()
+                    )
+                    and isinstance(frame.get("values"), list)
+                    and len(frame["values"]) == request["count"]
                 ]
                 if blocks:
-                    self._outputs({**row, "primary_blocks": blocks}, {})
+                    raw = {**row, "primary_blocks": blocks}
+                    self._controller(raw, availability=False)
+                    if request["function"] == 4:
+                        self._outputs(raw, {})
             return
         if kind == "interpretation":
             if row.get("semantic") == "rejected":

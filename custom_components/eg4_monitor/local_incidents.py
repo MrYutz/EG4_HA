@@ -36,6 +36,7 @@ from .eg4_logger import (
     GENERATOR_ON_POWER,
     GENERATOR_ON_VOLTAGE,
 )
+from .local_dongle import raw_primary_measurements
 from .local_dongle_trace import LocalDongleTraceWriter
 
 _RECORDER_SCHEMA = "eg4_host_recorder.v1"
@@ -43,6 +44,12 @@ _INCIDENT_SCHEMA = "eg4_host_incident.v1"
 _SEGMENT = re.compile(r"local-dongle(?:-[0-9]+)?\.jsonl\Z")
 _INCIDENT_DIR = re.compile(r"incident-[A-Za-z0-9_-]+\Z")
 _MAX_SUMMARIES = 64
+_MAX_RECLAMATION_METADATA_BYTES = 1024**2
+_MONITORED_MEASUREMENTS = frozenset({
+    "grid_voltage_v", "grid_frequency_hz", "generator_voltage_v",
+    "generator_frequency_hz", "generator_power_w", "ups_voltage_v",
+    "eps_voltage_r_v", "eps_frequency_hz",
+})
 
 
 @dataclass(frozen=True)
@@ -629,33 +636,24 @@ class IncidentRecorder:
                     elif supplying is True or present is False:
                         self._edge(f"{role}:accepted_power_lost", False, "accepted_generator_power_lost", source, {"power_w": power, "reported_voltage_v": voltage})
 
-    def _raw_values(self, role: str, block: dict[str, Any], source: dict[str, Any]) -> None:
-        """Capture reported raw primary values even if semantic decoding rejected them."""
-        words = block.get("values")
-        if block.get("function") != 4 or not isinstance(words, (list, tuple)):
-            return
-        start = block.get("register", -1)
-        values: dict[str, Any] = {}
-        if role.startswith("gridboss") and start == 0 and len(words) >= 34:
-            for name, index in (("grid_voltage_v", 1), ("ups_voltage_v", 2), ("generator_voltage_v", 3)):
-                word = _number(words[index])
-                values[name] = word / 10 if word is not None and 0 <= word <= 5000 else None
-            powers = [
-                word for index in (30, 31)
-                if (word := _number(words[index])) is not None and 0 <= word <= 65535
-            ]
-            if len(powers) == 2:
-                values["generator_power_w"] = sum(word if word < 32768 else word - 65536 for word in powers)
-        elif role.startswith("gridboss") and start == 120 and len(words) >= 11:
-            for name, index in (("grid_frequency_hz", 9), ("generator_frequency_hz", 10)):
-                word = _number(words[index])
-                values[name] = word / 100 if word is not None and 0 <= word < 65535 else None
-        elif not role.startswith("gridboss") and start == 0 and len(words) >= 24:
-            for name, index, divisor in (("eps_voltage_r_v", 20, 10), ("eps_frequency_hz", 23, 100)):
-                word = _number(words[index])
-                values[name] = word / divisor if word is not None and 0 <= word < 65535 else None
+    def _raw_values(
+        self, role: str, block: dict[str, Any], source: dict[str, Any],
+    ) -> dict[str, float | None]:
+        """Project received lanes separately from decoded publication usability."""
+        words, start = block.get("values"), block.get("register")
+        if (
+            block.get("function") != 4 or not isinstance(words, (list, tuple))
+            or type(start) is not int
+        ):
+            return {}
+        values = {
+            name: value for name, value in raw_primary_measurements(
+                words, register=start, gridboss=role.startswith("gridboss"),
+            ).items() if name in _MONITORED_MEASUREMENTS
+        }
         if values:
             self._analog(role, values, {**source, "raw_values_semantically_validated": False})
+        return values
 
     def _detect(self, record: dict[str, Any]) -> None:
         """Evaluate only received attempts/settled verdicts, never a second reader."""
@@ -743,18 +741,26 @@ class IncidentRecorder:
                     if isinstance(word, int):
                         value = word & 3 if index == 6 else word
                         self._edge(f"{role}:protection:{index}", value != 0, "controller_protection_word_nonzero", record, {"register": index, "raw_word": word, "trigger_value": value, "physical_meaning": "unknown"})
+        raw_fields: set[str] = set()
         for block in (*record.get("primary_blocks", ()), *record.get("diagnostics", ())):
             shape = f"{block.get('function')}:{block.get('register')}:{block.get('count')}"
             self._availability(f"{role}:block:{shape}", block.get("ok"), record, primary=block in record.get("primary_blocks", ()))
             verdict = block.get("semantic")
             if verdict in ("accepted", "rejected"):
                 self._edge(f"semantic:{role}:{shape}", verdict == "rejected", "semantic_rejection", record, {"semantic": verdict, "transaction_id": block.get("transaction_id"), "error": block.get("semantic_error")})
-            if not observation:
-                self._raw_values(role, block, record)
+            raw_fields.update(self._raw_values(role, block, record))
         telemetry = record.get("telemetry") or {}
         values = telemetry.get("decoded" if role.startswith("gridboss") else "core")
         if isinstance(values, dict):
-            self._analog(role, values, record)
+            fallback = {}
+            for name, value in values.items():
+                if name in raw_fields:
+                    self._availability(
+                        f"{role}:decoded:{name}:measurement", _number(value) is not None, record,
+                    )
+                else:
+                    fallback[name] = value
+            self._analog(role, fallback, record)
 
     async def _spool(self) -> None:
         """Serialize all pre/live appends and barriers through the existing writer."""
@@ -1200,7 +1206,7 @@ class IncidentRecorder:
         relative = path.relative_to(self.root).as_posix()
         if relative in claims:
             owner.setdefault("pending_unlinks", {})[relative] = claims.pop(relative)
-            self._atomic_json_sync(self.root / "recorder.json", owner)
+            self._atomic_json_sync(self.root / "recorder.json", owner, reclamation=True)
 
     def _complete_owned_unlink_sync(self, path: Path) -> None:
         """Discard a removal intent after its directory entry is synchronized."""
@@ -1211,7 +1217,7 @@ class IncidentRecorder:
         relative = path.relative_to(self.root).as_posix()
         if relative in pending:
             del pending[relative]
-            self._atomic_json_sync(self.root / "recorder.json", owner)
+            self._atomic_json_sync(self.root / "recorder.json", owner, reclamation=True)
 
     def _recover_pending_unlinks_sync(self) -> None:
         """Finish exact owned-inode removals, never append to a deletion-intent file."""
@@ -1236,15 +1242,23 @@ class IncidentRecorder:
                 self._incident_segment_cache.pop((info.st_dev, info.st_ino), None)
                 self._sync_directory_sync(path.parent)
             del pending[relative]
-        self._atomic_json_sync(self.root / "recorder.json", owner)
+        self._atomic_json_sync(self.root / "recorder.json", owner, reclamation=True)
 
-    def _atomic_json_sync(self, path: Path, document: dict[str, Any], *, synchronize: bool = True) -> None:
-        """Atomically replace JSON and synchronize both its bytes and directory."""
+    def _atomic_json_sync(
+        self, path: Path, document: dict[str, Any], *, synchronize: bool = True,
+        reclamation: bool = False,
+    ) -> None:
+        """Atomically replace JSON; only bounded reclamation commits may use reserve."""
         self._assert_path_sync(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = (json.dumps(document, separators=(",", ":"), allow_nan=False) + "\n").encode()
-        if shutil.disk_usage(self.root).free - len(payload) < self.limits.min_free_bytes:
-            raise OSError("recorder free-space reserve prevents manifest write")
+        free = shutil.disk_usage(self.root).free
+        if free - len(payload) < self.limits.min_free_bytes:
+            # Deletion intent/loss must be durable before reclaiming evidence.
+            # Allow only these call sites a bounded temporary metadata copy,
+            # never an ordinary ownership/manifest update or a payload append.
+            if not reclamation or len(payload) > _MAX_RECLAMATION_METADATA_BYTES or free < len(payload):
+                raise OSError("recorder free-space reserve prevents manifest write")
         temporary = path.with_name(f".{path.name}-{uuid4().hex}.tmp")
         try:
             descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -1543,7 +1557,7 @@ class IncidentRecorder:
             self._refresh_retained_context_sync(manifest, manifest_path.parent)
             # Persist the loss declaration before unlink. A crash can conservatively
             # underclaim retention, but can never leave a complete manifest after loss.
-            self._atomic_json_sync(manifest_path, manifest)
+            self._atomic_json_sync(manifest_path, manifest, reclamation=True)
         self._forget_owned_file_sync(path)
         path.unlink()
         self._segment_cache.pop(path, None)
@@ -1672,7 +1686,7 @@ class IncidentRecorder:
                     "triggers": [], "trigger_count": manifest.get("trigger_count", 0),
                     "trigger_files": [], "files": [],
                 })
-                self._atomic_json_sync(path, retired)
+                self._atomic_json_sync(path, retired, reclamation=True)
             for kind in ("records", "triggers"):
                 for segment in self._segments_sync(directory / kind):
                     self._remove_sync(segment, "incidents", "retention_expired", retiring=True)
@@ -1695,7 +1709,7 @@ class IncidentRecorder:
                     del claims[relative]
                     changed = True
             if changed:
-                self._atomic_json_sync(self.root / "recorder.json", owner)
+                self._atomic_json_sync(self.root / "recorder.json", owner, reclamation=True)
             path.unlink()
             self._sync_directory_sync(directory)
             for candidate in (directory / "records", directory / "triggers", directory):

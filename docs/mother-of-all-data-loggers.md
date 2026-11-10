@@ -1,5 +1,8 @@
 # EG4 Mother of All Data Loggers
 
+This branch includes **unreleased recorder review fixes**. It does not change the
+installation documented in the [0.2.2 deployment receipt](host-recorder-deployment-2026-11-10.md).
+
 ## Implementation status
 
 The integration now has a stateful logger for the local telemetry path:
@@ -133,6 +136,12 @@ raw context. Its candidate firmware meaning is explicitly unverified. Structural
 valid raw primary blocks remain journal evidence even when semantic rejection
 prevents publication as valid telemetry. Higher input6 bits and analog142/143
 noise are not mandatory per-fluctuation triggers.
+
+Incident capture keeps raw-channel availability separate from decoded-publication
+usability. The decoder and capture share register projection, while publication
+guards remain unchanged. A raw overvoltage can remain evidence even when its
+decoded value is unavailable; a repeated identical masked image is not a recovery.
+Only the existing monitored aggregate/240-V channels participate, not unused legs.
 
 Both bytes of decision words are retained: input519 changing from`0x0504` to
 `0x0604` is captured even though the low state byte stays4. Warnings60/61,
@@ -345,6 +354,10 @@ examined throughout the input, not only during low generator power. A structural
 received UPS/EPS word can still be reported when a later block or semantic decode
 fails: it is labeled `structural_raw_register`, never promoted into valid telemetry.
 Cached blocks from another acquisition cannot manufacture a new voltage observation.
+Controller/protection and relevant holding-word changes are also reconstructed from
+matching raw transactions even when no later acquisition summary survives. Original
+source identities suppress summary/cached replay; per-word observation brackets keep
+overlap or a regressed host clock unresolved rather than discarding a new raw fact.
 Onset/recovery brackets retain original read intervals and unresolved overlapping
 ordering. No zero-fill, interpolation, engine/contact claim or continuous house-outage
 duration is inferred.
@@ -366,12 +379,19 @@ unrelated HA files remain outside this retention owner.
 
 Segments target25 MiB. Positive integer byte overrides affect host storage only
 and survive ordinary integration-options saves; they have no additional UI controls.
-Limits are ceilings, not preallocation or promised days. The recorder rejects writes
-that would cross its1 GiB free-space reserve; unrelated HA writes can still change
-free space. Ordinary raw expires before incident evidence under pressure. Forced
+Limits are ceilings, not preallocation or promised days. Ordinary payload appends and
+metadata updates must preserve a1 GiB free-space reserve; unrelated HA writers can
+still change free space. Ordinary raw expires before incident evidence under pressure. Forced
 incident eviction leaves incomplete/lost-coverage metadata rather than a plausible
 complete bundle. Existing diagnostic `RecorderHealth.Incidents` reports actual raw
 coverage/bytes, free space, estimated retention, active/latest paths and truncation.
+
+Only durable owned-deletion intents, loss declarations and retirement cleanup may
+use emergency metadata space below that reserve. Each atomic temporary payload is
+capped at1 MiB and must fit the actual available space; ordinary appends and new
+metadata creation get no exception. Ownership/path/inode checks, pre-unlink loss
+declarations and synchronization remain required. A truly full disk still degrades
+capture rather than authorizing unrelated deletion or inventing successful writes.
 
 Immediate source edges preserve the preceding ten minutes, bounded to16 MiB, plus
 ten quiet minutes after the latest trigger/recovery. Startup warmup and memory
