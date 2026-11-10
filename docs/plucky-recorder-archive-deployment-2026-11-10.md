@@ -80,3 +80,7 @@ Evidence root: `/home/greg/.local/state/eg4-host-recorder/plucky-archive-deliver
 It contains approvals, source/installed hash inventories, stopped-source/configuration backups, actual systemd journal/status, native before/after health, measured source gaps, red/green test outputs and analyzer reports. Raw evidence and credentials remain outside Git. Earlier retained investigations remain intact.
 
 Use the [operator guide](mother-of-all-data-loggers.md#plucky-off-host-archive) for status/configuration and stopping the timer without deleting evidence. The historical inverter/GridBOSS acceptance/signaling failure mode remains undetermined; this release improves retention, not power behavior.
+
+## Subsequent recorder deployment
+
+The [recorder0.2.4 deployment receipt](host-recorder-review-fixes-deployment-2026-11-10.md) records the later merged review fixes, measured metadata-path repair and verified native capture. Plucky's `current` release now selects source `8d1208d4a58534626bcb715a13f3322aee03b2d0`, including the updated analyzer; archive scripts, retention policy and configuration are unchanged. The installation/timing observations above remain historical evidence.

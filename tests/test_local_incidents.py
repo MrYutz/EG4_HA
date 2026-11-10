@@ -1289,3 +1289,127 @@ async def test_partial_gridboss_minus_one_watt_preserves_independent_loss_reason
     assert losses[0]["transaction_id"] == "received-power"
     assert losses[0]["completed_at"] == transaction["completed_at"]
     await engine.async_close()
+
+
+@pytest.mark.asyncio
+async def test_unchanged_retained_manifests_are_not_reread_per_raw_append(tmp_path, clock, monkeypatch):
+    """Real guarded writes must not reread the entire retained context corpus."""
+    engine = recorder(tmp_path, clock, pre_seconds=0, post_seconds=1)
+    engine.set_context_provider(lambda: {"settings": list(range(4000))})
+    await engine.async_start()
+    for _ in range(3):
+        engine.observe(flex(clock, output=282.9))
+        engine.observe(flex(clock))
+        clock.advance(1)
+        await engine.async_tick()
+    retained = list(engine.incidents_root.glob("*/manifest.json"))
+    assert len(retained) == 3
+    writer = LocalDongleTraceWriter(
+        engine.raw_root, max_files=None, write_guard=engine.write_guard("raw"),
+    )
+    reads = []
+    original = Path.open
+
+    def counted(path, mode="r", *args, **kwargs):
+        if path.name == "manifest.json" and "r" in mode:
+            reads.append(path)
+        return original(path, mode, *args, **kwargs)
+
+    try:
+        await writer.async_write(grid(clock))
+        monkeypatch.setattr(Path, "open", counted)
+        for _ in range(20):
+            assert await writer.async_write(grid(clock)) is not None
+        repeated_reads = len(reads)
+        assert writer.health["DroppedRecords"] == 0
+        assert writer.health["WriteErrors"] == 0
+    finally:
+        monkeypatch.setattr(Path, "open", original)
+        await writer.async_close()
+        await engine.async_close()
+    assert repeated_reads <= len(retained)
+
+
+@pytest.mark.asyncio
+async def test_manifest_cache_observes_in_place_state_and_age_changes(tmp_path, clock):
+    """Preserved mtime/size cannot hide an external open/closed retention change."""
+    engine = recorder(tmp_path, clock, pre_seconds=0, post_seconds=1, incident_max_age_seconds=10)
+    await engine.async_start()
+    engine.observe(flex(clock, output=282.9))
+    engine.observe(flex(clock))
+    clock.advance(1)
+    await engine.async_tick()
+    root = Path(engine.health["LatestIncidentPath"])
+    path = root / "manifest.json"
+    document = json.loads(path.read_text())
+    original_bytes = path.read_bytes()
+    original_info = path.stat()
+    retained = [root / item["path"] for item in document["files"] if item["retained"]]
+    writer = LocalDongleTraceWriter(
+        engine.raw_root, max_files=None, write_guard=engine.write_guard("raw"),
+    )
+    try:
+        assert await writer.async_write(grid(clock)) is not None
+        clock.advance(11)
+        for segment in retained:
+            old = clock().timestamp() - 11
+            os.utime(segment, (old, old))
+        # The two padding bytes preserve the closed document's exact size.
+        changed = original_bytes.replace(b'"state":"closed"', b'"state":"open"  ')
+        assert len(changed) == len(original_bytes) and changed != original_bytes
+        path.write_bytes(changed)
+        os.utime(path, ns=(original_info.st_atime_ns, original_info.st_mtime_ns))
+        assert await writer.async_write(grid(clock)) is not None
+        assert path.exists() and all(segment.exists() for segment in retained)
+        path.write_bytes(original_bytes)
+        os.utime(path, ns=(original_info.st_atime_ns, original_info.st_mtime_ns))
+        assert await writer.async_write(grid(clock)) is not None
+        assert not path.exists()
+        assert all(not segment.exists() for segment in retained)
+    finally:
+        await writer.async_close()
+        await engine.async_close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", ["identity", "symlink"])
+async def test_manifest_cache_rejects_external_identity_and_symlink_replacement(tmp_path, clock, replacement):
+    """A previously owned manifest cannot authorize pruning a replacement tree."""
+    engine = recorder(tmp_path, clock, pre_seconds=0, post_seconds=1, incident_max_age_seconds=10)
+    await engine.async_start()
+    engine.observe(flex(clock, output=282.9))
+    engine.observe(flex(clock))
+    clock.advance(1)
+    await engine.async_tick()
+    root = Path(engine.health["LatestIncidentPath"])
+    path = root / "manifest.json"
+    old_info = path.stat()
+    original_bytes = path.read_bytes()
+    retained = [root / item["path"] for item in manifest(engine)["files"] if item["retained"]]
+    writer = LocalDongleTraceWriter(
+        engine.raw_root, max_files=None, write_guard=engine.write_guard("raw"),
+    )
+    outside = tmp_path / "external-manifest.json"
+    unrelated = original_bytes.replace(b"synthetic-entry", b"unrelated-entry")
+    assert unrelated != original_bytes and len(unrelated) == len(original_bytes)
+    try:
+        assert await writer.async_write(grid(clock)) is not None
+        outside.write_bytes(unrelated)
+        os.utime(outside, ns=(old_info.st_atime_ns, old_info.st_mtime_ns))
+        if replacement == "identity":
+            outside.replace(path)
+        else:
+            path.unlink()
+            path.symlink_to(outside)
+        clock.advance(11)
+        for segment in retained:
+            old = clock().timestamp() - 11
+            os.utime(segment, (old, old))
+        assert await writer.async_write(grid(clock)) is not None
+        assert path.read_bytes() == unrelated
+        assert all(segment.exists() for segment in retained)
+        if replacement == "symlink":
+            assert path.is_symlink() and outside.read_bytes() == unrelated
+    finally:
+        await writer.async_close()
+        await engine.async_close()
