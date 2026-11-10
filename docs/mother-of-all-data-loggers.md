@@ -1,8 +1,8 @@
 # EG4 Mother of All Data Loggers
 
-The0.2.3 deployment was rolled back after a growing persistence backlog was observed
-on both old and new code. A storage-path correction is being verified for0.2.4.
-The [0.2.2 receipt](host-recorder-deployment-2026-11-10.md) remains historical evidence.
+The recorder review and measured persistence fixes are deployed as **0.2.4**,
+together with the updated standalone analyzer. See the [deployment receipt](host-recorder-review-fixes-deployment-2026-11-10.md)
+for the failed attempt, rollback, corrected native capture and remaining storage/transport limits.
 
 ## Implementation status
 
