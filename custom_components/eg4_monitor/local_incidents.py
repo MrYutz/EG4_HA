@@ -640,7 +640,7 @@ class IncidentRecorder:
                 values[name] = word / 10 if word is not None and 0 <= word <= 5000 else None
             powers = [
                 word for index in (30, 31)
-                if (word := _number(words[index])) is not None and 0 <= word < 65535
+                if (word := _number(words[index])) is not None and 0 <= word <= 65535
             ]
             if len(powers) == 2:
                 values["generator_power_w"] = sum(word if word < 32768 else word - 65536 for word in powers)

@@ -4,13 +4,14 @@ Custom Home Assistant integration for EG4 portal-backed systems, tuned for moder
 
 ## What Changed
 
-### Host recorder 0.2.0
+### Host recorder 0.2.1
 
 - Independent read-only schedules keep healthy FlexBOSS/GridBOSS roles recording when another request stalls.
 - Versioned raw transactions preserve rejected/partial bytes before decoding; cached data retains its original identity and age.
 - Generator AC presence, qualification and accepted power remain separate. Qualified 0 Hz is not evidence of engine cycling.
 - Input6 protection candidates and existing controller decisions are journaled with persistence-loss recovery, without invented physical meanings.
 - Bounded pre/post incidents, owned-only retention, explicit loss/coverage and final hashes make saved evidence exportable.
+- Partial/crash reconstruction includes signed−1 W power-loss reasons and raw-only UPS/EPS anomalies, deduplicated by original source identity.
 - Existing `RecorderHealth` diagnostics and the standalone streaming analyzer expose capture failures, source gaps, output anomalies and bundle completeness.
 
 Host-only release: no power firmware, equipment operating/protection settings, new

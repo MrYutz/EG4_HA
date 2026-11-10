@@ -326,7 +326,7 @@ class RoleSummary:
     source_interval: tuple[Any, Any] | None = None
     source_first: datetime | None = None
     source_last: datetime | None = None
-    outputs: dict[str, tuple[bool, str, tuple[Any, Any]]] = field(default_factory=dict)
+    outputs: dict[str, tuple[bool, str, tuple[Any, Any], str | None]] = field(default_factory=dict)
     controller: dict[str, Any] = field(default_factory=dict)
 
     def _outputs(self, row: dict[str, Any], telemetry: dict[str, Any]) -> None:
@@ -374,6 +374,10 @@ class RoleSummary:
             else:
                 return
         previous = self.outputs.get(channel)
+        source_id = event_row.get("acquisition_id")
+        source_id = source_id if isinstance(source_id, str) and source_id else None
+        if source_id is not None and previous is not None and previous[3] == source_id:
+            return
         live = bool(previous and previous[0]) or value >= 180
         state = "high" if value > 264 else "low" if value < 180 and live else "normal"
         prior_interval = previous[2] if previous else None
@@ -392,7 +396,7 @@ class RoleSummary:
                 value_source=value_source,
                 recovery_bracket=_bracket(prior_interval, interval),
             )
-        self.outputs[channel] = live, state, interval
+        self.outputs[channel] = live, state, interval, source_id
 
     def _source(self, row: dict[str, Any]) -> None:
         """Measure acquisition coverage and gaps without filling missing data."""
@@ -536,6 +540,19 @@ class RoleSummary:
                     received_bytes=row.get("received_bytes"),
                     truncated=row.get("truncated", False), partial=partial, frames=frames,
                 )
+            request = _mapping(row.get("request"))
+            if request.get("function") == 4:
+                source = {
+                    name: row.get(name) for name in (
+                        "acquisition_id", "transaction_id", "started_at", "completed_at",
+                    )
+                }
+                blocks = [
+                    {**source, **request, "ok": True, "values": frame.get("values")}
+                    for frame in frames if frame.get("classification") == "matching"
+                ]
+                if blocks:
+                    self._outputs({**row, "primary_blocks": blocks}, {})
             return
         if kind == "interpretation":
             if row.get("semantic") == "rejected":

@@ -921,3 +921,39 @@ def test_recorder_cli_reports_crash_tail_and_continues_later_sessions_read_only(
     assert old_path.read_bytes() == damaged
     assert active.read_bytes() == later
     assert journal_path.read_bytes() == journal_bytes
+
+
+def test_cli_recovers_raw_only_output_and_deduplicates_its_later_summary(tmp_path):
+    """A flushed input block survives a crash before its acquisition summary."""
+    for role, output_register in (("gridboss", 2), ("flexboss_master", 20)):
+        for include_summary in (False, True):
+            values = [0] * 40
+            values[output_register] = 2829
+            transaction = {
+                "schema": "eg4_local_dongle_trace.v2", "kind": "transaction",
+                "role": role, "session_id": "raw-only-crash",
+                "acquisition_id": "output-source", "transaction_id": "raw-power",
+                "ok": True, "started_at": "2026-11-09T12:00:00+00:00",
+                "completed_at": "2026-11-09T12:00:01+00:00",
+                "request": {"function": 4, "register": 0, "count": 40},
+                "frames": [{"classification": "matching", "values": values}],
+            }
+            records = [transaction]
+            if include_summary:
+                records.append({
+                    **transaction, "kind": "acquisition",
+                    "sample_completed_at": "2026-11-09T12:00:06+00:00",
+                    "telemetry": {"decoded": {"ups_voltage_v": 282.9},
+                                  "core": {"eps_voltage_r_v": 282.9}},
+                })
+            trace = tmp_path / f"{role}-{include_summary}.jsonl"
+            original = _write_rows(trace, records)
+            result = _invoke(trace)
+            assert result.returncode == 0, result.stderr
+            events = [line for line in result.stdout.splitlines()
+                      if "output_voltage_anomaly " in line]
+            assert len(events) == 1
+            assert '"voltage_v": 282.9' in events[0]
+            assert '"value_source": "structural_raw_register"' in events[0]
+            assert "raw-power" in events[0] and "12:00:01" in events[0]
+            assert trace.read_bytes() == original

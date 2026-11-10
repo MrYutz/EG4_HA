@@ -1103,3 +1103,36 @@ async def test_rotation_supports_nonreentrant_write_guards(tmp_path, clock):
     assert sorted(json.loads(line)["sequence"] for path in output for line in path.read_text().splitlines()) == [0, 1, 2, 3]
     assert writer.health["WriteErrors"] == 0
     await writer.async_close()
+
+
+@pytest.mark.asyncio
+async def test_partial_gridboss_minus_one_watt_preserves_independent_loss_reason(tmp_path, clock):
+    """Signed0xffff remains power evidence when a later frequency request fails."""
+    engine = recorder(tmp_path, clock)
+    await engine.async_start()
+    engine.observe(grid(clock))
+    clock.advance(1)
+    words = [0] * 40
+    words[1], words[2], words[3], words[30] = 2400, 2400, 2390, 65535
+    transaction = {
+        "schema": "eg4_local_dongle_trace.v2", "kind": "transaction",
+        "role": "gridboss", "session_id": "session-one", "ok": True,
+        "acquisition_id": "partial-power", "transaction_id": "received-power",
+        "started_at": clock().isoformat(), "completed_at": clock().isoformat(),
+        "request": {"function": 4, "register": 0, "count": 40},
+        "frames": [{"classification": "matching", "values": words}],
+    }
+    engine.observe(transaction)
+    engine.observe({
+        **transaction, "kind": "acquisition", "ok": False, "partial": True,
+        "error": "later frequency timeout", "telemetry": None,
+    })
+    await engine.async_tick()
+    losses = [event for event in rows(engine, "triggers")
+              if event["reason"] == "accepted_generator_power_lost"]
+    assert len(losses) == 1
+    assert losses[0]["details"]["power_w"] == -1
+    assert losses[0]["acquisition_id"] == "partial-power"
+    assert losses[0]["transaction_id"] == "received-power"
+    assert losses[0]["completed_at"] == transaction["completed_at"]
+    await engine.async_close()
