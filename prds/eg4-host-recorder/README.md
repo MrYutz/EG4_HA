@@ -3,7 +3,7 @@
 | Field | Value |
 | --- | --- |
 | Initiative ID | `eg4-host-recorder` |
-| Lifecycle | `implementing` |
+| Lifecycle | `complete` |
 | Source business need | [Conversation-captured problem](./2026-11-09-host-recorder-mvp.md#problem-statement) (`conversation-provisional`) |
 | PRD | [EG4 host recorder MVP](./2026-11-09-host-recorder-mvp.md) |
 | Issue board | [Implementation issue board](./issues/README.md) |
@@ -24,5 +24,9 @@
 | Business need captured | complete | [source](./2026-11-09-host-recorder-mvp.md#problem-statement) (`conversation-provisional`) |
 | PRD synthesis | complete | [PRD](./2026-11-09-host-recorder-mvp.md) |
 | Issue slicing | complete | [Issue board](./issues/README.md) |
-| Delivery | current (`implementing`) | [EG4REC-06](./issues/06-deploy-and-verify-recorder.md) |
-| Closure | pending | Delivery evidence after completion |
+| Delivery | complete | [Issue board](./issues/README.md) |
+| Closure | current (`complete`) | Delivery evidence after completion |
+
+## Delivery evidence
+
+[Exercised production deployment receipt](../../docs/host-recorder-deployment-2026-11-10.md). All six implementation issues are done; source/review/production/merge evidence is recorded on EG4REC-06 and in its private evidence index.
