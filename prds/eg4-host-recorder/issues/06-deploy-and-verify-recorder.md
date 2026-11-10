@@ -2,7 +2,7 @@
 id: EG4REC-06
 title: Push, deploy and verify the recorder on Home Assistant
 type: AFK
-status: ready
+status: in-progress
 phase: delivery
 source_github: null
 source_business_need: conversation-provisional
@@ -49,3 +49,13 @@ Deliver the integrated host-only release now, using the already authorized HA Co
 ## Blocked by
 
 - [05-preserve-and-analyze-incident-bundles.md](./05-preserve-and-analyze-incident-bundles.md)
+
+## Pull request stack
+
+Stack root: `main` at `9a1a916516daddfb0d8b1a78ea0ce4405351940e`; all five implementation slices are merged.
+
+| Key | Branch | Purpose | Predecessor / PR base | Acceptance advanced |
+| --- | --- | --- | --- | --- |
+| 6.1 | `codex/eg4-host-recorder-6.1-production-release` | Publish version0.2.0 and operator guidance, install the pushed coherent package, perform the authorized Core stop/start cycle, preserve the first fixed live window, prove installed-source synthetic export, then record reviewed deployment and rollback evidence | `main` at the stack root | All EG4REC-06 criteria and end-to-end R1–R6/A1–A8 |
+
+Push and open this green source entry before replacement. Keep its source identity fixed through the production proof; add the receipt/evidence to the same entry after observation. Final full-suite verification and two-axis review precede merge. Mark delivery done only after the implementation stack and recorded merge evidence are complete. No firmware or operating/protection settings change; only documented host-storage ceilings may be adjusted.

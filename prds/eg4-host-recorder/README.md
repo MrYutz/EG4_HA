@@ -24,5 +24,5 @@
 | Business need captured | complete | [source](./2026-11-09-host-recorder-mvp.md#problem-statement) (`conversation-provisional`) |
 | PRD synthesis | complete | [PRD](./2026-11-09-host-recorder-mvp.md) |
 | Issue slicing | complete | [Issue board](./issues/README.md) |
-| Delivery | current (`implementing`) | [EG4REC-05](./issues/05-preserve-and-analyze-incident-bundles.md) |
+| Delivery | current (`implementing`) | [EG4REC-06](./issues/06-deploy-and-verify-recorder.md) |
 | Closure | pending | Delivery evidence after completion |

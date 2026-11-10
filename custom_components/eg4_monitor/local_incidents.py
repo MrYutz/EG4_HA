@@ -211,6 +211,8 @@ class IncidentRecorder:
         self._incident_segment_cache: dict[tuple[int, int], tuple[int, int, dict[str, Any]]] = {}
         self._recognized_segments: dict[Path, tuple[int, int]] = {}
         self._protected_bundles: set[Path] = set()
+        self._inventory_cache: dict[str, list[Path]] | None = None
+        self._inventory_stamps: dict[Path, tuple[int, ...] | None] = {}
         self._metrics: dict[str, Any] = {
             "RawOldest": None, "RawNewest": None, "RawBytes": 0,
             "JournalBytes": 0, "IncidentBytes": 0, "FreeBytes": None,
@@ -640,7 +642,7 @@ class IncidentRecorder:
                 values[name] = word / 10 if word is not None and 0 <= word <= 5000 else None
             powers = [
                 word for index in (30, 31)
-                if (word := _number(words[index])) is not None and 0 <= word < 65535
+                if (word := _number(words[index])) is not None and 0 <= word <= 65535
             ]
             if len(powers) == 2:
                 values["generator_power_w"] = sum(word if word < 32768 else word - 65536 for word in powers)
@@ -998,8 +1000,11 @@ class IncidentRecorder:
                     self._assert_owner_sync()
                     self._assert_path_sync(path, stream)
                     self._recover_pending_unlinks_sync()
-                    if path.exists() and path not in self._segments_sync(path.parent):
-                        raise OSError("refusing to append to unrecognized recorder evidence")
+                    if path.exists():
+                        info = path.stat()
+                        if (self._recognized_segments.get(path) != (info.st_dev, info.st_ino)
+                                and path not in self._segments_sync(path.parent)):
+                            raise OSError("refusing to append to unrecognized recorder evidence")
                     # Leave transient room for the atomic ownership commit as
                     # well as the append; its bytes are not a stream payload.
                     marker_bytes = (self.root / "recorder.json").stat().st_size
@@ -1446,13 +1451,40 @@ class IncidentRecorder:
                 continue
         return result
 
+    @staticmethod
+    def _inventory_stamp_sync(path: Path) -> tuple[int, ...] | None:
+        """Watch membership/metadata changes without walking every evidence path."""
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return None
+        return (
+            info.st_dev, info.st_ino, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns,
+        )
+
     def _inventory_sync(self) -> dict[str, list[Path]]:
-        """Enumerate recognized evidence only, including growing incident segments."""
+        """Cache membership only; quota sizes and free space remain live."""
+        if self._inventory_cache is not None and all(
+            self._inventory_stamp_sync(path) == stamp
+            for path, stamp in self._inventory_stamps.items()
+        ):
+            return {name: list(paths) for name, paths in self._inventory_cache.items()}
+        watched = {
+            self.root / "recorder.json", self.raw_root,
+            self.journal_root, self.incidents_root,
+        }
         inventory = {"raw": self._segments_sync(self.raw_root), "journal": self._segments_sync(self.journal_root), "incidents": []}
         for manifest_path, _ in self._manifests_sync():
             inventory["incidents"].append(manifest_path)
+            watched.update((
+                manifest_path, manifest_path.parent,
+                manifest_path.parent / "records", manifest_path.parent / "triggers",
+            ))
             for kind in ("records", "triggers"):
                 inventory["incidents"].extend(self._segments_sync(manifest_path.parent / kind))
+        self._inventory_cache = {name: list(paths) for name, paths in inventory.items()}
+        self._inventory_stamps = {path: self._inventory_stamp_sync(path) for path in watched}
         return inventory
 
     def _stream_limit(self, stream: str) -> tuple[int, float]:
@@ -1999,6 +2031,9 @@ class IncidentRecorder:
     def _retention_metrics_sync(self, open_ids: tuple[str, ...] | None = None) -> dict[str, Any]:
         """Expire owned files and refresh a compact cache at health-tick frequency."""
         with self._fs_lock:
+            # Rescan at health cadence even if an external producer restored a
+            # manifest inside an already existing, previously unrecognized dir.
+            self._inventory_cache = None
             self._assert_owner_sync()
             if open_ids is not None:
                 for path, manifest in self._manifests_sync():

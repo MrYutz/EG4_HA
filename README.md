@@ -4,6 +4,24 @@ Custom Home Assistant integration for EG4 portal-backed systems, tuned for moder
 
 ## What Changed
 
+### Host recorder 0.2.2
+
+- Independent read-only schedules keep healthy FlexBOSS/GridBOSS roles recording when another request stalls.
+- Versioned raw transactions preserve rejected/partial bytes before decoding; cached data retains its original identity and age.
+- Generator AC presence, qualification and accepted power remain separate. Qualified 0 Hz is not evidence of engine cycling.
+- Input6 protection candidates and existing controller decisions are journaled with persistence-loss recovery, without invented physical meanings.
+- Bounded pre/post incidents, owned-only retention, explicit loss/coverage and final hashes make saved evidence exportable.
+- Partial/crash reconstruction includes signed−1 W power-loss reasons and raw-only UPS/EPS anomalies, deduplicated by original source identity.
+- Storage guards avoid repeated directory walks for every record; current byte ceilings, free-space reserve and inode/path safety remain enforced.
+- Existing `RecorderHealth` diagnostics and the standalone streaming analyzer expose capture failures, source gaps, output anomalies and bundle completeness.
+
+Production installation and measured limits: [2026-11-10 deployment receipt](docs/host-recorder-deployment-2026-11-10.md).
+
+Host-only release: no power firmware, equipment operating/protection settings, new
+device collector or dashboard. See the [operator and evidence guide](docs/mother-of-all-data-loggers.md).
+
+### Existing site-aware telemetry
+
 This project was expanded from simple single-device polling to a site-aware model:
 
 - Multi-device cloud polling with role detection (`flexboss_master`, `flexboss_slave`, `gridboss`)
@@ -35,7 +53,7 @@ This project was expanded from simple single-device polling to a site-aware mode
   - manual FlexBOSS host fields remain optional role-specific overrides
 - Direct GridBOSS transfer diagnosis
   - read-only GridBOSS input-register polling for grid/generator/UPS terminals
-  - same-sequence correlation with FlexBOSS local AC input/EPS telemetry
+  - source-interval correlation with FlexBOSS local AC input/EPS telemetry, not an atomic site snapshot
   - bounded JSONL transition trace retaining raw register evidence
 - Uncleared error monitoring
   - active problem binary sensor
@@ -102,9 +120,12 @@ FlexBOSS is found. Public portal IPs are never scanned. The two host fields
 remain optional manual overrides (`192.168.3.14` and `192.168.3.162` for this
 installation).
 
-Trace logging is enabled by default: one bounded JSONL record per core poll
-(default 1 second), with BMS refreshes every 5 seconds. The files are
-under `/config/.eg4-investigation/local-dongle/<entry_id>/` on HAOS.
+Capture is enabled by default. Each role targets 1s dynamic rounds, with 5s BMS
+refreshes and staggered fixed maintenance; `RecorderHealth` reports achieved cadence
+and original source ages rather than promising1Hz. New JSONL lives under
+`/config/.eg4-investigation/host-recorder-v2/<entry_id>/`, split into `raw/`,
+`controller-observations/` and copyable `incidents/` directories. Old
+`local-dongle/` investigations and deployment backups are never pruned by this owner.
 The stateful logger also exposes high-rate generator AC-evidence and battery
 charging-session entities, restores its active session across restarts, retains
 up to 90 days/100 completed sessions, and fires accepted transition events:
