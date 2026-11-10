@@ -422,6 +422,110 @@ recent events, and up to90 days/100 completed sessions. Long-term trends still
 depend on the target HA Recorder retention policy. Configure Recorder in the
 HA-owned configuration if90-day entity history is required.
 
+## Plucky off-host archive
+
+The Plucky-side puller copies existing recorder files; it does not poll devices,
+change sampling, mount storage into HA or itself require a Core restart. HA keeps
+an independent local outage buffer. During rollout, HA actually exhausted its
+1GiB free-space reserve and stopped persisting. Separately approved storage relief
+preserved current evidence first, reduced only recorder ceilings to256MiB raw,
+32MiB controller and128MiB incidents, and required one checked Core restart.
+The reserve and equipment settings are unchanged. Restart/failed-persistence gaps
+remain evidence loss, not reconstructed observations.
+
+| Plucky evidence | Retention |
+| --- | --- |
+| Raw and controller segments | Eight days after the last newly received bytes |
+| Open/incomplete incident copies | No automatic expiry |
+| Sealed incident snapshots | No automatic expiry |
+
+Age cleanup applies only to owned raw/controller segments, never unrelated files
+or incident snapshots. There is no byte-ceiling eviction of recent evidence.
+Below the default10GiB free-space guard, new copying fails visibly instead.
+Indefinite incident retention requires monitoring Plucky disk usage.
+
+The source is the canonical SSH-addon path
+`/homeassistant/.eg4-investigation/host-recorder-v2/<entry-id>/`.
+The destination is
+`/home/greg/.local/state/eg4-host-recorder/archive/<entry-id>/`, with native
+`raw/`, `controller-observations/`, `incidents/` and `recorder.json` plus the
+archiver's `archive.json` index and `status.json`. Directories are private.
+Raw bytes are opaque and unchanged; active files are received prefixes, not
+atomic site snapshots. Resumption trusts the recorder's append/rotate ownership
+and checks first-record identity and a bounded overlap, not arbitrary historical
+middle-file rewrites.
+
+`incidents/incident-*/archive-receipt.json` distinguishes moving from sealed copies.
+Sealing brackets received bytes with a stable final/interrupted source manifest,
+checks sizes and available final hashes, and records local hashes. Sealed copies
+are not overwritten by subsequent source pruning or changes. A sealed copy can
+still have `received_complete: false`: custody does not repair missing acquisition,
+startup warmup or interrupted coverage. Source-pruned open copies remain incomplete
+and report missing source evidence.
+
+The exact received producer manifest is retained as `source-manifest.json`.
+The analyzer-facing `manifest.json` also inventories captured files not yet
+checkpointed by HA and previously received files subsequently pruned there.
+It labels archive reconstruction and remains incomplete when source evidence
+cannot establish completeness. Sealed receipts hash both manifests separately.
+Durable inode-checked operation intents make publication, rotation and pruning
+recoverable across process termination; unrelated replacement files fail closed.
+
+### Plucky runtime and operation
+
+Install a committed release of the two archive scripts, the existing analyzer,
+`scripts/requirements-eg4-archive.txt` and the systemd templates into
+`~/.local/libexec/eg4-recorder-archive/releases/<commit>/`. Create its isolated
+`venv` and install that requirements file there; no HA dependency changes.
+Point `~/.local/libexec/eg4-recorder-archive/current` at that release.
+Install the service/timer templates from `scripts/systemd/` under
+`~/.config/systemd/user/`. The per-user manager must remain running after logout
+(`Linger=yes` on Plucky).
+
+Create mode0600 `~/.config/eg4-recorder-archive/environment` in a mode0700 directory:
+
+```sh
+EG4_ARCHIVE_SOURCE=/homeassistant/.eg4-investigation/host-recorder-v2/<entry-id>
+EG4_ARCHIVE_DESTINATION=/home/greg/.local/state/eg4-host-recorder/archive/<entry-id>
+EG4_ARCHIVE_ENTRY_ID=<entry-id>
+EG4_ARCHIVE_HOST=<ha-address>
+EG4_ARCHIVE_USER=<ssh-user>
+EG4_ARCHIVE_IDENTITY=/home/greg/.ssh/<existing-key>
+EG4_ARCHIVE_KNOWN_HOSTS=/home/greg/.ssh/known_hosts
+```
+
+Host keys must already be verified in that file; unknown or changed keys fail
+closed. Authentication is explicit-key-only, without agent/password fallback.
+The existing production root key has broader authority than this client's
+read-only SFTP operations; it is **not** an OS-enforced read-only account.
+
+```sh
+systemctl --user daemon-reload
+systemctl --user start eg4-recorder-archive.service
+systemctl --user enable --now eg4-recorder-archive.timer
+systemctl --user status eg4-recorder-archive.timer eg4-recorder-archive.service
+journalctl --user -u eg4-recorder-archive.service -n 20
+cat /home/greg/.local/state/eg4-host-recorder/archive/<entry-id>/status.json
+```
+
+The timer runs60s after the previous activation finishes, never concurrently.
+The service has a15min whole-run bound; failed/interrupted transfers resume from
+the actual retained prefix. `status.json` and the journal expose degraded runs and
+the last successful time. To stop replication without deleting evidence:
+`systemctl --user disable --now eg4-recorder-archive.timer`.
+
+The standalone `scripts/pull_eg4_archive.py --help` also exposes local backfill and
+SFTP options. Preserve older saved copies before pulling a newer moving source.
+Analyze an incident directory or selected segment with the unchanged
+`scripts/analyze_local_dongle_trace.py`; a whole multi-day archive produces a large
+detailed report. Keep reports/raw logs outside Git.
+
+Eight days fills prospectively; already-pruned history cannot be recovered.
+Plucky downtime can only catch up within HA's remaining local spool (about2.9h
+at the earlier measured rate and reduced256MiB ceiling, not a guarantee). Check both archive
+`last_success_at` and HA `RecorderHealth` loss/coverage; successful replication
+does not prove successful acquisition or explain the historical standby fault.
+
 ## Validation checklist
 
 1. After a successful `ha core check`, restart HA Core once to load changed Python.

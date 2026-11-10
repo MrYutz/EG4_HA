@@ -13,7 +13,7 @@
 | Role | Reference | Status |
 | --- | --- | --- |
 | Accepted host-only design and rollout | [Host recorder MVP specification](../../docs/host-recorder-mvp-spec.md) | governing |
-| Acceptance contract | [Focused acceptance tests A1–A8](../../docs/host-recorder-mvp-spec.md#focused-acceptance-tests) | governing |
+| Acceptance contract | [Focused acceptance tests A1–A8](../../docs/host-recorder-mvp-spec.md#focused-acceptance-tests) and [Plucky A9](../../docs/host-recorder-mvp-spec.md) | governing |
 | Read-only acquisition surfaces | [Verified read surfaces](../../investigations/2026-11-08-firmware-reverse-engineering/direct-session/history-and-read-surfaces.md) | governing for listed read shapes, not installed firmware identity |
 | Installed firmware identity / physical protection-bit semantics | See [PRD authority gaps](./2026-11-09-host-recorder-mvp.md#implementation-decisions) | missing; raw capture must preserve uncertainty |
 
@@ -29,4 +29,6 @@
 
 ## Delivery evidence
 
-[Exercised production deployment receipt](../../docs/host-recorder-deployment-2026-11-10.md). All six implementation issues are done; source/review/production/merge evidence is recorded on EG4REC-06 and in its private evidence index.
+[Original HA production deployment receipt](../../docs/host-recorder-deployment-2026-11-10.md). The original six implementation issues remain done; source/review/production/merge evidence is recorded on EG4REC-06 and in its private evidence index.
+
+[Plucky archive deployment and approved storage recovery](../../docs/plucky-recorder-archive-deployment-2026-11-10.md). EG4REC-07 is also done: PR10 merged at `58f2a07158f09703ecbbdd656dfd1aba87587375`, with the enabled timer, installed hashes, real transfers, recovery gaps and private evidence indexes recorded on the issue. All seven slices are complete; no delivery slice remains active.
