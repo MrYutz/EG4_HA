@@ -5,14 +5,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import voluptuous as vol
 import aiohttp
-
+import voluptuous as vol
 from homeassistant import config_entries
+from homeassistant.const import CONF_PASSWORD, CONF_SCAN_INTERVAL, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.const import CONF_PASSWORD, CONF_SCAN_INTERVAL, CONF_USERNAME
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .backup_metrics import (
@@ -51,7 +50,10 @@ from .const import (
     CONF_LOCAL_SLAVE_HOST,
     CONF_LOCAL_TRACE_BMS_INTERVAL,
     CONF_LOCAL_TRACE_ENABLED,
+    CONF_LOCAL_TRACE_INCIDENT_MAX_BYTES,
     CONF_LOCAL_TRACE_INTERVAL,
+    CONF_LOCAL_TRACE_JOURNAL_MAX_BYTES,
+    CONF_LOCAL_TRACE_RAW_MAX_BYTES,
     CONF_MASTER_SERIAL,
     CONF_SLAVE_SERIAL,
     DEFAULT_BATTERY_DETAIL_INTERVAL,
@@ -257,7 +259,17 @@ class SensorSelectFlow(config_entries.OptionsFlow):
     ) -> FlowResult:
         """Handle sensor selection."""
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            # Advanced host-retention ceilings have no additional UI controls.
+            data = {
+                key: self.config_entry.options[key]
+                for key in (
+                    CONF_LOCAL_TRACE_RAW_MAX_BYTES,
+                    CONF_LOCAL_TRACE_JOURNAL_MAX_BYTES,
+                    CONF_LOCAL_TRACE_INCIDENT_MAX_BYTES,
+                )
+                if key in self.config_entry.options
+            }
+            return self.async_create_entry(title="", data={**data, **user_input})
 
         options: dict[Any, Any] = {
             vol.Optional(

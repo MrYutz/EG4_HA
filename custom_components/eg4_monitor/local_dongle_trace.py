@@ -10,6 +10,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future
+from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -19,7 +20,6 @@ from uuid import uuid4
 
 from .const import LOCAL_DONGLE_TRACE_SCHEMA
 from .local_dongle import EG4GridBossTelemetry, EG4LocalTelemetry
-
 
 DEFAULT_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_MAX_FILES = 8
@@ -422,15 +422,17 @@ class LocalDongleTraceWriter:
         root: str | Path,
         *,
         max_bytes: int = DEFAULT_MAX_BYTES,
-        max_files: int = DEFAULT_MAX_FILES,
+        max_files: int | None = DEFAULT_MAX_FILES,
         session_id: str | None = None,
         max_queue_records: int = 1024,
         max_queue_bytes: int = 8 * 1024 * 1024,
+        write_guard: Callable[[Path, int], AbstractContextManager[None]] | None = None,
     ) -> None:
         self.root = Path(root)
         self.session_id = session_id if session_id is not None else str(uuid4())
-        self.max_bytes = max(64 * 1024, int(max_bytes))
-        self.max_files = max(2, int(max_files))
+        self.max_bytes = max(1, int(max_bytes))
+        self.max_files = None if max_files is None else max(2, int(max_files))
+        self._write_guard = write_guard
         self.max_queue_records = max(1, int(max_queue_records))
         self.max_queue_bytes = max(1, int(max_queue_bytes))
         self._queue: queue.SimpleQueue[_PendingWrite | _SyncRequest] = queue.SimpleQueue()
@@ -645,32 +647,52 @@ class LocalDongleTraceWriter:
         """Append and flush without copying the encoded evidence payload."""
         started = datetime.now(UTC).isoformat(timespec="milliseconds").encode("ascii")
         prefix = b'{"persistence_started_at":"' + started + b'",'
-        self.root.mkdir(parents=True, exist_ok=True)
         active = self.active_path
-        if (
-            active.exists()
-            and active.stat().st_size + len(prefix) + len(line) - 1 > self.max_bytes
-        ):
-            rotated = self.root / f"local-dongle-{time.time_ns()}.jsonl"
-            active.replace(rotated)
-            if active in self._dirty_paths:
-                self._dirty_paths.remove(active)
-                self._dirty_paths.add(rotated)
+        guard = self._write_guard(active, len(prefix) + len(line) - 1) if self._write_guard else nullcontext()
+        with guard:
+            self.root.mkdir(parents=True, exist_ok=True)
+            if (
+                active.exists() and active.stat().st_size > 0
+                and active.stat().st_size + len(prefix) + len(line) - 1 > self.max_bytes
+            ):
+                rotated = self.root / f"local-dongle-{time.time_ns()}.jsonl"
+                active.replace(rotated)
+                if active in self._dirty_paths:
+                    self._dirty_paths.remove(active)
+                    self._dirty_paths.add(rotated)
+            else:
+                self._append_line_sync(active, prefix, line)
+                return active
+        # Rotation changes the active inode. Re-enter the guard sequentially,
+        # not recursively: custom guards need not use a reentrant lock.
+        append_guard = self._write_guard(active, len(prefix) + len(line) - 1) if self._write_guard else nullcontext()
+        with append_guard:
+            self.root.mkdir(parents=True, exist_ok=True)
+            self._append_line_sync(active, prefix, line)
+        return active
+
+    def _append_line_sync(self, active: Path, prefix: bytes, line: bytes) -> None:
+        """Append one encoded record while its worker-side guard owns the file."""
         with active.open("ab") as stream:
             self._dirty_paths.add(active)
             stream.write(prefix)
             stream.write(memoryview(line)[1:])
             stream.flush()
         self._prune_sync()
-        return active
 
     def _sync_sync(self) -> None:
         """Synchronize retained changed files and their directory off-loop."""
         if not self._dirty_paths:
             return
         for path in self._dirty_paths:
-            with path.open("rb") as stream:
-                os.fsync(stream.fileno())
+            try:
+                with path.open("rb") as stream:
+                    os.fsync(stream.fileno())
+            except FileNotFoundError:
+                if self._write_guard is None:
+                    raise
+                # The external retention owner may expire a flushed segment
+                # before the next barrier; it owns that deliberate coverage loss.
         descriptor = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(descriptor)
@@ -680,6 +702,8 @@ class LocalDongleTraceWriter:
 
     def _prune_sync(self) -> None:
         """Prune only owned trace segments and forget deliberately removed files."""
+        if self.max_files is None:
+            return
         files = sorted(
             self.root.glob("local-dongle*.jsonl"),
             key=lambda path: path.stat().st_mtime,
@@ -701,6 +725,7 @@ class ControllerObservationJournal:
         self._tracker = ControllerObservationTracker()
         self._writer_loss_generation = 0
         self._health_callback: Callable[[], None] | None = None
+        self._observation_callback: Callable[[dict[str, Any]], None] | None = None
         self._last_transition: tuple[str, bool] | None = None
 
     def _refresh_writer_loss(self) -> dict[str, Any]:
@@ -718,6 +743,12 @@ class ControllerObservationJournal:
         if health["ContinuityBroken"]:
             health["State"] = "degraded"
         return health
+
+    def set_observation_callback(
+        self, callback: Callable[[dict[str, Any]], None] | None,
+    ) -> None:
+        """Deliver each discrete observation on its source loop before enqueue."""
+        self._observation_callback = callback
 
     def set_health_callback(self, callback: Callable[[], None] | None) -> None:
         """Notify only significant state/continuity transitions on this loop."""
@@ -739,6 +770,14 @@ class ControllerObservationJournal:
         self._refresh_writer_loss()
         observation = self._tracker.observe(record)
         if observation is not None:
+            if self._observation_callback is not None:
+                try:
+                    self._observation_callback(observation)
+                except Exception as err:
+                    asyncio.get_running_loop().call_exception_handler({
+                        "message": "EG4 observation callback failed",
+                        "exception": err,
+                    })
             token = self._tracker.mark_pending(observation)
 
             def completed(result: PersistenceResult) -> None:

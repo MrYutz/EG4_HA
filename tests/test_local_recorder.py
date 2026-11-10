@@ -18,6 +18,10 @@ from custom_components.eg4_monitor.local_dongle_trace import (
     ControllerObservationJournal,
     LocalDongleTraceWriter,
 )
+from custom_components.eg4_monitor.local_incidents import (
+    IncidentRecorder,
+    RecorderLimits,
+)
 from custom_components.eg4_monitor.local_recorder import EG4LocalRecorder
 from tests.test_local_dongle import _fixture_response
 
@@ -810,6 +814,15 @@ async def test_real_storage_failure_recovers_health_without_hiding_healthy_captu
     raw = LocalDongleTraceWriter(raw_root)
     journal_writer = LocalDongleTraceWriter(journal_root, session_id=raw.session_id)
     journal = ControllerObservationJournal(journal_writer)
+    # Isolate the raw/journal fault from the independent incident storage owner.
+    incidents = IncidentRecorder(
+        tmp_path / "incident-store",
+        entry_id="storage-recovery",
+        session_id=raw.session_id,
+        build_id="temporary-storage-recovery",
+        roles={"flexboss_master"},
+        limits=RecorderLimits(min_free_bytes=0),
+    )
     notifications = []
 
     async def respond(shape):
@@ -823,7 +836,8 @@ async def test_real_storage_failure_recovers_health_without_hiding_healthy_captu
 
         recorder = consumer.recorder = EG4LocalRecorder(
             devices={"flexboss_master": device}, configured_inverter_roles={"flexboss_master"},
-            writer=raw, journal=journal, on_update=consumer, on_health_update=health_update,
+            writer=raw, journal=journal, incidents=incidents,
+            on_update=consumer, on_health_update=health_update,
             interval=0.005, build_id="temporary-storage-recovery",
         )
         captured = []

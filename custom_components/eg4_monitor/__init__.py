@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from math import isfinite
@@ -17,9 +18,10 @@ from homeassistant.const import (
     CONF_PASSWORD,
     CONF_SCAN_INTERVAL,
     CONF_USERNAME,
+    EVENT_HOMEASSISTANT_STOP,
     Platform,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Event, HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -35,7 +37,10 @@ from .const import (
     CONF_LOCAL_SLAVE_HOST,
     CONF_LOCAL_TRACE_BMS_INTERVAL,
     CONF_LOCAL_TRACE_ENABLED,
+    CONF_LOCAL_TRACE_INCIDENT_MAX_BYTES,
     CONF_LOCAL_TRACE_INTERVAL,
+    CONF_LOCAL_TRACE_JOURNAL_MAX_BYTES,
+    CONF_LOCAL_TRACE_RAW_MAX_BYTES,
     CONF_MASTER_SERIAL,
     CONF_SLAVE_SERIAL,
     DEFAULT_BATTERY_DETAIL_INTERVAL,
@@ -80,6 +85,7 @@ from .local_dongle import (
     async_discover_dongles,
 )
 from .local_dongle_trace import ControllerObservationJournal, LocalDongleTraceWriter
+from .local_incidents import IncidentRecorder, RecorderLimits
 from .local_recorder import EG4LocalRecorder
 
 _LOGGER = logging.getLogger(__name__)
@@ -96,6 +102,15 @@ def _local_recorder_build_id() -> str:
         digest.update(source.name.encode())
         digest.update(source.read_bytes())
     return digest.hexdigest()
+
+
+def _recorder_byte_limit(value: Any, default: int) -> int:
+    """Keep malformed host-only ceilings from disabling device acquisition."""
+    try:
+        parsed = int(value)
+    except (OverflowError, TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 async def _async_update_listener(
@@ -1661,27 +1676,54 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if gridboss_dongle is not None:
         recorder_devices["gridboss"] = gridboss_dongle
     recorder_build_id = await hass.async_add_executor_job(_local_recorder_build_id)
+    recorder_session_id = str(uuid4())
+    default_limits = RecorderLimits()
+    recorder_limits = replace(
+        default_limits,
+        raw_max_bytes=_recorder_byte_limit(
+            entry.options.get(CONF_LOCAL_TRACE_RAW_MAX_BYTES), default_limits.raw_max_bytes,
+        ),
+        journal_max_bytes=_recorder_byte_limit(
+            entry.options.get(CONF_LOCAL_TRACE_JOURNAL_MAX_BYTES), default_limits.journal_max_bytes,
+        ),
+        incident_max_bytes=_recorder_byte_limit(
+            entry.options.get(CONF_LOCAL_TRACE_INCIDENT_MAX_BYTES), default_limits.incident_max_bytes,
+        ),
+    )
+    incident_recorder = (
+        IncidentRecorder(
+            hass.config.path(".eg4-investigation", "host-recorder-v2", entry.entry_id),
+            entry_id=entry.entry_id,
+            session_id=recorder_session_id,
+            build_id=recorder_build_id,
+            roles=configured_local_roles | recorder_devices.keys(),
+            limits=recorder_limits,
+        )
+        if local_trace_enabled and recorder_devices else None
+    )
     local_trace_writer = (
         LocalDongleTraceWriter(
-            hass.config.path(".eg4-investigation", "local-dongle", entry.entry_id)
+            incident_recorder.raw_root,
+            session_id=recorder_session_id,
+            max_bytes=recorder_limits.segment_bytes,
+            max_files=None,
+            write_guard=incident_recorder.write_guard("raw"),
         )
-        if local_trace_enabled and (local_dongles or gridboss_dongle is not None)
-        else None
+        if incident_recorder is not None else None
     )
     controller_trace_writer = (
         LocalDongleTraceWriter(
-            local_trace_writer.root / "controller-observations",
-            session_id=local_trace_writer.session_id,
+            incident_recorder.journal_root,
+            session_id=recorder_session_id,
+            max_bytes=recorder_limits.segment_bytes,
+            max_files=None,
+            write_guard=incident_recorder.write_guard("journal"),
         )
-        if local_trace_writer is not None
-        else None
+        if incident_recorder is not None else None
     )
     controller_journal = (
         ControllerObservationJournal(controller_trace_writer)
         if controller_trace_writer is not None else None
-    )
-    recorder_session_id = (
-        local_trace_writer.session_id if local_trace_writer is not None else str(uuid4())
     )
     local_recorder = EG4LocalRecorder(
         devices=recorder_devices,
@@ -1689,12 +1731,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         writer=local_trace_writer,
         on_update=_local_recorder_update,
         journal=controller_journal,
+        incidents=incident_recorder,
         on_health_update=_local_recorder_health_update,
         interval=local_trace_interval,
         bms_interval=local_trace_bms_interval,
         build_id=recorder_build_id,
         session_id=recorder_session_id,
     )
+
+    async def _async_close_local_capture() -> None:
+        """Join capture and synchronize owned writers before saving final state."""
+        await local_recorder.async_close()
+        for writer in (local_trace_writer, controller_trace_writer):
+            if writer is not None:
+                await writer.async_close()
+        await logger_store.async_save(telemetry_logger.to_dict())
+
+    async def _async_stop_local_capture(_event: Event) -> None:
+        """Core shutdown does not unload config entries."""
+        await _async_close_local_capture()
 
 
     async def async_update_data() -> dict[str, Any]:
@@ -1979,8 +2034,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         update_method=async_update_data,
         update_interval=timedelta(seconds=scan_interval),
     )
+    stop_unsubscribe: Callable[[], None] | None = None
     try:
         await local_recorder.async_start()
+        stop_unsubscribe = hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STOP, _async_stop_local_capture,
+        )
         _publish_logger_sample(local_recorder.snapshot().sample)
         if recorder_devices:
             # An initialized local owner must survive the portal's first error,
@@ -1998,6 +2057,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "inverters": inverters_by_serial,
             "roles": role_map,
             "local_recorder": local_recorder,
+            "async_close_capture": _async_close_local_capture,
+            "incident_recorder": incident_recorder,
             "local_trace_writer": local_trace_writer,
             "controller_trace_writer": controller_trace_writer,
             "controller_observation_path": (
@@ -2015,12 +2076,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         }
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
         entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+        entry.async_on_unload(stop_unsubscribe)
     except BaseException:
-        await local_recorder.async_close()
-        for writer in (local_trace_writer, controller_trace_writer):
-            if writer is not None:
-                await writer.async_close()
-        await logger_store.async_save(telemetry_logger.to_dict())
+        if stop_unsubscribe is not None:
+            stop_unsubscribe()
+        await _async_close_local_capture()
         await logger_coordinator.async_shutdown()
         await coordinator.async_shutdown()
         hass.data[DOMAIN].pop(entry.entry_id, None)
@@ -2035,18 +2095,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if not unload_ok:
         return False
-    local_recorder = entry_data.get("local_recorder")
-    if local_recorder is not None:
-        await local_recorder.async_close()
-    for writer_key in ("local_trace_writer", "controller_trace_writer"):
-        trace_writer = entry_data.get(writer_key)
-        if trace_writer is not None:
-            await trace_writer.async_close()
-
-    telemetry_logger = entry_data.get("telemetry_logger")
-    logger_store = entry_data.get("logger_store")
-    if telemetry_logger is not None and logger_store is not None:
-        await logger_store.async_save(telemetry_logger.to_dict())
+    close_capture = entry_data.get("async_close_capture")
+    if close_capture is not None:
+        await close_capture()
 
     logger_coordinator = entry_data.get("logger_coordinator")
     if logger_coordinator is not None:

@@ -42,6 +42,7 @@ from .local_dongle_trace import (
     gridboss_to_record,
     telemetry_to_record,
 )
+from .local_incidents import IncidentRecorder
 
 Shape = tuple[int, int, int]
 _LOGGER = logging.getLogger(__name__)
@@ -121,6 +122,7 @@ class EG4LocalRecorder:
         writer: LocalDongleTraceWriter | None,
         on_update: Callable[[dict[str, Any] | None], Awaitable[None]],
         journal: ControllerObservationJournal | None = None,
+        incidents: IncidentRecorder | None = None,
         on_health_update: Callable[[], Awaitable[None]] | None = None,
         interval: float = 1.0,
         bms_interval: float = 5.0,
@@ -134,6 +136,7 @@ class EG4LocalRecorder:
         self.max_age = max(15.0, self.interval * 5.0)
         self.writer = writer
         self.journal = journal
+        self.incidents = incidents
         self.session_id = session_id or (writer.session_id if writer else str(uuid4()))
         self.build_id = build_id
         self._on_update = on_update
@@ -171,13 +174,33 @@ class EG4LocalRecorder:
             device.session_id = self.session_id
             device.evidence_sink = self._observe
 
+    def _incident_context(self) -> dict[str, Any]:
+        """Preserve settings ages and source identities at the trigger boundary."""
+        now = datetime.now(UTC)
+        snapshot = self.snapshot(now)
+        return {
+            "configuration_observed_at": now.isoformat(),
+            "roles": snapshot.settings,
+            "role_freshness": {
+                "inverters": snapshot.local_freshness,
+                "gridboss": snapshot.gridboss_freshness,
+            },
+        }
+
     async def async_start(self) -> None:
         """Start exactly one task per role without waiting for device responses."""
         if self._started or self._closed:
             return
         self._started = True
+        if self.incidents is not None:
+            self.incidents.set_context_provider(self._incident_context)
+            self.incidents.set_health_callback(self._signal_health)
+            await self.incidents.async_start()
         if self.journal is not None:
             self.journal.set_health_callback(self._signal_health)
+            self.journal.set_observation_callback(
+                self.incidents.observe if self.incidents is not None else None
+            )
         self._health_task = asyncio.create_task(self._run_health(), name="eg4-recorder-health")
         for role in self._roles:
             self._tasks[role] = asyncio.create_task(self._run(role), name=f"eg4-recorder-{role}")
@@ -197,6 +220,8 @@ class EG4LocalRecorder:
         self._closed = True
         if self.journal is not None:
             self.journal.set_health_callback(None)
+        if self.incidents is not None:
+            self.incidents.set_health_callback(None)
         tasks = [*self._tasks.values()]
         if self._health_task is not None:
             tasks.append(self._health_task)
@@ -206,6 +231,8 @@ class EG4LocalRecorder:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
         self._health_task = None
+        if self.journal is not None:
+            self.journal.set_observation_callback(None)
         for state in self._roles.values():
             state.primary_available = False
             state.device.evidence_sink = None
@@ -216,6 +243,13 @@ class EG4LocalRecorder:
             if self.writer is not None:
                 await self.writer.async_sync()
             await self._publish_health("shutdown", notify=False)
+        if self.incidents is not None:
+            # Final health must pass the live storage guard before its owner closes.
+            if self.writer is not None:
+                await self.writer.async_sync()
+            await self.incidents.async_close()
+            self.incidents.set_context_provider(None)
+            self._health_cache = None
         self._on_health_update = None
 
     def _warn(self, category: str, error: str) -> None:
@@ -254,7 +288,16 @@ class EG4LocalRecorder:
                    if not block["ok"] or shape in state.semantic_rejections or block.get("error")))
             for role, state in self._roles.items()
         )
-        return (raw["State"], journal["State"], journal.get("ContinuityBroken"), roles)
+        storage = self.incidents.health if self.incidents is not None else {}
+        incident_signature = tuple(
+            storage.get(key) for key in (
+                "State", "ActiveIncidentId", "LatestIncidentId", "Incomplete", "Truncated",
+            )
+        )
+        return (
+            raw["State"], journal["State"], journal.get("ContinuityBroken"),
+            incident_signature, roles,
+        )
 
     def _signal_health(self) -> None:
         """Wake the single publisher only for current state/continuity edges."""
@@ -278,6 +321,8 @@ class EG4LocalRecorder:
 
     async def _write(self, record: dict[str, Any]) -> None:
         """Enqueue evidence without waiting for disk or reporting queue success."""
+        if self.incidents is not None:
+            self.incidents.observe(record)
         if self.writer is None:
             return
         try:
@@ -294,6 +339,11 @@ class EG4LocalRecorder:
 
     async def _publish_health(self, reason: str, *, notify: bool = True) -> None:
         """Persist compact diagnostics without copying raw frames or settings."""
+        if self.incidents is not None:
+            await self.incidents.async_tick()
+            storage = self.incidents.health
+            if storage["State"] == "degraded":
+                self._warn("incident storage", storage.get("LastError") or "capture degraded")
         now = datetime.now(UTC)
         self._health_cache = None
         health = self._health(now)
@@ -664,13 +714,17 @@ class EG4LocalRecorder:
                 "Maintenance": maintenance,
             }
         raw, journal = self._persistence()
+        incidents = (
+            {**self.incidents.health, "Enabled": True} if self.incidents is not None
+            else {"State": "degraded", "Enabled": False, "LastError": "incident preservation disabled"}
+        )
         for persistence in (raw, journal):
             completed = persistence["LastSuccessfulPersistence"]
             persistence["LastSuccessfulPersistenceAgeSeconds"] = (
                 max(0.0, (now - datetime.fromisoformat(completed)).total_seconds())
                 if completed else None
             )
-        persistence_states = (raw["State"], journal["State"])
+        persistence_states = (raw["State"], journal["State"], incidents["State"])
         overall = "degraded" if self._closed or "degraded" in persistence_states else (
             "starting" if not self._started or "starting" in persistence_states else
             "healthy" if roles and all(role["State"] == "healthy" for role in roles.values())
@@ -680,6 +734,7 @@ class EG4LocalRecorder:
             "SessionId": self.session_id, "BuildId": self.build_id, "State": overall,
             "ObservedAt": now.isoformat(), "Roles": roles, "WriterError": self._writer_error,
             "RawPersistence": raw, "JournalPersistence": journal,
+            "Incidents": incidents,
         }
         self._health_at = clock
         return deepcopy(self._health_cache)
