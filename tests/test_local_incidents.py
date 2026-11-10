@@ -59,6 +59,18 @@ def recorder(tmp_path, clock, **changes):
     )
 
 
+def simulate_free_space(monkeypatch, root, free_bytes):
+    """Model external usage while real recorder replacements/unlinks change free bytes."""
+    capacity = sum(path.stat().st_size for path in root.rglob("*") if path.is_file()) + free_bytes
+
+    def usage(path):
+        used = sum(item.stat().st_size for item in root.rglob("*") if item.is_file())
+        return SimpleNamespace(total=capacity, used=used, free=max(0, capacity - used))
+
+    monkeypatch.setattr("custom_components.eg4_monitor.local_incidents.shutil.disk_usage", usage)
+    return usage
+
+
 def grid(clock, *, power=5000, frequency=60, output=240, **extra):
     """Represent an actual producer acquisition shape, including 120-V leg context."""
     return {
@@ -416,6 +428,147 @@ async def test_free_reserve_prunes_raw_before_incident_and_rejects_unsafe_writes
     monkeypatch.undo()
     await raw.async_close()
     await journal_writer.async_close()
+    await engine.async_close()
+
+
+@pytest.mark.asyncio
+async def test_below_reserve_append_reclaims_sole_owned_active_raw(tmp_path, clock, monkeypatch):
+    """External usage cannot deadlock durable ownership intent ahead of raw reclaim."""
+    engine = recorder(tmp_path, clock)
+    engine.limits = replace(engine.limits, min_free_bytes=1024**2)
+    await engine.async_start()
+    writer = LocalDongleTraceWriter(engine.raw_root, max_files=None, write_guard=engine.write_guard("raw"))
+    assert await writer.async_write(grid(clock, sequence=0, payload="x" * 131072)) is not None
+    active = engine.raw_root / "local-dongle.jsonl"
+    assert list(engine.raw_root.glob("*.jsonl")) == [active]
+    usage = simulate_free_space(monkeypatch, engine.root, engine.limits.min_free_bytes - 4096)
+
+    assert await writer.async_write(grid(clock, sequence=1)) == active
+    assert await writer.async_sync() is True
+    saved = [json.loads(line) for line in active.read_text().splitlines()]
+    assert [row["sequence"] for row in saved] == [1]
+    assert usage(engine.root).free >= engine.limits.min_free_bytes
+    assert writer.health["WriteErrors"] == 0
+    marker = json.loads((engine.root / "recorder.json").read_text())
+    assert marker.get("pending_unlinks", {}) == {}
+    claim = marker["owned_files"]["raw/local-dongle.jsonl"]
+    assert (claim["device"], claim["inode"]) == (active.stat().st_dev, active.stat().st_ino)
+    monkeypatch.undo()
+    await writer.async_close()
+    await engine.async_close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence", ["owned_no_space", "unowned", "absent"])
+async def test_reclamation_cannot_bypass_actual_space_ownership_or_payload_reserve(tmp_path, clock, monkeypatch, evidence):
+    """No metadata room, a replaced inode or no reclaimable file still rejects append."""
+    engine = recorder(tmp_path, clock)
+    engine.limits = replace(engine.limits, min_free_bytes=1024**2)
+    await engine.async_start()
+    writer = LocalDongleTraceWriter(engine.raw_root, max_files=None, write_guard=engine.write_guard("raw"))
+    active = engine.raw_root / "local-dongle.jsonl"
+    if evidence != "absent":
+        assert await writer.async_write(grid(clock, sequence=0, payload="x" * 131072)) is not None
+        if evidence == "unowned":
+            replacement = engine.raw_root / "unrelated-evidence"
+            replacement.write_bytes(b"sealed unrelated evidence\n" * 8192)
+            replacement.replace(active)
+    before = active.read_bytes() if active.exists() else None
+    marker = (engine.root / "recorder.json").read_bytes()
+    free = 1 if evidence == "owned_no_space" else engine.limits.min_free_bytes - 4096
+    simulate_free_space(monkeypatch, engine.root, free)
+
+    assert await writer.async_write(grid(clock, sequence=1)) is None
+    assert (active.read_bytes() if active.exists() else None) == before
+    assert (engine.root / "recorder.json").read_bytes() == marker
+    assert writer.health["State"] == "degraded"
+    monkeypatch.undo()
+    await writer.async_close()
+    await engine.async_close()
+
+
+@pytest.mark.asyncio
+async def test_below_reserve_incident_eviction_preserves_durable_loss_truth(tmp_path, clock, monkeypatch):
+    """Reclaiming incident history keeps its coverage tombstone across later checkpoints."""
+    engine = recorder(tmp_path, clock, segment_bytes=4096)
+    engine.limits = replace(engine.limits, min_free_bytes=1024**2)
+    await engine.async_start()
+    engine.observe(flex(clock, payload="sole-primary" * 12000))
+    clock.advance(1)
+    engine.observe(grid(clock, output=282.9))
+    await engine.async_tick()
+    root = Path(engine.health["LatestIncidentPath"])
+    old = next(
+        root / item["path"] for item in manifest(engine)["files"]
+        if item["kind"] == "records" and item["retained"]
+        and any(row.get("role") == "flexboss_master" for row in (
+            json.loads(line) for line in (root / item["path"]).read_text().splitlines()
+        ))
+    )
+    assert old.name != "local-dongle.jsonl"
+    os.utime(old, (clock().timestamp() - 1, clock().timestamp() - 1))
+    lost_bytes = old.stat().st_size
+    unrelated = root / "sealed-evidence"
+    unrelated.write_text("not recorder evidence")
+    usage = simulate_free_space(monkeypatch, engine.root, engine.limits.min_free_bytes - 4096)
+    writer = LocalDongleTraceWriter(engine.raw_root, max_files=None, write_guard=engine.write_guard("raw"))
+
+    assert await writer.async_write(grid(clock, sequence=1)) is not None
+    document = manifest(engine)
+    loss = next(item for item in document["files"] if item["path"] == old.relative_to(root).as_posix())
+    assert not old.exists()
+    assert loss["retained"] is False and loss["lost_reason"] == "free_space_reserve"
+    assert loss["coverage"] == {
+        "start": "2026-11-09T12:00:00+00:00", "end": "2026-11-09T12:00:00+00:00",
+    }
+    assert document["complete"] is False and document["truncated"] is True
+    assert document["retention_losses"]["free_space_reserve"]["bytes"] >= lost_bytes
+    assert document["observed_roles"] == ["gridboss"]
+    assert "flexboss_master" in document["missing_roles"]
+    assert usage(engine.root).free >= engine.limits.min_free_bytes
+    await engine.async_tick()
+    rewritten = manifest(engine)
+    assert "retention_eviction" in rewritten["incomplete_reasons"]
+    assert any(not item["retained"] and item["path"] == loss["path"] for item in rewritten["files"])
+    assert unrelated.read_text() == "not recorder evidence"
+    monkeypatch.undo()
+    await writer.async_close()
+    await engine.async_close()
+
+
+@pytest.mark.asyncio
+async def test_emergency_reclamation_metadata_is_bounded(tmp_path, clock, monkeypatch):
+    """Ample actual bytes do not authorize an unbounded below-reserve manifest copy."""
+    engine = recorder(tmp_path, clock, segment_bytes=4096)
+    engine.limits = replace(engine.limits, min_free_bytes=8 * 1024**2)
+    engine.set_context_provider(lambda: {"roles": {"gridboss": {"settings": "x" * (2 * 1024**2)}}})
+    await engine.async_start()
+    engine.observe(flex(clock, output=282.9))
+    await engine.async_tick()
+    root = Path(engine.health["LatestIncidentPath"])
+    before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    marker = (engine.root / "recorder.json").read_bytes()
+    simulate_free_space(monkeypatch, engine.root, engine.limits.min_free_bytes - 4096)
+    writer = LocalDongleTraceWriter(engine.raw_root, max_files=None, write_guard=engine.write_guard("raw"))
+
+    assert await writer.async_write(grid(clock)) is None
+    assert all(path.read_bytes() == payload for path, payload in before.items())
+    assert (engine.root / "recorder.json").read_bytes() == marker
+    assert not (engine.raw_root / "local-dongle.jsonl").exists()
+    monkeypatch.undo()
+    await writer.async_close()
+    await engine.async_close()
+
+
+@pytest.mark.asyncio
+async def test_below_reserve_ordinary_metadata_creation_remains_blocked(tmp_path, clock, monkeypatch):
+    """Emergency loss commits never authorize a new ordinary ownership marker."""
+    engine = recorder(tmp_path, clock)
+    engine.limits = replace(engine.limits, min_free_bytes=1024**2)
+    simulate_free_space(monkeypatch, tmp_path, engine.limits.min_free_bytes - 4096)
+    await engine.async_start()
+    assert engine.health["State"] == "degraded"
+    assert not (engine.root / "recorder.json").exists()
     await engine.async_close()
 
 

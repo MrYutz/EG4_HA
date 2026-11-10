@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import struct
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -34,6 +34,26 @@ _ROUTE_REQUEST_LOCKS: WeakValueDictionary[tuple[str, int], asyncio.Lock] = WeakV
 _Decoded = TypeVar("_Decoded")
 _VALID_STATUS_CODES = frozenset(
     {0x00, 0x04, 0x08, 0x0C, 0x10, 0x11, 0x14, 0x20, 0x28, 0x40, 0x80, 0xC0}
+)
+# Register, reported name, divisor, largest measurement word, signed encoding.
+# Publication guards remain in the decoders; raw EPS330 V must stay observable.
+_GRIDBOSS_PRIMARY_FIELDS = (
+    (1, "grid_voltage_v", 10.0, 5000, False),
+    (2, "ups_voltage_v", 10.0, 5000, False),
+    (3, "generator_voltage_v", 10.0, 5000, False),
+    (30, "generator_l1_power_w", 1.0, 65535, True),
+    (31, "generator_l2_power_w", 1.0, 65535, True),
+    (128, "phase_lock_frequency_hz", 100.0, 65534, False),
+    (129, "grid_frequency_hz", 100.0, 65534, False),
+    (130, "generator_frequency_hz", 100.0, 65534, False),
+)
+_FLEXBOSS_PRIMARY_FIELDS = (
+    (12, "grid_voltage_v", 10.0, 65534, False),
+    (15, "grid_frequency_hz", 100.0, 65534, False),
+    (20, "eps_voltage_r_v", 10.0, 65534, False),
+    (21, "eps_voltage_s_v", 10.0, 65534, False),
+    (22, "eps_voltage_t_v", 10.0, 65534, False),
+    (23, "eps_frequency_hz", 100.0, 65534, False),
 )
 
 
@@ -508,6 +528,30 @@ def _signed_word(value: int) -> int:
     return struct.unpack("<h", struct.pack("<H", value))[0]
 
 
+def raw_primary_measurements(
+    values: Sequence[int], *, register: int, gridboss: bool,
+) -> dict[str, float | None]:
+    """Project known wire lanes without applying whole-image/publication guards."""
+    fields = _GRIDBOSS_PRIMARY_FIELDS if gridboss else _FLEXBOSS_PRIMARY_FIELDS
+    measurements: dict[str, float | None] = {}
+    for index, name, divisor, upper, signed in fields:
+        offset = index - register
+        if not 0 <= offset < len(values):
+            continue
+        word = values[offset]
+        measurements[name] = (
+            (_signed_word(word) if signed else word) / divisor
+            if type(word) is int and 0 <= word <= upper else None
+        )
+    if "generator_l1_power_w" in measurements and "generator_l2_power_w" in measurements:
+        first = measurements["generator_l1_power_w"]
+        second = measurements["generator_l2_power_w"]
+        measurements["generator_power_w"] = (
+            first + second if first is not None and second is not None else None
+        )
+    return measurements
+
+
 def _gridboss_register_value(
     values: tuple[int, ...], register: int
 ) -> int | None:
@@ -547,16 +591,6 @@ def _gridboss_power(values: tuple[int, ...], register: int) -> float | None:
         -100_000.0,
         100_000.0,
     )
-
-
-def _gridboss_frequency(
-    values: tuple[int, ...], register: int, start_register: int
-) -> float | None:
-    """Decode a GridBOSS frequency register in hundredths of a hertz."""
-    index = register - start_register
-    if index < 0 or index >= len(values):
-        return None
-    return _bounded(values[index] / 100.0, 0.0, 100.0)
 
 
 def classify_gridboss_transfer(
@@ -651,17 +685,19 @@ def _decode_gridboss_telemetry(
     input_registers_valid = all(
         raw is not None and raw <= 5_000 for raw in input_voltage_raw
     )
+    measurements = raw_primary_measurements(
+        values, register=_GRIDBOSS_REGISTER, gridboss=True,
+    )
+    frequency_measurements = raw_primary_measurements(
+        frequencies, register=_GRIDBOSS_FREQUENCY_REGISTER, gridboss=True,
+    )
 
     grid_l1_power = _gridboss_power(values, 26) if input_registers_valid else None
     grid_l2_power = _gridboss_power(values, 27) if input_registers_valid else None
     load_l1_power = _gridboss_power(values, 28) if input_registers_valid else None
     load_l2_power = _gridboss_power(values, 29) if input_registers_valid else None
-    generator_l1_power = (
-        _gridboss_power(values, 30) if input_registers_valid else None
-    )
-    generator_l2_power = (
-        _gridboss_power(values, 31) if input_registers_valid else None
-    )
+    generator_l1_power = measurements["generator_l1_power_w"] if input_registers_valid else None
+    generator_l2_power = measurements["generator_l2_power_w"] if input_registers_valid else None
     ups_l1_power = _gridboss_power(values, 32) if input_registers_valid else None
     ups_l2_power = _gridboss_power(values, 33) if input_registers_valid else None
 
@@ -670,20 +706,12 @@ def _decode_gridboss_telemetry(
             return None
         return first + second
 
-    grid_voltage = _gridboss_voltage(values, 1) if input_registers_valid else None
-    ups_voltage = _gridboss_voltage(values, 2) if input_registers_valid else None
-    generator_voltage = (
-        _gridboss_voltage(values, 3) if input_registers_valid else None
-    )
-    phase_lock_frequency = _gridboss_frequency(
-        frequencies, 128, _GRIDBOSS_FREQUENCY_REGISTER
-    )
-    grid_frequency = _gridboss_frequency(
-        frequencies, 129, _GRIDBOSS_FREQUENCY_REGISTER
-    )
-    generator_frequency = _gridboss_frequency(
-        frequencies, 130, _GRIDBOSS_FREQUENCY_REGISTER
-    )
+    grid_voltage = measurements["grid_voltage_v"] if input_registers_valid else None
+    ups_voltage = measurements["ups_voltage_v"] if input_registers_valid else None
+    generator_voltage = measurements["generator_voltage_v"] if input_registers_valid else None
+    phase_lock_frequency = _bounded(frequency_measurements["phase_lock_frequency_hz"], 0.0, 100.0)
+    grid_frequency = _bounded(frequency_measurements["grid_frequency_hz"], 0.0, 100.0)
+    generator_frequency = _bounded(frequency_measurements["generator_frequency_hz"], 0.0, 100.0)
     (
         grid_available,
         generator_available,
@@ -809,12 +837,7 @@ def _decode_core_telemetry(
         else None
     )
 
-    def scaled(index: int, divisor: float, upper: float) -> float | None:
-        return _bounded(
-            values[index] / divisor if len(values) > index else None,
-            0.0,
-            upper,
-        )
+    measurements = raw_primary_measurements(values, register=_CORE_REGISTER, gridboss=False)
 
     return EG4LocalTelemetry(
         host=host,
@@ -842,8 +865,8 @@ def _decode_core_telemetry(
         bms_cycle_count=None,
         bms_available=False,
         status_code=status_code,
-        grid_voltage=scaled(12, 10.0, 300.0),
-        grid_frequency=scaled(15, 100.0, 100.0),
+        grid_voltage=_bounded(measurements["grid_voltage_v"], 0.0, 300.0),
+        grid_frequency=_bounded(measurements["grid_frequency_hz"], 0.0, 100.0),
         inverter_power=(
             _bounded(float(values[16]), 0.0, 100_000.0)
             if len(values) > 16
@@ -854,10 +877,10 @@ def _decode_core_telemetry(
             if len(values) > 17
             else None
         ),
-        eps_voltage_r=scaled(20, 10.0, 300.0),
-        eps_voltage_s=scaled(21, 10.0, 300.0),
-        eps_voltage_t=scaled(22, 10.0, 300.0),
-        eps_frequency=scaled(23, 100.0, 100.0),
+        eps_voltage_r=_bounded(measurements["eps_voltage_r_v"], 0.0, 300.0),
+        eps_voltage_s=_bounded(measurements["eps_voltage_s_v"], 0.0, 300.0),
+        eps_voltage_t=_bounded(measurements["eps_voltage_t_v"], 0.0, 300.0),
+        eps_frequency=_bounded(measurements["eps_frequency_hz"], 0.0, 100.0),
         eps_power=(
             _bounded(float(values[24]), 0.0, 100_000.0)
             if len(values) > 24
