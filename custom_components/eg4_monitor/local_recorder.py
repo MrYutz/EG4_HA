@@ -6,6 +6,7 @@ is a sequence of independently timed blocks, never an atomic site snapshot.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -35,12 +36,15 @@ from .local_dongle import (
     merge_local_telemetry,
 )
 from .local_dongle_trace import (
+    ControllerObservationJournal,
     LocalDongleTraceWriter,
+    PersistenceResult,
     gridboss_to_record,
     telemetry_to_record,
 )
 
 Shape = tuple[int, int, int]
+_LOGGER = logging.getLogger(__name__)
 
 
 def _age(source: dict[str, Any] | None, now: datetime) -> float | None:
@@ -79,6 +83,8 @@ class _Role:
     due: dict[Shape, float]
     blocks: dict[Shape, dict[str, Any]] = field(default_factory=dict)
     last_good: dict[Shape, dict[str, Any]] = field(default_factory=dict)
+    # Pending raw frames do not replace the last completed semantic verdict.
+    semantic_rejections: set[Shape] = field(default_factory=set)
     core: EG4LocalTelemetry | EG4GridBossTelemetry | None = None
     source: dict[str, Any] | None = None
     primary_available: bool = False
@@ -90,8 +96,10 @@ class _Role:
     last_started: float | None = None
     spacing: deque[float] = field(default_factory=lambda: deque(maxlen=120))
     error: str | None = None
+    last_error: str | None = None
     callback_error: str | None = None
     errors: int = 0
+    last_callback_error: str | None = None
     sequence: int = 0
     source_sequence: int | None = None
     last_transfer_state: str | None = None
@@ -112,6 +120,8 @@ class EG4LocalRecorder:
         configured_inverter_roles: set[str],
         writer: LocalDongleTraceWriter | None,
         on_update: Callable[[dict[str, Any] | None], Awaitable[None]],
+        journal: ControllerObservationJournal | None = None,
+        on_health_update: Callable[[], Awaitable[None]] | None = None,
         interval: float = 1.0,
         bms_interval: float = 5.0,
         build_id: str = "unknown",
@@ -123,9 +133,11 @@ class EG4LocalRecorder:
         self.bms_interval = max(0.001, float(bms_interval))
         self.max_age = max(15.0, self.interval * 5.0)
         self.writer = writer
+        self.journal = journal
         self.session_id = session_id or (writer.session_id if writer else str(uuid4()))
         self.build_id = build_id
         self._on_update = on_update
+        self._on_health_update = on_health_update
         self._clock = clock
         self._configured = set(configured_inverter_roles) | (devices.keys() - {"gridboss"})
         self._roles: dict[str, _Role] = {}
@@ -136,6 +148,11 @@ class EG4LocalRecorder:
         self._health_cache: dict[str, Any] | None = None
         self._health_at = 0.0
         self._writer_error: str | None = None
+        self._health_event = asyncio.Event()
+        self._health_task: asyncio.Task[None] | None = None
+        self._health_signature: tuple[Any, ...] | None = None
+        self._warnings: dict[str, float] = {}
+        self._close_task: asyncio.Task[None] | None = None
         for role, device in devices.items():
             gridboss = role == "gridboss"
             profile = LOCAL_GRIDBOSS_MAINTENANCE if gridboss else LOCAL_INVERTER_MAINTENANCE
@@ -159,35 +176,161 @@ class EG4LocalRecorder:
         if self._started or self._closed:
             return
         self._started = True
+        if self.journal is not None:
+            self.journal.set_health_callback(self._signal_health)
+        self._health_task = asyncio.create_task(self._run_health(), name="eg4-recorder-health")
         for role in self._roles:
             self._tasks[role] = asyncio.create_task(self._run(role), name=f"eg4-recorder-{role}")
 
     async def async_close(self) -> None:
-        """Cancel and join only owned tasks; leave writer draining to the caller."""
+        """Join owned tasks before the caller drains and synchronizes writers."""
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close())
+        try:
+            await asyncio.shield(self._close_task)
+        except asyncio.CancelledError:
+            await asyncio.shield(self._close_task)
+            raise
+
+    async def _close(self) -> None:
+        """Join acquisition and drain prior output before enqueueing final health."""
         self._closed = True
-        for task in self._tasks.values():
+        if self.journal is not None:
+            self.journal.set_health_callback(None)
+        tasks = [*self._tasks.values()]
+        if self._health_task is not None:
+            tasks.append(self._health_task)
+        for task in tasks:
             task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
+        self._health_task = None
         for state in self._roles.values():
             state.primary_available = False
+            state.device.evidence_sink = None
         self._health_cache = None
+        if self._started:
+            if self.journal is not None:
+                await self.journal.writer.async_sync()
+            if self.writer is not None:
+                await self.writer.async_sync()
+            await self._publish_health("shutdown", notify=False)
+        self._on_health_update = None
+
+    def _warn(self, category: str, error: str) -> None:
+        """Bound repeated warnings without allowing failures to kill capture."""
+        now = time.monotonic()
+        previous = self._warnings.get(category)
+        if previous is None or now - previous >= 30.0:
+            self._warnings[category] = now
+            _LOGGER.warning("EG4 recorder %s: %s", category, error)
+
+    def _persistence(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Read memory-only persistence status; disabled is explicitly degraded."""
+        disabled = {
+            "State": "degraded", "Enabled": False, "QueueDepth": 0, "QueuedBytes": 0,
+            "DroppedRecords": 0, "WriteErrors": 0, "PersistedRecords": 0,
+            "LastSuccessfulPersistence": None, "LastError": None, "LossGeneration": 0,
+        }
+        raw = {**self.writer.health, "Enabled": True} if self.writer else dict(disabled)
+        journal = {**self.journal.health, "Enabled": True} if self.journal else {
+            **disabled, "ContinuityBroken": None, "PendingObservations": 0,
+            "ObservedRoles": [], "PersistedRoles": [],
+        }
+        if self._writer_error:
+            raw["State"] = "degraded"
+            raw["LastError"] = self._writer_error
+        return raw, journal
+
+    def _signature(self) -> tuple[Any, ...]:
+        """Exclude counters/timestamps so successful appends cannot churn health."""
+        raw, journal = self._persistence()
+        roles = tuple(
+            (role, state.last_attempt is None, state.primary_available,
+             bool(state.error), bool(state.callback_error),
+             all(shape in state.blocks for shape in (*state.primary, *state.dynamic, *state.periods)),
+             tuple(shape for shape, block in state.blocks.items()
+                   if not block["ok"] or shape in state.semantic_rejections or block.get("error")))
+            for role, state in self._roles.items()
+        )
+        return (raw["State"], journal["State"], journal.get("ContinuityBroken"), roles)
+
+    def _signal_health(self) -> None:
+        """Wake the single publisher only for current state/continuity edges."""
+        if self._closed:
+            return
+        signature = self._signature()
+        if signature != self._health_signature:
+            self._health_signature = signature
+            self._health_cache = None
+            self._health_event.set()
+
+    def _write_completed(self, result: PersistenceResult) -> None:
+        """React to actual append outcomes, never to an enqueue acknowledgement."""
+        if self._closed:
+            return
+        if result.error is not None:
+            self._warn("raw persistence", result.error)
+        elif result.path is not None:
+            self._writer_error = None
+        self._signal_health()
 
     async def _write(self, record: dict[str, Any]) -> None:
-        """Enqueue evidence without allowing writer failure to stop acquisition."""
+        """Enqueue evidence without waiting for disk or reporting queue success."""
         if self.writer is None:
             return
         try:
-            accepted = await self.writer.async_write(record, wait=False)
-            error = self.writer.last_error if accepted is None else None
-            if accepted is None and error is None:
-                error = "trace writer rejected record"
+            accepted = await self.writer.async_write(
+                record, wait=False, on_complete=self._write_completed,
+            )
         except Exception as err:
-            error = f"{type(err).__name__}: {err}"
-        if error != self._writer_error:
-            self._writer_error = error
-            self._health_cache = None
+            self._writer_error = f"{type(err).__name__}: {err}"
+            self._warn("raw persistence", self._writer_error)
+        else:
+            if accepted is None:
+                self._warn("raw persistence", self.writer.health["LastError"] or "record rejected")
+        self._signal_health()
+
+    async def _publish_health(self, reason: str, *, notify: bool = True) -> None:
+        """Persist compact diagnostics without copying raw frames or settings."""
+        now = datetime.now(UTC)
+        self._health_cache = None
+        health = self._health(now)
+        await self._write({
+            "schema": LOCAL_DONGLE_TRACE_SCHEMA, "kind": "recorder_health",
+            "session_id": self.session_id, "build_id": self.build_id,
+            "role": "recorder", "observed_at": now.isoformat(),
+            "reason": reason, "health": health,
+        })
+        if notify and self._on_health_update is not None:
+            try:
+                await self._on_health_update()
+            except Exception as err:
+                self._warn("health callback", f"{type(err).__name__}: {err}")
+
+    async def _run_health(self) -> None:
+        """Publish startup, bounded periodic health and significant transitions."""
+        self._health_signature = self._signature()
+        self._health_event.clear()
+        await self._publish_health("startup")
+        previous_state = self._health(datetime.now(UTC))["State"]
+        while not self._closed:
+            try:
+                await asyncio.wait_for(self._health_event.wait(), timeout=30.0)
+                state = self._health(datetime.now(UTC))["State"]
+                reason = (
+                    "failure" if state == "degraded" and previous_state != "degraded"
+                    else "recovery" if state == "healthy" and previous_state != "healthy"
+                    else "transition"
+                )
+            except TimeoutError:
+                reason = "periodic"
+            self._health_event.clear()
+            if self.journal is not None and self.journal.health["State"] == "degraded":
+                self._warn("journal persistence", self.journal.health["LastError"] or "continuity broken")
+            await self._publish_health(reason)
+            previous_state = self._health(datetime.now(UTC))["State"]
 
     async def _observe(self, evidence: dict[str, Any]) -> None:
         """Keep bounded shape metadata before optionally persisting raw evidence."""
@@ -213,10 +356,14 @@ class EG4LocalRecorder:
                     "error": evidence.get("error"),
                 }
         elif state is not None and evidence.get("kind") == "interpretation":
-            for block in state.blocks.values():
+            for shape, block in state.blocks.items():
                 if block["transaction_id"] == evidence["transaction_id"]:
                     block["semantic"] = evidence["semantic"]
                     block["semantic_error"] = evidence.get("error")
+                    if evidence["semantic"] == "rejected":
+                        state.semantic_rejections.add(shape)
+                    elif evidence["semantic"] == "accepted":
+                        state.semantic_rejections.discard(shape)
                     break
         await self._write(evidence)
 
@@ -244,11 +391,13 @@ class EG4LocalRecorder:
         except Exception as err:
             error = f"{type(err).__name__}: {err}"
             state.errors += 1
+            state.last_callback_error = error
+            self._warn("role callback", error)
         else:
             error = None
         if state.callback_error != error:
             state.callback_error = error
-            self._health_cache = None
+            self._signal_health()
 
     async def _primary(self, role: str, state: _Role, record: dict[str, Any]) -> None:
         """Read dynamic data and publish primary continuity loss immediately."""
@@ -262,16 +411,16 @@ class EG4LocalRecorder:
             source = self._source(state, state.primary, record["acquisition_id"])
         except Exception as err:
             state.error = f"{type(err).__name__}: {err}"
+            state.last_error = state.error
+            self._warn("primary acquisition", state.error)
             state.errors += 1
             state.primary_available = False
             record["error"] = state.error
-            self._health_cache = None
+            self._signal_health()
             # Publish the interruption before any later block or recovery can
             # hide a failed observation behind a still-young last-good cache.
             await self._notify(state, None)
         else:
-            if not state.primary_available or state.error is not None:
-                self._health_cache = None
             state.core, state.source = core, source
             state.source_sequence = state.sequence
             state.primary_available = True
@@ -284,7 +433,6 @@ class EG4LocalRecorder:
     async def _block(self, state: _Role, shape: Shape, *, bms: bool = False) -> None:
         """Attempt one maintenance shape without replacing last-good on failure."""
         previous = state.last_good.get(shape)
-        previous_attempt = state.blocks.get(shape)
         bms_data: EG4LocalBMSData | None = None
         try:
             if bms:
@@ -296,7 +444,8 @@ class EG4LocalRecorder:
                 raise ValueError("Block acquisition provenance unavailable")
         except Exception as err:
             state.errors += 1
-            self._health_cache = None
+            state.last_error = f"{type(err).__name__}: {err}"
+            self._warn("maintenance acquisition", state.last_error)
             if bms:
                 state.bms_available = False
             # Transport retains the original failed transaction. A semantic
@@ -305,8 +454,6 @@ class EG4LocalRecorder:
             if block is not None:
                 block["error"] = f"{type(err).__name__}: {err}"
         else:
-            if previous_attempt is None or not previous_attempt["ok"] or previous_attempt.get("error"):
-                self._health_cache = None
             if shape in state.periods:
                 observed_changed = previous is not None and previous["values"] != block["values"]
                 state.last_good[shape] = {**deepcopy(block), "observed_changed": observed_changed}
@@ -314,6 +461,7 @@ class EG4LocalRecorder:
                 state.bms = bms_data
                 state.bms_available = bms_data.available
                 state.bms_source = self._source(state, (shape,), block["acquisition_id"])
+        self._signal_health()
 
     async def _run(self, role: str) -> None:
         """Run one role's primary cadence and oldest-due maintenance work."""
@@ -357,6 +505,12 @@ class EG4LocalRecorder:
                 finally:
                     self._finish(state, record)
                     await self._write(record)
+                    if not cancelled and self.journal is not None:
+                        try:
+                            await self.journal.async_observe(record)
+                        except Exception as err:
+                            self._warn("journal observation", f"{type(err).__name__}: {err}")
+                    self._signal_health()
                     if not cancelled:
                         await self._notify(state, record)
                 if cancelled:
@@ -453,6 +607,7 @@ class EG4LocalRecorder:
     def _health(self, now: datetime) -> dict[str, Any]:
         """Summarize role continuity and measured cadence at bounded frequency."""
         clock = time.monotonic()
+        self._signal_health()
         if self._health_cache is not None and clock - self._health_at < 30.0:
             return deepcopy(self._health_cache)
         roles = {}
@@ -461,9 +616,22 @@ class EG4LocalRecorder:
             if state is None:
                 roles[role] = {"State": "degraded", "PrimaryAvailable": False, "LastError": "configured driver missing"}
                 continue
-            maintenance = {_key(shape): self._context(state, shape, now) for shape in state.periods}
-            missing = [key for key, context in maintenance.items() if context["status"] == "missing"]
-            failed = [key for key, context in maintenance.items() if context["status"] == "failed"]
+            maintenance = {
+                _key(shape): {
+                    "Status": "missing" if shape not in state.blocks else "ok" if (
+                        state.blocks[shape]["ok"]
+                        and shape not in state.semantic_rejections
+                        and not state.blocks[shape].get("error")
+                    ) else "failed",
+                    "LastSuccessAgeSeconds": _age(state.last_good.get(shape), now),
+                    "Source": {
+                        key: state.last_good[shape][key]
+                        for key in ("acquisition_id", "transaction_id", "acquired_at")
+                    } if shape in state.last_good else None,
+                } for shape in state.periods
+            }
+            missing = [key for key, context in maintenance.items() if context["Status"] == "missing"]
+            failed = [key for key, context in maintenance.items() if context["Status"] == "failed"]
             missing.extend(
                 _key(shape) for shape in (*state.primary, *state.dynamic)
                 if shape not in state.blocks
@@ -472,7 +640,7 @@ class EG4LocalRecorder:
                 _key(shape) for shape in (*state.primary, *state.dynamic)
                 if shape in state.blocks and (
                     not state.blocks[shape]["ok"]
-                    or state.blocks[shape]["semantic"] == "rejected"
+                    or shape in state.semantic_rejections
                     or state.blocks[shape].get("error")
                 )
             )
@@ -490,19 +658,28 @@ class EG4LocalRecorder:
                 "MedianSpacingSeconds": median(state.spacing) if state.spacing else None,
                 "MaxSpacingSeconds": max(state.spacing) if state.spacing else None,
                 "SpacingSamples": len(state.spacing), "Errors": state.errors,
-                "LastError": state.error, "CallbackError": state.callback_error,
+                "LastError": state.last_error, "CallbackError": state.callback_error,
+                "LastCallbackError": state.last_callback_error,
                 "MissingProfileBlocks": missing, "FailedProfileBlocks": failed,
-                "Maintenance": {key: {
-                    "Status": context["status"],
-                    "LastSuccessAgeSeconds": (context["last_success"] or {}).get("age_seconds"),
-                } for key, context in maintenance.items()},
+                "Maintenance": maintenance,
             }
-        overall = "starting" if not self._started else "healthy" if roles and all(
-            role["State"] == "healthy" for role in roles.values()
-        ) and not self._writer_error else "degraded"
+        raw, journal = self._persistence()
+        for persistence in (raw, journal):
+            completed = persistence["LastSuccessfulPersistence"]
+            persistence["LastSuccessfulPersistenceAgeSeconds"] = (
+                max(0.0, (now - datetime.fromisoformat(completed)).total_seconds())
+                if completed else None
+            )
+        persistence_states = (raw["State"], journal["State"])
+        overall = "degraded" if self._closed or "degraded" in persistence_states else (
+            "starting" if not self._started or "starting" in persistence_states else
+            "healthy" if roles and all(role["State"] == "healthy" for role in roles.values())
+            else "degraded"
+        )
         self._health_cache = {
             "SessionId": self.session_id, "BuildId": self.build_id, "State": overall,
             "ObservedAt": now.isoformat(), "Roles": roles, "WriterError": self._writer_error,
+            "RawPersistence": raw, "JournalPersistence": journal,
         }
         self._health_at = clock
         return deepcopy(self._health_cache)

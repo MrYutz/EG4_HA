@@ -2,7 +2,7 @@
 id: EG4REC-04
 title: Preserve protection changes and recover the journal after write failures
 type: AFK
-status: ready
+status: in-progress
 phase: delivery
 source_github: null
 source_business_need: conversation-provisional
@@ -48,3 +48,13 @@ Make received discrete controller changes and recorder loss survive the entire o
 ## Blocked by
 
 - [01-preserve-raw-dongle-evidence.md](./01-preserve-raw-dongle-evidence.md)
+
+## Pull request stack
+
+Stack root: `main` at `580aacd07a9d830e16d3ad92781ff547b0bd2068`; independent polling is merged.
+
+| Key | Branch | Purpose | Predecessor / PR base | Acceptance advanced |
+| --- | --- | --- | --- | --- |
+| 4.1 | `codex/eg4-host-recorder-4.1-recover-journal` | Persist discrete protection changes, acknowledge actual writes, recover unchanged baselines after loss, and expose bounded persistence health through the existing recorder | `main` at the stack root | All EG4REC-04 acceptance criteria and A6, preserving A1–A5 |
+
+Keep the existing threaded JSONL writer and independent acquisition owner. A queued record is not a successful write. Controller comparison state advances only through explicit write outcomes; filesystem failures must not stall role polling or suppress a later recovery baseline. One complete green entry keeps the persistence producer, journal and diagnostic consumer aligned. Incident retention/finalization policy remains EG4REC-05.

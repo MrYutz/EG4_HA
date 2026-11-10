@@ -79,7 +79,7 @@ from .local_dongle import (
     EG4LocalTelemetry,
     async_discover_dongles,
 )
-from .local_dongle_trace import ControllerObservationTracker, LocalDongleTraceWriter
+from .local_dongle_trace import ControllerObservationJournal, LocalDongleTraceWriter
 from .local_recorder import EG4LocalRecorder
 
 _LOGGER = logging.getLogger(__name__)
@@ -1501,19 +1501,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if gridboss_host and gridboss_serial
         else None
     )
-    local_trace_writer = (
-        LocalDongleTraceWriter(
-            hass.config.path(".eg4-investigation", "local-dongle", entry.entry_id)
-        )
-        if local_trace_enabled and (local_dongles or gridboss_dongle is not None)
-        else None
-    )
-    controller_trace_writer = (
-        LocalDongleTraceWriter(local_trace_writer.root / "controller-observations")
-        if local_trace_writer is not None
-        else None
-    )
-    controller_observations = ControllerObservationTracker()
     logger_store: Store[dict[str, Any]] = Store(
         hass,
         1,
@@ -1592,6 +1579,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             logger_store.async_delay_save(_logger_state_for_save, 1)
         for event in events:
             hass.bus.async_fire(event["event_type"], event)
+        _publish_local_snapshot()
+
+    def _publish_local_snapshot() -> None:
+        """Publish local availability and health without manufacturing a sample."""
         snapshot = local_recorder.snapshot()
         aggregate: dict[str, Any] = {
             "LocalTelemetry": {
@@ -1612,7 +1603,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             aggregate, snapshot.inverters, configured_roles=configured_local_roles
         )
         logger_coordinator.async_set_updated_data({
-            **telemetry_logger.snapshot(sample.observed_at),
+            **telemetry_logger.snapshot(snapshot.sample.observed_at),
             "aggregate": aggregate,
         })
 
@@ -1658,45 +1649,50 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ))
 
 
-    async def _record_controller_observation(record: dict[str, Any]) -> None:
-        """Retain discrete controller evidence independently of full raw rotation."""
-        if controller_trace_writer is None:
-            return
-        observation = controller_observations.observe(record)
-        if observation is None:
-            return
-        try:
-            if await controller_trace_writer.async_write(observation, wait=False) is None:
-                _LOGGER.warning(
-                    "Unable to write controller observation for role %s: %s",
-                    record["role"],
-                    controller_trace_writer.last_error or "unknown writer error",
-                )
-        except Exception as err_trace:
-            _LOGGER.warning("Controller observation writer failed: %s", err_trace)
+    async def _local_recorder_health_update() -> None:
+        """Publish recorder diagnostics independently of acquisition callbacks."""
+        _publish_local_snapshot()
 
     async def _local_recorder_update(record: dict[str, Any] | None) -> None:
-        """Interrupt immediately; journal only completed acquisition records."""
+        """Publish source-owned role updates and immediate primary interruptions."""
         _publish_logger_sample(local_recorder.snapshot().sample)
-        if record is not None:
-            await _record_controller_observation(record)
 
     recorder_devices = dict(local_dongles)
     if gridboss_dongle is not None:
         recorder_devices["gridboss"] = gridboss_dongle
+    recorder_build_id = await hass.async_add_executor_job(_local_recorder_build_id)
+    local_trace_writer = (
+        LocalDongleTraceWriter(
+            hass.config.path(".eg4-investigation", "local-dongle", entry.entry_id)
+        )
+        if local_trace_enabled and (local_dongles or gridboss_dongle is not None)
+        else None
+    )
+    controller_trace_writer = (
+        LocalDongleTraceWriter(
+            local_trace_writer.root / "controller-observations",
+            session_id=local_trace_writer.session_id,
+        )
+        if local_trace_writer is not None
+        else None
+    )
+    controller_journal = (
+        ControllerObservationJournal(controller_trace_writer)
+        if controller_trace_writer is not None else None
+    )
     recorder_session_id = (
         local_trace_writer.session_id if local_trace_writer is not None else str(uuid4())
     )
-    if controller_trace_writer is not None:
-        controller_trace_writer.session_id = recorder_session_id
     local_recorder = EG4LocalRecorder(
         devices=recorder_devices,
         configured_inverter_roles=configured_local_roles,
         writer=local_trace_writer,
         on_update=_local_recorder_update,
+        journal=controller_journal,
+        on_health_update=_local_recorder_health_update,
         interval=local_trace_interval,
         bms_interval=local_trace_bms_interval,
-        build_id=await hass.async_add_executor_job(_local_recorder_build_id),
+        build_id=recorder_build_id,
         session_id=recorder_session_id,
     )
 
@@ -2024,6 +2020,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         for writer in (local_trace_writer, controller_trace_writer):
             if writer is not None:
                 await writer.async_close()
+        await logger_store.async_save(telemetry_logger.to_dict())
         await logger_coordinator.async_shutdown()
         await coordinator.async_shutdown()
         hass.data[DOMAIN].pop(entry.entry_id, None)

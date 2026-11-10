@@ -5,14 +5,19 @@ import asyncio
 import contextlib
 import json
 import sys
+import threading
 from collections import Counter
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 from custom_components.eg4_monitor.eg4_logger import EG4TelemetryLogger
 from custom_components.eg4_monitor.local_dongle import EG4GridBossDongle, EG4LocalDongle
-from custom_components.eg4_monitor.local_dongle_trace import LocalDongleTraceWriter
+from custom_components.eg4_monitor.local_dongle_trace import (
+    ControllerObservationJournal,
+    LocalDongleTraceWriter,
+)
 from custom_components.eg4_monitor.local_recorder import EG4LocalRecorder
 from tests.test_local_dongle import _fixture_response
 
@@ -791,3 +796,318 @@ async def test_transfer_changes_reach_analyzer_without_hiding_intervening_gap(tm
     stdout, stderr = await process.communicate()
     assert process.returncode == 0, stderr.decode()
     assert "transitions=2" in stdout.decode()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_stream", ["raw", "journal"])
+async def test_real_storage_failure_recovers_health_without_hiding_healthy_capture(
+    tmp_path, failed_stream, caplog,
+):
+    """A real unusable directory loses writes, not device observations."""
+    raw_root, journal_root = tmp_path / "raw", tmp_path / "journal"
+    blocked = raw_root if failed_stream == "raw" else journal_root
+    blocked.write_text("not a directory")
+    raw = LocalDongleTraceWriter(raw_root)
+    journal_writer = LocalDongleTraceWriter(journal_root, session_id=raw.session_id)
+    journal = ControllerObservationJournal(journal_writer)
+    notifications = []
+
+    async def respond(shape):
+        return _words(shape)
+
+    async with _endpoint(respond) as (device, _, concurrency):
+        consumer = _LoggerConsumer()
+
+        async def health_update():
+            notifications.append(recorder.snapshot().health)
+
+        recorder = consumer.recorder = EG4LocalRecorder(
+            devices={"flexboss_master": device}, configured_inverter_roles={"flexboss_master"},
+            writer=raw, journal=journal, on_update=consumer, on_health_update=health_update,
+            interval=0.005, build_id="temporary-storage-recovery",
+        )
+        captured = []
+        try:
+            await recorder.async_start()
+            # Finish the real startup maintenance profile while storage fails.
+            for index in range(6):
+                record, snapshot, _ = await consumer.next()
+                captured.append(record["acquisition_id"])
+                assert record["ok"] is True
+                assert snapshot.sample.charge_power_w == 500
+                if index != 5:
+                    consumer.advance()
+            await raw.async_sync()
+            await journal_writer.async_sync()
+            failed = recorder.snapshot().health
+            key = "RawPersistence" if failed_stream == "raw" else "JournalPersistence"
+            loss = failed[key]
+            assert failed["State"] == "degraded"
+            assert loss["WriteErrors"] > 0
+            assert loss["LastError"]
+            assert loss["PersistedRecords"] == 0
+            assert loss["LastSuccessfulPersistence"] is None
+            assert failed["Roles"]["flexboss_master"]["State"] == "healthy"
+            if failed_stream == "journal":
+                assert loss["ContinuityBroken"] is True
+            # Flush the transition health attempt too. Its failure must not
+            # generate a self-triggering stream of further health attempts.
+            for _ in range(3):
+                await raw.async_sync()
+                await journal_writer.async_sync()
+            assert len(notifications) < 12
+            assert len([entry for entry in caplog.records
+                        if "persistence" in entry.message]) <= 2
+
+            blocked.unlink()
+            consumer.advance()
+            resumed, _, _ = await consumer.next()
+            await raw.async_sync()
+            await journal_writer.async_sync()
+            recovered = recorder.snapshot().health
+            assert recovered["State"] == "healthy"
+            assert recovered[key]["State"] == "healthy"
+            assert recovered[key]["WriteErrors"] >= loss["WriteErrors"]
+            assert recovered[key]["LastError"] == loss["LastError"]
+            assert recovered[key]["LastSuccessfulPersistence"]
+            assert recovered[key]["LastSuccessfulPersistenceAgeSeconds"] >= 0
+            assert recovered["JournalPersistence"]["ContinuityBroken"] is False
+            assert concurrency["maximum"] == 1
+        finally:
+            await recorder.async_close()
+            await raw.async_close()
+            await journal_writer.async_close()
+        assert device.evidence_sink is None
+
+    rows = [json.loads(line) for line in raw.active_path.read_text().splitlines()]
+    health_rows = [row for row in rows if row["kind"] == "recorder_health"]
+    assert health_rows[-1]["reason"] == "shutdown"
+    assert any(row["health"][key]["State"] == "healthy" for row in health_rows)
+    assert all(row["role"] == "recorder" and row["session_id"] == raw.session_id
+               and row["build_id"] == "temporary-storage-recovery" for row in health_rows)
+    assert all("values" not in json.dumps(row) and "frames" not in json.dumps(row)
+               for row in health_rows)
+    assert any(row.get("acquisition_id") == resumed["acquisition_id"]
+               and row["kind"] == "acquisition" for row in rows)
+    journal_rows = [json.loads(line) for line in journal_writer.active_path.read_text().splitlines()]
+    assert all(row["session_id"] == raw.session_id for row in journal_rows)
+    if failed_stream == "journal":
+        assert any(row["observation"] == "recovery_baseline" for row in journal_rows)
+    else:
+        assert any(row["observation"] == "baseline" for row in journal_rows)
+
+
+@pytest.mark.asyncio
+async def test_stalled_raw_filesystem_never_blocks_role_or_journal_receipts(tmp_path, monkeypatch):
+    """Block real file opening on its worker; loopback capture still advances."""
+    raw = LocalDongleTraceWriter(tmp_path / "raw", max_queue_records=128)
+    journal_writer = LocalDongleTraceWriter(
+        tmp_path / "journal", session_id=raw.session_id,
+    )
+    journal = ControllerObservationJournal(journal_writer)
+    entered, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    original_open = Path.open
+
+    def gated_open(path, *args, **kwargs):
+        if path == raw.active_path and args and args[0] == "ab" and not release.is_set():
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(5):
+                raise TimeoutError("test filesystem gate was not released")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", gated_open)
+
+    async def respond(shape):
+        return _words(shape)
+
+    async with _endpoint(respond) as (device, _, concurrency):
+        consumer = _LoggerConsumer()
+        recorder = consumer.recorder = EG4LocalRecorder(
+            devices={"flexboss_master": device}, configured_inverter_roles={"flexboss_master"},
+            writer=raw, journal=journal, on_update=consumer, interval=0.005,
+        )
+        try:
+            await recorder.async_start()
+            await asyncio.wait_for(entered.wait(), 2)
+            captured = []
+            for index in range(3):
+                record, snapshot, _ = await consumer.next()
+                captured.append(record["acquisition_id"])
+                assert record["ok"] is True
+                assert snapshot.sample.charge_power_w == 500
+                if index != 2:
+                    consumer.advance()
+            await journal_writer.async_sync()
+            health = recorder.snapshot().health
+            assert raw.health["PersistedRecords"] == 0
+            assert raw.health["LastSuccessfulPersistence"] is None
+            assert 0 < raw.health["QueueDepth"] <= 128
+            assert health["RawPersistence"]["State"] != "healthy"
+            assert journal.health["PersistedRecords"] > 0
+            assert len(set(captured)) == 3
+            assert concurrency["maximum"] == 1
+            release.set()
+            await raw.async_sync()
+        finally:
+            release.set()
+            await recorder.async_close()
+            await raw.async_close()
+            await journal_writer.async_close()
+    rows = [json.loads(line) for line in raw.active_path.read_text().splitlines()]
+    saved = {row["acquisition_id"] for row in rows if row["kind"] == "acquisition"}
+    assert set(captured) <= saved
+    journal_rows = [json.loads(line) for line in journal_writer.active_path.read_text().splitlines()]
+    assert journal_rows
+    assert rows[0]["kind"] == "recorder_health"
+    assert rows[0]["reason"] == "startup"
+    assert rows[0]["health"]["RawPersistence"]["PersistedRecords"] == 0
+    assert rows[-1]["reason"] == "shutdown"
+
+
+@pytest.mark.asyncio
+async def test_disabled_persistence_is_explicit_without_health_role_callbacks():
+    updates, health_updates = [], []
+
+    async def observed(record):
+        updates.append(record)
+
+    async def health_update():
+        health_updates.append(recorder.snapshot().health)
+        published.set()
+
+    published = asyncio.Event()
+    recorder = EG4LocalRecorder(
+        devices={}, configured_inverter_roles=set(), writer=None,
+        on_update=observed, on_health_update=health_update,
+    )
+    try:
+        await recorder.async_start()
+        await asyncio.wait_for(published.wait(), 1)
+        health = recorder.snapshot().health
+        assert health["State"] == "degraded"
+        assert health["RawPersistence"]["Enabled"] is False
+        assert health["JournalPersistence"]["Enabled"] is False
+        assert health["RawPersistence"]["LastSuccessfulPersistence"] is None
+        assert health_updates
+        assert updates == []
+    finally:
+        await recorder.async_close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_semantic_rejection_does_not_republish_settled_health(tmp_path):
+    """Pending decode cannot manufacture recovery between identical failures."""
+    async def respond(shape):
+        values = _words(shape)
+        if shape == (4, 0, 40):
+            values[0] = 33280
+        return values
+
+    raw = LocalDongleTraceWriter(tmp_path)
+    async with _endpoint(respond) as (device, _, _):
+        consumer = _LoggerConsumer()
+        recorder = consumer.recorder = EG4LocalRecorder(
+            devices={"flexboss_master": device}, configured_inverter_roles={"flexboss_master"},
+            writer=raw, on_update=consumer, interval=0.005,
+        )
+
+        async def completed_acquisition():
+            """Let immediate primary interruptions reach the final role record."""
+            while True:
+                record, _, _ = await consumer.next()
+                if record is not None:
+                    assert record["ok"] is False
+                    return
+                consumer.advance()
+
+        def saved_health():
+            rows = [json.loads(line) for line in raw.active_path.read_text().splitlines()]
+            return [
+                row for row in rows
+                if row["kind"] == "recorder_health" and row["reason"] != "periodic"
+            ]
+
+        try:
+            await recorder.async_start()
+            for index in range(5):
+                await completed_acquisition()
+                if index < 4:
+                    consumer.advance()
+            await raw.async_sync()
+            before = saved_health()
+            for _ in range(3):
+                consumer.advance()
+                await completed_acquisition()
+                await raw.async_sync()
+            after = saved_health()
+            assert len(after) == len(before)
+            assert recorder.snapshot().sample.charge_power_w is None
+            assert before[-1]["health"]["State"] == after[-1]["health"]["State"] == "degraded"
+        finally:
+            await recorder.async_close()
+            await raw.async_close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", ["raw", "journal"])
+async def test_shutdown_health_survives_full_outstanding_queue(tmp_path, monkeypatch, stream):
+    """Graceful close waits for real capacity instead of dropping its final row."""
+    raw = LocalDongleTraceWriter(
+        tmp_path / "raw", max_queue_records=1 if stream == "raw" else 1024,
+    )
+    journal_writer = (
+        LocalDongleTraceWriter(tmp_path / "journal", max_queue_records=1)
+        if stream == "journal" else None
+    )
+    journal = ControllerObservationJournal(journal_writer) if journal_writer else None
+    blocked = raw if stream == "raw" else journal_writer
+    assert blocked is not None
+    entered, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    original_open = Path.open
+
+    def gated_open(path, *args, **kwargs):
+        if path == blocked.active_path and args and args[0] == "ab" and not release.is_set():
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(5):
+                raise TimeoutError("test filesystem gate was not released")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", gated_open)
+
+    async def role_update(record):
+        raise AssertionError("health must not invent an acquisition for an absent device")
+
+    recorder = EG4LocalRecorder(
+        devices={}, configured_inverter_roles=set(), writer=raw, journal=journal, on_update=role_update,
+    )
+    close_task = None
+    try:
+        if journal is not None:
+            from tests.test_local_dongle_trace import _controller_sample
+            await journal.async_observe(_controller_sample())
+        await recorder.async_start()
+        await asyncio.wait_for(entered.wait(), 2)
+        assert blocked.health["PersistedRecords"] == 0
+        close_task = asyncio.create_task(recorder.async_close())
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(close_task), 0.05)
+    finally:
+        release.set()
+        if close_task is not None:
+            await close_task
+        else:
+            await recorder.async_close()
+        await raw.async_close()
+        if journal_writer is not None:
+            await journal_writer.async_close()
+    rows = [json.loads(line) for line in raw.active_path.read_text().splitlines()]
+    assert rows[-1]["kind"] == "recorder_health"
+    assert rows[-1]["reason"] == "shutdown"
+    assert raw.health["DroppedRecords"] == 0
+    if journal_writer is not None:
+        shutdown = rows[-1]["health"]["JournalPersistence"]
+        assert shutdown["PendingObservations"] == 0
+        assert shutdown["PersistedRecords"] == 1
+        assert journal_writer.health["DroppedRecords"] == 0

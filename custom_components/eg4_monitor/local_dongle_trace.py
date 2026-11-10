@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import queue
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import Future
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -21,6 +24,9 @@ from .local_dongle import EG4GridBossTelemetry, EG4LocalTelemetry
 DEFAULT_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_MAX_FILES = 8
 CONTROLLER_OBSERVATION_SCHEMA = "eg4_controller_observation.v1"
+_PERSISTENCE_PREFIX_BYTES = len(
+    b'{"persistence_started_at":"2000-01-01T00:00:00.000+00:00",'
+) - 1
 _GRIDBOSS_INPUTS = (
     *range(122, 128), 131, *range(500, 520),
     567, 568, 569, 572, 576, 577, 578, 579, 580, 587, 588,
@@ -30,7 +36,7 @@ _GRIDBOSS_HOLDINGS = (
 )
 # FAAB-27xx warnings are 60/61; the 64/65 analog branch is raw context, not a trigger.
 # Keep analog command142/143 in raw blocks; trigger on limiter/state144/145.
-_FLEXBOSS_INPUTS = (0, 60, 61, 62, 63, 77, 144, 145)
+_FLEXBOSS_INPUTS = (0, 6, 60, 61, 62, 63, 77, 144, 145)
 _FLEXBOSS_HOLDINGS = (110, 170, 177, 179, 194, 195, 196, 197, 226)
 _TRANSFER_FIELDS = (
     "state", "input_registers_valid", "grid_available",
@@ -151,6 +157,25 @@ def telemetry_to_record(telemetry: EG4LocalTelemetry) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class PersistenceResult:
+    """Report an actual append/flush attempt, not queue acceptance."""
+
+    path: Path | None
+    error: str | None
+    completed_at: str
+
+
+@dataclass(frozen=True)
+class _PendingObservation:
+    """Keep scalar comparison state until an explicit persistence outcome."""
+
+    role: str
+    signature: tuple[tuple[str, Any], ...]
+    generation: int
+    recovery: bool
+
+
 class ControllerObservationTracker:
     """Keep first and changed raw controller observations, separately per role.
 
@@ -160,10 +185,58 @@ class ControllerObservationTracker:
     """
 
     def __init__(self) -> None:
-        self._previous: dict[str, tuple[tuple[str, Any], ...]] = {}
+        self._observed: dict[str, tuple[tuple[str, Any], ...]] = {}
+        self._persisted: dict[str, tuple[int, tuple[tuple[str, Any], ...]]] = {}
+        self._pending: dict[int, _PendingObservation] = {}
+        self._broken: dict[str, int] = {}
+        self._loss_generation = 0
+        self._sequence = 0
+
+    @property
+    def health(self) -> dict[str, Any]:
+        """Return observation continuity without treating pending work as saved."""
+        return {
+            "ContinuityBroken": bool(self._broken),
+            "PendingObservations": len(self._pending),
+            "ObservedRoles": sorted(self._observed),
+            "PersistedRoles": sorted(self._persisted),
+        }
+
+    def mark_loss(self, role: str | None = None) -> None:
+        """Break continuity until a new-generation baseline actually persists."""
+        self._loss_generation += 1
+        for affected in self._observed if role is None else (role,):
+            self._broken[affected] = self._loss_generation
+
+    def mark_pending(self, observation: dict[str, Any]) -> int:
+        """Reserve a bounded receipt token immediately before queue submission."""
+        self._sequence += 1
+        role = observation["role"]
+        self._pending[self._sequence] = _PendingObservation(
+            role, self._observed[role], self._broken.get(role, 0),
+            observation["observation"] == "recovery_baseline",
+        )
+        return self._sequence
+
+    def reject(self, token: int) -> None:
+        """Record explicit queue loss; rejection is not a write acknowledgement."""
+        pending = self._pending.pop(token)
+        self.mark_loss(pending.role)
+
+    def acknowledge(self, token: int, result: PersistenceResult) -> None:
+        """Advance saved comparison state only from an actual write receipt."""
+        pending = self._pending.pop(token)
+        if result.path is None or result.error is not None:
+            self.mark_loss(pending.role)
+            return
+        previous = self._persisted.get(pending.role)
+        if previous is None or token > previous[0]:
+            self._persisted[pending.role] = (token, pending.signature)
+        if pending.recovery and self._broken.get(pending.role) == pending.generation:
+            del self._broken[pending.role]
 
     def observe(self, record: dict) -> dict | None:
-        """Return durable context on change, excluding unrelated HA states."""
+        """Return baseline/change context; observation alone is not persistence."""
         role = record["role"]
         gridboss = role.startswith("gridboss")
         inputs = _GRIDBOSS_INPUTS if gridboss else _FLEXBOSS_INPUTS
@@ -188,6 +261,15 @@ class ControllerObservationTracker:
                         ((4, start + offset), value)
                         for offset, value in enumerate(values)
                     )
+        # Structural evidence is usable even when semantic telemetry was rejected.
+        # Preserve the complete source blocks/times below; never mark it primary-ok.
+        for block in record.get("primary_blocks") or ():
+            values = block.get("values")
+            if block.get("ok") is True and values is not None:
+                registers.update(
+                    ((block["function"], block["register"] + offset), value)
+                    for offset, value in enumerate(values)
+                )
 
         expected = (
             ((4, 500, 100), (3, 4500, 10)) if gridboss
@@ -224,11 +306,21 @@ class ControllerObservationTracker:
             },
             **{f"transfer.{key}": transfer.get(key) for key in _TRANSFER_FIELDS},
         }
+        if not gridboss:
+            word = registers.get((4, 6))
+            fields.pop("input.6")
+            fields["input.6.bits_0_1"] = word & 3 if word is not None else None
         signature = tuple(sorted(fields.items()))
-        previous_signature = self._previous.get(role)
-        if previous_signature == signature:
+        previous_signature = self._observed.get(role)
+        self._observed[role] = signature
+        recovery_pending = any(
+            pending.role == role and pending.recovery
+            and pending.generation == self._broken.get(role)
+            for pending in self._pending.values()
+        )
+        recovery = role in self._broken and not recovery_pending
+        if previous_signature == signature and not recovery:
             return None
-        self._previous[role] = signature
         previous = dict(previous_signature) if previous_signature is not None else None
         changed = (
             sorted(
@@ -265,6 +357,15 @@ class ControllerObservationTracker:
                 observation = "availability_changed"
             else:
                 observation = "controller_changed"
+        if recovery:
+            observation = "recovery_baseline"
+        if not gridboss:
+            controller["input6_semantics"] = {
+                "trigger_mask": 3,
+                "basis": "candidate_firmware",
+                "installed_semantics": "unverified",
+                "physical_meaning": "unknown",
+            }
         if gridboss:
             controller["decisions"] = {
                 str(reg): {
@@ -292,8 +393,29 @@ class ControllerObservationTracker:
         }
 
 
+@dataclass(frozen=True)
+class _PendingWrite:
+    """Own one encoded payload and its source-loop completion until delivery."""
+
+    line: bytes
+    size: int
+    generation: int
+    loop: asyncio.AbstractEventLoop
+    receipt: Future[PersistenceResult]
+    on_complete: Callable[[PersistenceResult], None] | None
+
+
+@dataclass(frozen=True)
+class _SyncRequest:
+    """Order one receipt-draining synchronization barrier in the append queue."""
+
+    result: Future[bool]
+    receipts: tuple[Future[PersistenceResult], ...]
+    stop: bool = False
+
+
 class LocalDongleTraceWriter:
-    """Append bounded, rotation-safe JSONL records from an HA task."""
+    """Append bounded JSONL off-loop, with explicit actual-persistence receipts."""
 
     def __init__(
         self,
@@ -301,114 +423,263 @@ class LocalDongleTraceWriter:
         *,
         max_bytes: int = DEFAULT_MAX_BYTES,
         max_files: int = DEFAULT_MAX_FILES,
+        session_id: str | None = None,
+        max_queue_records: int = 1024,
+        max_queue_bytes: int = 8 * 1024 * 1024,
     ) -> None:
         self.root = Path(root)
-        self.session_id = str(uuid4())
+        self.session_id = session_id if session_id is not None else str(uuid4())
         self.max_bytes = max(64 * 1024, int(max_bytes))
         self.max_files = max(2, int(max_files))
-        self._queue: queue.Queue[
-            tuple[bytes, Future[Path | None] | None] | None
-        ] = queue.Queue(maxsize=1024)
+        self.max_queue_records = max(1, int(max_queue_records))
+        self.max_queue_bytes = max(1, int(max_queue_bytes))
+        self._queue: queue.SimpleQueue[_PendingWrite | _SyncRequest] = queue.SimpleQueue()
+        self._lock = threading.Lock()
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
-        self.last_error: str | None = None
+        self._close_result = False
+        self._outstanding: set[Future[PersistenceResult]] = set()
+        self._queued_bytes = 0
+        self._dropped_records = 0
+        self._write_errors = 0
+        self._persisted_records = 0
+        self._last_success: str | None = None
+        self._last_error: str | None = None
+        self._loss_generation = 0
+        self._recovered_generation = -1
+        self._dirty_paths: set[Path] = set()
         self._thread = threading.Thread(
-            target=self._writer_loop,
-            name="eg4-dongle-trace",
-            daemon=True,
+            target=self._writer_loop, name="eg4-dongle-trace", daemon=True,
         )
         self._thread.start()
 
     @property
     def active_path(self) -> Path:
-        """Return the current trace path."""
+        """Return the current destination, without claiming that it exists."""
         return self.root / "local-dongle.jsonl"
 
+    @property
+    def last_error(self) -> str | None:
+        """Return the historical last error, retained after later recovery."""
+        with self._lock:
+            return self._last_error
+
+    @property
+    def health(self) -> dict[str, Any]:
+        """Return fresh thread-safe cumulative health, without filesystem access."""
+        with self._lock:
+            state = (
+                "degraded" if self._loss_generation > self._recovered_generation
+                and self._loss_generation > 0 else
+                "healthy" if self._persisted_records else "starting"
+            )
+            return {
+                "State": state,
+                "QueueDepth": len(self._outstanding),
+                "QueuedBytes": self._queued_bytes,
+                "DroppedRecords": self._dropped_records,
+                "WriteErrors": self._write_errors,
+                "PersistedRecords": self._persisted_records,
+                "LastSuccessfulPersistence": self._last_success,
+                "LastError": self._last_error,
+                "LossGeneration": self._loss_generation,
+            }
+
+    def _record_loss_locked(self, error: str, *, dropped: bool) -> None:
+        """Accumulate loss while retaining the historical cause after recovery."""
+        if dropped:
+            self._dropped_records += 1
+        else:
+            self._write_errors += 1
+        self._loss_generation += 1
+        self._last_error = error
+
     async def async_write(
-        self, record: dict[str, Any], *, wait: bool = True
+        self,
+        record: dict[str, Any],
+        *,
+        wait: bool = True,
+        on_complete: Callable[[PersistenceResult], None] | None = None,
     ) -> Path | None:
-        """Queue one record without blocking the HA event loop."""
+        """Accept bounded output promptly; optionally await its actual receipt.
+
+        A wait=False path is only a destination. Accepted output and callbacks
+        survive cancellation of the caller, but not arbitrary host power loss.
+        """
+        loop = asyncio.get_running_loop()
         enriched = {
             "schema": LOCAL_DONGLE_TRACE_SCHEMA,
             "kind": "acquisition",
             "session_id": self.session_id,
-            "queued_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
             **record,
+            "queued_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
         }
         try:
             line = (
                 json.dumps(enriched, separators=(",", ":"), allow_nan=False) + "\n"
             ).encode("utf-8")
-        except (TypeError, ValueError) as err:
-            self.last_error = f"{type(err).__name__}: {err}"
+        except (TypeError, ValueError, OverflowError, RecursionError) as err:
+            with self._lock:
+                self._record_loss_locked(f"{type(err).__name__}: {err}", dropped=True)
             return None
-        if self._closed:
-            self.last_error = "trace writer is closed"
-            return None
-        result: Future[Path | None] | None = Future() if wait else None
-        try:
-            self._queue.put_nowait((line, result))
-        except queue.Full:
-            self.last_error = "trace writer queue is full"
-            return None
-        if result is None:
+        # Account for the exact additional prefix written off-loop, without
+        # retaining a second large serialized payload for byte accounting.
+        size = len(line) + _PERSISTENCE_PREFIX_BYTES
+        receipt: Future[PersistenceResult] = Future()
+        with self._lock:
+            error = (
+                "trace writer is closed" if self._closed else
+                "trace writer queue record limit reached"
+                if len(self._outstanding) >= self.max_queue_records else
+                "trace writer queue byte limit reached"
+                if self._queued_bytes + size > self.max_queue_bytes else None
+            )
+            if error is not None:
+                self._record_loss_locked(error, dropped=True)
+                return None
+            self._outstanding.add(receipt)
+            self._queued_bytes += size
+            self._queue.put(_PendingWrite(
+                line, size, self._loss_generation, loop, receipt, on_complete,
+            ))
+        if not wait:
             return self.active_path
-        return await asyncio.wrap_future(result)
+        result = await asyncio.shield(asyncio.wrap_future(receipt))
+        return result.path
+
+    async def async_sync(self) -> bool:
+        """Drain preceding output/callbacks and fsync owned files off-loop."""
+        with self._lock:
+            closed = self._closed
+            receipts = tuple(self._outstanding)
+            result: Future[bool] = Future()
+            if not closed:
+                self._queue.put(_SyncRequest(result, receipts))
+        if closed:
+            await self.async_close()
+            return self._close_result
+        return await asyncio.shield(asyncio.wrap_future(result))
 
     async def async_close(self) -> None:
-        """Drain and flush every accepted record without blocking the HA loop."""
+        """Idempotently drain, deliver receipts and synchronize even if cancelled."""
         if self._close_task is None:
-            self._closed = True
-            self._close_task = asyncio.create_task(asyncio.to_thread(self._close_sync))
+            with self._lock:
+                self._closed = True
+                receipts = tuple(self._outstanding)
+                result: Future[bool] = Future()
+                self._queue.put(_SyncRequest(result, receipts, stop=True))
+            self._close_task = asyncio.create_task(self._finish_close(result))
         await asyncio.shield(self._close_task)
 
-    def _close_sync(self) -> None:
-        """Queue the stop marker after pending writes, even if the queue is full."""
-        self._queue.put(None)
-        self._thread.join()
+    async def _finish_close(self, result: Future[bool]) -> None:
+        """Finish the owned drain/sync task independently of caller cancellation."""
+        self._close_result = await asyncio.shield(asyncio.wrap_future(result))
+        await asyncio.to_thread(self._thread.join)
+
+    def _deliver_completion(
+        self, pending: _PendingWrite, result: PersistenceResult,
+    ) -> None:
+        """Deliver state mutation only on the originating event loop."""
+        try:
+            if pending.on_complete is not None:
+                pending.on_complete(result)
+        except Exception as err:
+            pending.loop.call_exception_handler({
+                "message": "EG4 persistence completion callback failed",
+                "exception": err,
+            })
+        finally:
+            with self._lock:
+                self._outstanding.remove(pending.receipt)
+                self._queued_bytes -= pending.size
+            pending.receipt.set_result(result)
 
     def _writer_loop(self) -> None:
-        """Drain queued writes on a daemon thread."""
+        """Serialize append and fsync operations on the one writer thread."""
         while True:
-            item = self._queue.get()
-            if item is None:
-                return
-            line, result = item
-            if result is not None and not result.set_running_or_notify_cancel():
-                # Cancellation of the awaiting task must not discard its record
-                # or kill the worker when it later tries to resolve the future.
-                result = None
+            pending = self._queue.get()
+            if isinstance(pending, _SyncRequest):
+                # Completion mutates journal/runtime state on its source loop.
+                # The barrier must deliver those receipts before fsync starts.
+                writes_ok = True
+                for receipt in pending.receipts:
+                    outcome = receipt.result()
+                    writes_ok = (
+                        writes_ok and outcome.path is not None
+                        and outcome.error is None
+                    )
+                try:
+                    self._sync_sync()
+                except OSError as err:
+                    with self._lock:
+                        self._record_loss_locked(
+                            f"{type(err).__name__}: {err}", dropped=False,
+                        )
+                    pending.result.set_result(False)
+                else:
+                    pending.result.set_result(writes_ok)
+                if pending.stop:
+                    return
+                continue
+            path = None
+            error = None
             try:
-                path = self._write_sync(line)
+                path = self._write_sync(pending.line)
             except OSError as err:
-                self.last_error = f"{type(err).__name__}: {err}"
-                if result is not None:
-                    result.set_result(None)
-            else:
-                self.last_error = None
-                if result is not None:
-                    result.set_result(path)
+                error = f"{type(err).__name__}: {err}"
+            completed_at = datetime.now(UTC).isoformat(timespec="milliseconds")
+            with self._lock:
+                if error is not None:
+                    self._record_loss_locked(error, dropped=False)
+                else:
+                    self._persisted_records += 1
+                    self._last_success = completed_at
+                    self._recovered_generation = max(
+                        self._recovered_generation, pending.generation,
+                    )
+            result = PersistenceResult(path, error, completed_at)
+            pending.loop.call_soon_threadsafe(self._deliver_completion, pending, result)
+            del pending
 
     def _write_sync(self, line: bytes) -> Path:
-        # This timestamps the filesystem attempt, not queue acceptance or fsync.
-        persisted = datetime.now(UTC).isoformat(timespec="milliseconds").encode("ascii")
-        line = b'{"persistence_started_at":"' + persisted + b'",' + line[1:]
+        """Append and flush without copying the encoded evidence payload."""
+        started = datetime.now(UTC).isoformat(timespec="milliseconds").encode("ascii")
+        prefix = b'{"persistence_started_at":"' + started + b'",'
         self.root.mkdir(parents=True, exist_ok=True)
         active = self.active_path
-        if active.exists() and active.stat().st_size + len(line) > self.max_bytes:
-            rotated = self.root / (
-                "local-dongle-"
-                f"{time.time_ns()}"
-                ".jsonl"
-            )
+        if (
+            active.exists()
+            and active.stat().st_size + len(prefix) + len(line) - 1 > self.max_bytes
+        ):
+            rotated = self.root / f"local-dongle-{time.time_ns()}.jsonl"
             active.replace(rotated)
+            if active in self._dirty_paths:
+                self._dirty_paths.remove(active)
+                self._dirty_paths.add(rotated)
         with active.open("ab") as stream:
-            stream.write(line)
+            self._dirty_paths.add(active)
+            stream.write(prefix)
+            stream.write(memoryview(line)[1:])
             stream.flush()
         self._prune_sync()
         return active
 
+    def _sync_sync(self) -> None:
+        """Synchronize retained changed files and their directory off-loop."""
+        if not self._dirty_paths:
+            return
+        for path in self._dirty_paths:
+            with path.open("rb") as stream:
+                os.fsync(stream.fileno())
+        descriptor = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        self._dirty_paths.clear()
+
     def _prune_sync(self) -> None:
+        """Prune only owned trace segments and forget deliberately removed files."""
         files = sorted(
             self.root.glob("local-dongle*.jsonl"),
             key=lambda path: path.stat().st_mtime,
@@ -419,3 +690,65 @@ class LocalDongleTraceWriter:
                 path.unlink()
             except FileNotFoundError:
                 pass
+            self._dirty_paths.discard(path)
+
+
+class ControllerObservationJournal:
+    """Join discrete observations to explicit write/loss acknowledgements."""
+
+    def __init__(self, writer: LocalDongleTraceWriter) -> None:
+        self.writer = writer
+        self._tracker = ControllerObservationTracker()
+        self._writer_loss_generation = 0
+        self._health_callback: Callable[[], None] | None = None
+        self._last_transition: tuple[str, bool] | None = None
+
+    def _refresh_writer_loss(self) -> dict[str, Any]:
+        """Turn writer loss, including fsync failure, into journal discontinuity."""
+        health = self.writer.health
+        if health["LossGeneration"] > self._writer_loss_generation:
+            self._writer_loss_generation = health["LossGeneration"]
+            self._tracker.mark_loss()
+        return health
+
+    @property
+    def health(self) -> dict[str, Any]:
+        """Expose actual storage and continuity, including outstanding recovery."""
+        health = {**self._refresh_writer_loss(), **self._tracker.health}
+        if health["ContinuityBroken"]:
+            health["State"] = "degraded"
+        return health
+
+    def set_health_callback(self, callback: Callable[[], None] | None) -> None:
+        """Notify only significant state/continuity transitions on this loop."""
+        self._health_callback = callback
+        health = self.health
+        self._last_transition = (health["State"], health["ContinuityBroken"])
+
+    def _notify_transition(self) -> None:
+        """Wake health publication only for current state/continuity transitions."""
+        health = self.health
+        transition = (health["State"], health["ContinuityBroken"])
+        if transition != self._last_transition:
+            self._last_transition = transition
+            if self._health_callback is not None:
+                self._health_callback()
+
+    async def async_observe(self, record: dict[str, Any]) -> None:
+        """Enqueue discrete evidence without waiting for the disk or a receipt."""
+        self._refresh_writer_loss()
+        observation = self._tracker.observe(record)
+        if observation is not None:
+            token = self._tracker.mark_pending(observation)
+
+            def completed(result: PersistenceResult) -> None:
+                self._refresh_writer_loss()
+                self._tracker.acknowledge(token, result)
+                self._notify_transition()
+
+            accepted = await self.writer.async_write(
+                observation, wait=False, on_complete=completed,
+            )
+            if accepted is None:
+                self._tracker.reject(token)
+        self._notify_transition()
