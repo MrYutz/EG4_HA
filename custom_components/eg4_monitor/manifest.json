@@ -6,7 +6,7 @@
   "documentation": "https://github.com/your_github_username/ha-eg4-monitor",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/your_github_username/ha-eg4-monitor/issues",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "requirements": [
     "aiohttp>=3.8.0",
     "beautifulsoup4>=4.9.3"
