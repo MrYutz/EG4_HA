@@ -15,6 +15,8 @@ Custom Home Assistant integration for EG4 portal-backed systems, tuned for moder
 - Storage guards avoid repeated directory walks for every record; current byte ceilings, free-space reserve and inode/path safety remain enforced.
 - Existing `RecorderHealth` diagnostics and the standalone streaming analyzer expose capture failures, source gaps, output anomalies and bundle completeness.
 
+Production installation and measured limits: [2026-11-10 deployment receipt](docs/host-recorder-deployment-2026-11-10.md).
+
 Host-only release: no power firmware, equipment operating/protection settings, new
 device collector or dashboard. See the [operator and evidence guide](docs/mother-of-all-data-loggers.md).
 
