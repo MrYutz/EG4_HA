@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import threading
+from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 
@@ -10,8 +15,10 @@ from custom_components.eg4_monitor.local_dongle import (
     EG4LocalTelemetry,
 )
 from custom_components.eg4_monitor.local_dongle_trace import (
+    ControllerObservationJournal,
     ControllerObservationTracker,
     LocalDongleTraceWriter,
+    PersistenceResult,
     telemetry_to_record,
 )
 
@@ -336,3 +343,433 @@ def test_controller_observation_failed_attempt_does_not_resume_missing_data() ->
     assert failed["telemetry"]["decoded"]["generator_voltage_v"] == 240.0
     assert failed["ok"] is True
     assert tracker.observe(sample) is None
+
+
+@pytest.mark.asyncio
+async def test_journal_disk_failure_recovers_identical_observation(tmp_path) -> None:
+    root = tmp_path / "blocked"
+    root.write_text("not a directory")
+    writer = LocalDongleTraceWriter(root, session_id="synthetic-journal")
+    journal = ControllerObservationJournal(writer)
+    sample = _controller_sample()
+    try:
+        await journal.async_observe(sample)
+        assert await writer.async_sync() is False
+        failed = journal.health
+        assert failed["State"] == "degraded"
+        assert failed["ContinuityBroken"] is True
+        assert failed["WriteErrors"] == 1
+        assert failed["PersistedRecords"] == 0
+        assert failed["PersistedRoles"] == []
+        root.unlink()
+        await journal.async_observe(sample)
+        assert await writer.async_sync() is True
+        recovered = journal.health
+        assert recovered["State"] == "healthy"
+        assert recovered["ContinuityBroken"] is False
+        assert recovered["WriteErrors"] == 1
+        assert recovered["LastError"] == failed["LastError"]
+        assert recovered["LastSuccessfulPersistence"] is not None
+        assert recovered["PersistedRoles"] == ["gridboss"]
+        saved = [json.loads(line) for line in writer.active_path.read_text().splitlines()]
+        assert len(saved) == 1
+        assert saved[0]["observation"] == "recovery_baseline"
+        assert saved[0]["session_id"] == "synthetic-journal"
+        assert saved[0]["controller"]["input"]["519"] == 0x0504
+    finally:
+        await writer.async_close()
+
+
+@contextmanager
+def _gated_appends(monkeypatch, destination):
+    """Delay only the external append boundary, preserving genuine file output."""
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    original = Path.open
+
+    def open_path(path, mode="r", *args, **kwargs):
+        if path == destination and mode == "ab":
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(10):
+                raise TimeoutError("synthetic append gate was not released")
+        return original(path, mode, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", open_path)
+        try:
+            yield entered, release
+        finally:
+            release.set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "limits",
+    [{"max_queue_records": 1}, {"max_queue_records": 16, "max_queue_bytes": 4096}],
+    ids=["record-count", "serialized-bytes"],
+)
+async def test_trace_writer_bounds_inflight_work_and_retains_loss(
+    tmp_path, monkeypatch, limits,
+) -> None:
+    writer = LocalDongleTraceWriter(tmp_path, **limits)
+    receipts: list[PersistenceResult] = []
+    callback_threads = []
+    loop_thread = threading.get_ident()
+
+    def completed(result):
+        callback_threads.append(threading.get_ident())
+        receipts.append(result)
+
+    try:
+        with _gated_appends(monkeypatch, writer.active_path) as (entered, release):
+            assert await writer.async_write(
+                {"sequence": 1, "payload": "x" * 2048},
+                wait=False, on_complete=completed,
+            ) == writer.active_path
+            await asyncio.wait_for(entered.wait(), 2)
+            queued = writer.health
+            assert queued["State"] == "starting"
+            assert queued["QueueDepth"] == 1
+            assert 2048 < queued["QueuedBytes"] <= writer.max_queue_bytes
+            assert queued["PersistedRecords"] == 0
+            assert queued["LastSuccessfulPersistence"] is None
+            assert receipts == []
+            assert await writer.async_write(
+                {"sequence": 2, "payload": "x" * 2048},
+                wait=False, on_complete=completed,
+            ) is None
+            failed = writer.health
+            assert failed["DroppedRecords"] == 1
+            assert failed["QueueDepth"] == 1
+            assert failed["QueuedBytes"] == queued["QueuedBytes"]
+            release.set()
+            assert await writer.async_sync() is True
+        # This write predates the queue loss: it must not clear the newer loss.
+        assert writer.health["State"] == "degraded"
+        assert len(receipts) == 1
+        assert receipts[0].path == writer.active_path
+        assert receipts[0].error is None
+        assert receipts[0].completed_at
+        assert callback_threads == [loop_thread]
+        assert await writer.async_write({"sequence": 3}) == writer.active_path
+        recovered = writer.health
+        assert recovered["State"] == "healthy"
+        assert recovered["DroppedRecords"] == 1
+        assert recovered["WriteErrors"] == 0
+        assert recovered["LastError"] == failed["LastError"]
+        assert recovered["QueueDepth"] == recovered["QueuedBytes"] == 0
+        saved = [json.loads(line) for line in writer.active_path.read_text().splitlines()]
+        assert [row["sequence"] for row in saved] == [1, 3]
+    finally:
+        await writer.async_close()
+
+
+@pytest.mark.asyncio
+async def test_journal_queue_loss_requires_new_generation_recovery(
+    tmp_path, monkeypatch,
+) -> None:
+    writer = LocalDongleTraceWriter(tmp_path, max_queue_records=1)
+    journal = ControllerObservationJournal(writer)
+    transitions = []
+    journal.set_health_callback(lambda: transitions.append(journal.health["State"]))
+    sample = _controller_sample()
+    try:
+        with _gated_appends(monkeypatch, writer.active_path) as (entered, release):
+            await journal.async_observe(sample)
+            await asyncio.wait_for(entered.wait(), 2)
+            sample["diagnostics"][0]["values"][19] = 0x0604
+            await journal.async_observe(sample)
+            assert journal.health["PendingObservations"] == 1
+            assert journal.health["ContinuityBroken"] is True
+            assert journal.health["PersistedRoles"] == []
+            release.set()
+            assert await writer.async_sync() is True
+        # The older baseline was saved, but it cannot acknowledge the newer loss.
+        assert journal.health["ContinuityBroken"] is True
+        assert journal.health["State"] == "degraded"
+        with _gated_appends(monkeypatch, writer.active_path) as (entered, release):
+            await journal.async_observe(sample)
+            await asyncio.wait_for(entered.wait(), 2)
+            for _ in range(5):
+                await journal.async_observe(sample)
+            assert journal.health["DroppedRecords"] == 1
+            assert journal.health["PendingObservations"] == 1
+            # Lose a newer change while the recovery baseline is still in flight.
+            sample["diagnostics"][0]["values"][19] = 0x0704
+            await journal.async_observe(sample)
+            assert journal.health["DroppedRecords"] == 2
+            release.set()
+            assert await writer.async_sync() is True
+        assert journal.health["ContinuityBroken"] is True
+        await journal.async_observe(sample)
+        assert await writer.async_sync() is True
+        assert journal.health["State"] == "healthy"
+        assert journal.health["ContinuityBroken"] is False
+        assert journal.health["PendingObservations"] == 0
+        assert journal.health["DroppedRecords"] == 2
+        assert transitions == ["degraded", "healthy"]
+        saved = [json.loads(line) for line in writer.active_path.read_text().splitlines()]
+        assert [row["controller"]["input"]["519"] for row in saved] == [
+            0x0504, 0x0604, 0x0704,
+        ]
+        assert [row["observation"] for row in saved] == [
+            "baseline", "recovery_baseline", "recovery_baseline",
+        ]
+        assert saved[-1]["changed_fields"] == []
+    finally:
+        await writer.async_close()
+
+
+@pytest.mark.asyncio
+async def test_journal_preserves_pending_reason_changes_in_order(
+    tmp_path, monkeypatch,
+) -> None:
+    writer = LocalDongleTraceWriter(tmp_path)
+    journal = ControllerObservationJournal(writer)
+    sample = _controller_sample()
+    try:
+        with _gated_appends(monkeypatch, writer.active_path) as (entered, release):
+            await journal.async_observe(sample)
+            await asyncio.wait_for(entered.wait(), 2)
+            for reason in (0x0604, 0x0704):
+                sample["diagnostics"][0]["values"][19] = reason
+                await journal.async_observe(sample)
+            await journal.async_observe(sample)
+            assert journal.health["PendingObservations"] == 3
+            assert journal.health["PersistedRoles"] == []
+            release.set()
+            assert await writer.async_sync() is True
+        saved = [json.loads(line) for line in writer.active_path.read_text().splitlines()]
+        assert [row["controller"]["input"]["519"] for row in saved] == [
+            0x0504, 0x0604, 0x0704,
+        ]
+        assert [row["changed_fields"] for row in saved[1:]] == [
+            ["input.519"], ["input.519"],
+        ]
+        assert journal.health["PersistedRoles"] == ["gridboss"]
+        assert journal.health["PendingObservations"] == 0
+    finally:
+        await writer.async_close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("low_bit", [1, 2], ids=["bit0", "bit1"])
+async def test_journal_persists_input6_bits_but_not_high_bit_or_analog_noise(
+    tmp_path, low_bit,
+) -> None:
+    values = [0] * 40
+    values[0], values[6] = 33280, 0x4000
+    analog = [0] * 26
+    sample = {
+        "role": "flexboss_master", "ok": False,
+        "primary_blocks": [{
+            "function": 4, "register": 0, "count": 40, "ok": True,
+            "semantic": "rejected", "values": values,
+            "transaction_id": "synthetic-rejected-core",
+            "started_at": "2026-11-09T12:00:00+00:00",
+            "completed_at": "2026-11-09T12:00:01+00:00",
+        }],
+        "diagnostics": [{
+            "function": 4, "register": 120, "count": 26,
+            "ok": True, "values": analog,
+        }],
+    }
+    writer = LocalDongleTraceWriter(tmp_path)
+    journal = ControllerObservationJournal(writer)
+    try:
+        await journal.async_observe(sample)
+        assert await writer.async_sync() is True
+        values[6] = 0x8000
+        analog[22], analog[23] = 123, 456
+        await journal.async_observe(sample)
+        assert await writer.async_sync() is True
+        assert journal.health["PersistedRecords"] == 1
+        values[6] |= low_bit
+        await journal.async_observe(sample)
+        assert await writer.async_sync() is True
+        saved = [json.loads(line) for line in writer.active_path.read_text().splitlines()]
+        assert [row["controller"]["input"]["6"] for row in saved] == [
+            0x4000, 0x8000 | low_bit,
+        ]
+        assert saved[-1]["changed_fields"] == ["input.6.bits_0_1"]
+        assert saved[-1]["controller"]["input6_semantics"] == {
+            "trigger_mask": 3, "basis": "candidate_firmware",
+            "installed_semantics": "unverified", "physical_meaning": "unknown",
+        }
+        assert all(row["availability"]["primary"] is False for row in saved)
+        assert saved[-1]["primary_blocks"][0]["semantic"] == "rejected"
+        assert saved[-1]["primary_blocks"][0]["transaction_id"] == (
+            "synthetic-rejected-core"
+        )
+        assert saved[-1]["diagnostics"][0]["values"][22:24] == [123, 456]
+    finally:
+        await writer.async_close()
+
+
+@pytest.mark.asyncio
+async def test_sync_delivers_receipts_before_offloop_fsync_and_retains_failure(
+    tmp_path, monkeypatch,
+) -> None:
+    writer = LocalDongleTraceWriter(tmp_path)
+    receipts = []
+    original = os.fsync
+    loop_thread = threading.get_ident()
+    fail_once = True
+    sync_threads = []
+    receipt_counts_at_sync = []
+    receipt_paths_at_sync = []
+
+    def sync(descriptor):
+        nonlocal fail_once
+        sync_threads.append(threading.get_ident())
+        receipt_counts_at_sync.append(len(receipts))
+        receipt_paths_at_sync.append(receipts[0].path if receipts else None)
+        if fail_once:
+            fail_once = False
+            raise OSError("synthetic filesystem synchronization failure")
+        return original(descriptor)
+
+    monkeypatch.setattr(os, "fsync", sync)
+    try:
+        assert await writer.async_write(
+            {"sequence": 1}, wait=False, on_complete=receipts.append,
+        ) == writer.active_path
+        assert await writer.async_sync() is False
+        failed = writer.health
+        assert failed["WriteErrors"] == 1
+        assert failed["PersistedRecords"] == 1
+        assert failed["State"] == "degraded"
+        assert await writer.async_sync() is True
+        assert writer.health["State"] == "degraded"
+        assert await writer.async_write({"sequence": 2}) == writer.active_path
+        assert writer.health["State"] == "healthy"
+        assert writer.health["WriteErrors"] == 1
+        assert writer.health["LastError"] == failed["LastError"]
+        assert sync_threads
+        assert all(identity != loop_thread for identity in sync_threads)
+        assert all(count == 1 for count in receipt_counts_at_sync)
+        assert all(path == writer.active_path for path in receipt_paths_at_sync)
+    finally:
+        await writer.async_close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_waiter_and_close_still_persist_and_deliver_receipt(
+    tmp_path, monkeypatch,
+) -> None:
+    writer = LocalDongleTraceWriter(tmp_path)
+    receipts = []
+    closing_started = asyncio.Event()
+
+    async def close():
+        closing_started.set()
+        await writer.async_close()
+
+    try:
+        with _gated_appends(monkeypatch, writer.active_path) as (entered, release):
+            waiter = asyncio.create_task(writer.async_write(
+                {"sequence": 1}, on_complete=receipts.append,
+            ))
+            await asyncio.wait_for(entered.wait(), 2)
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            closer = asyncio.create_task(close())
+            await closing_started.wait()
+            closer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await closer
+            assert receipts == []
+            release.set()
+            await writer.async_close()
+        assert len(receipts) == 1
+        assert receipts[0].path == writer.active_path
+        assert receipts[0].error is None
+        saved = [json.loads(line) for line in writer.active_path.read_text().splitlines()]
+        assert [row["sequence"] for row in saved] == [1]
+        assert saved[0]["queued_at"] <= saved[0]["persistence_started_at"]
+        assert saved[0]["persistence_started_at"] <= receipts[0].completed_at
+        assert writer.health["QueueDepth"] == writer.health["QueuedBytes"] == 0
+        assert await writer.async_sync() is True
+    finally:
+        await writer.async_close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_encoding_size_and_closed_output_have_no_receipts(
+    tmp_path,
+) -> None:
+    writer = LocalDongleTraceWriter(tmp_path, max_queue_bytes=512)
+    receipts = []
+    try:
+        assert await writer.async_write(
+            {"payload": "x" * 4096}, wait=False, on_complete=receipts.append,
+        ) is None
+        assert await writer.async_write(
+            {"invalid": float("nan")}, wait=False, on_complete=receipts.append,
+        ) is None
+        assert writer.health["DroppedRecords"] == 2
+        assert writer.health["PersistedRecords"] == 0
+        assert writer.health["QueueDepth"] == writer.health["QueuedBytes"] == 0
+        assert receipts == []
+        assert not writer.active_path.exists()
+        assert await writer.async_write(
+            {"sequence": 3}, on_complete=receipts.append,
+        ) == writer.active_path
+        await writer.async_close()
+        assert await writer.async_write(
+            {"sequence": 4}, wait=False, on_complete=receipts.append,
+        ) is None
+        assert len(receipts) == 1
+        assert writer.health["DroppedRecords"] == 3
+        assert writer.health["PersistedRecords"] == 1
+        assert writer.health["State"] == "degraded"
+        assert writer.health["LastError"] == "trace writer is closed"
+        saved = [json.loads(line) for line in writer.active_path.read_text().splitlines()]
+        assert [row["sequence"] for row in saved] == [3]
+    finally:
+        await writer.async_close()
+
+
+@pytest.mark.asyncio
+async def test_write_failure_receipt_runs_on_source_loop_and_preserves_history(
+    tmp_path,
+) -> None:
+    root = tmp_path / "blocked"
+    root.write_text("not a directory")
+    writer = LocalDongleTraceWriter(root)
+    receipts = []
+    callback_threads = []
+    loop_thread = threading.get_ident()
+
+    def completed(result):
+        receipts.append(result)
+        callback_threads.append(threading.get_ident())
+
+    try:
+        assert await writer.async_write(
+            {"sequence": 1}, on_complete=completed,
+        ) is None
+        assert len(receipts) == 1
+        assert receipts[0].path is None
+        assert receipts[0].error is not None
+        assert receipts[0].completed_at
+        assert callback_threads == [loop_thread]
+        failed = writer.health
+        assert failed["PersistedRecords"] == 0
+        assert failed["LastSuccessfulPersistence"] is None
+        assert failed["WriteErrors"] == 1
+        root.unlink()
+        assert await writer.async_write(
+            {"sequence": 2}, on_complete=completed,
+        ) == writer.active_path
+        assert len(receipts) == 2
+        assert callback_threads == [loop_thread, loop_thread]
+        assert writer.health["State"] == "healthy"
+        assert writer.health["WriteErrors"] == 1
+        assert writer.health["LastError"] == failed["LastError"]
+        saved = [json.loads(line) for line in writer.active_path.read_text().splitlines()]
+        assert [row["sequence"] for row in saved] == [2]
+    finally:
+        await writer.async_close()

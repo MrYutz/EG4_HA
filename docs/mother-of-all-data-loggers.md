@@ -124,16 +124,41 @@ availability events were preserved separately. This is not a guaranteed1Hz
 recorder, continuous-health claim or proof of a cycling repair. The restart caused
 about63s of observed sampling gap, not a measured power outage.
 
-An independent, size-bounded JSONL writer under
-`<existing TracePath>/controller-observations/` records a baseline per role,
-discrete controller changes, availability loss and resumption. Repeated identical
-observations and voltage/current/timestamp noise do not create history entries.
-Both bytes of each decision word are compared: input519 changing from`0x0504`
-to`0x0604` is retained even though its low state byte remains4. Command-path
-counters, packed flags, relevant settings, command readbacks and observed transfer
-state/quality are compared too; unresolved continuously changing input593 and
-GPIO594 are retained in emitted raw blocks but do not trigger observations.
-Restart begins a new baseline, not a synthetic physical transition.
+### Controller journal and persistence health
+
+Next to the raw trace, `controller-observations/local-dongle.jsonl` records
+per-role baselines, discrete changes and availability loss/resumption. Input6
+bits0/1 participate in the FlexBOSS discrete signature; the complete word remains
+raw context. Its candidate firmware meaning is explicitly unverified. Structurally
+valid raw primary blocks remain journal evidence even when semantic rejection
+prevents publication as valid telemetry. Higher input6 bits and analog142/143
+noise are not mandatory per-fluctuation triggers.
+
+Both bytes of decision words are retained: input519 changing from`0x0504` to
+`0x0604` is captured even though the low state byte stays4. Warnings60/61,
+faults62/63, limiter/state144/145, command counters, relevant settings, readbacks
+and observed transfer quality remain discrete context. Undefined593/594 data is
+retained raw but does not trigger observations.
+
+Observed, queued/pending and successfully persisted comparison states are
+separate. Queue rejection or disk failure breaks journal continuity. After writes
+resume, an unchanged controller observation can produce a `recovery_baseline`;
+an older successful receipt cannot clear a newer loss. Restart starts a baseline,
+not a synthetic physical transition.
+
+Each writer defaults to1024 outstanding records and an8MiB serialized-byte budget,
+including in-flight work. Disk latency does not put role polling behind a shared
+write barrier. Ordinary appends flush; synchronization and graceful close fsync
+required output off the HA event loop. Queue acceptance is never disk success or
+a guarantee against arbitrary host power loss.
+
+The existing diagnostic's `RecorderHealth` includes `RawPersistence` and
+`JournalPersistence`: current state, queue depth/bytes, cumulative drops/write
+errors, last successful persistence and historical last error. Recovered state
+does not erase earlier loss. Disabled persistence is explicit, not healthy storage.
+Compact `recorder_health` rows (`role=recorder`) live in raw JSONL at startup,
+shutdown,30-second intervals and significant failure/recovery. Cached attributes
+refresh at most every30s except those transitions; warnings are rate-limited.
 
 Historical regular profiles did not poll GridBOSS holding18/24/37/38/170/226/2102;
 those fields were null unless separately baselined. The new approved settings
