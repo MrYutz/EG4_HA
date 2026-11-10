@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -59,6 +60,8 @@ class LoopbackSFTP:
     identity: Path
     known_hosts: Path
     requests: list[tuple[str, str]]
+    fail_read_at: int | None = None
+    failed_at: datetime | None = None
 
     def route(self, *, identity: Path | None = None, known_hosts: Path | None = None) -> list[str]:
         return [
@@ -104,6 +107,13 @@ def sftp_server(tmp_path: Path) -> Iterator[LoopbackSFTP]:
     class Handle(paramiko.SFTPHandle):
         def stat(self):
             return paramiko.SFTPAttributes.from_stat(os.fstat(self.readfile.fileno()))
+
+        def read(self, offset, length):
+            if (self.readfile.name == str(root / "recorder" / "raw" / "local-dongle.jsonl")
+                    and server.fail_read_at is not None and offset >= server.fail_read_at):
+                server.failed_at = datetime.now(timezone.utc)
+                return paramiko.SFTP_FAILURE
+            return super().read(offset, length)
 
     class Files(paramiko.SFTPServerInterface):
         def path(self, name):
@@ -190,7 +200,8 @@ def sftp_server(tmp_path: Path) -> Iterator[LoopbackSFTP]:
     thread = threading.Thread(target=accept_connections, daemon=True)
     thread.start()
     try:
-        yield LoopbackSFTP(root, port, identity, known_hosts, requests)
+        server = LoopbackSFTP(root, port, identity, known_hosts, requests)
+        yield server
     finally:
         stop.set()
         listener.close()
@@ -233,6 +244,46 @@ def test_sftp_cli_ingests_real_bytes_and_resumes_append(sftp_server: LoopbackSFT
     assert (source / "raw" / "local-dongle.jsonl").read_bytes() == original + appended
     assert not any(operation in {"write", "exec", "shell"} for operation, _ in sftp_server.requests)
     assert destination.stat().st_mode & 0o077 == 0
+
+
+def test_sftp_cli_interrupted_append_preserves_transfer_receipt_and_resumes(
+    sftp_server: LoopbackSFTP, tmp_path: Path,
+) -> None:
+    source = sftp_server.root / "recorder"
+    original = recorder(source)
+    destination = tmp_path / "archive"
+    first = invoke(destination, *sftp_server.route())
+    assert first.returncode == 0, first.stdout + first.stderr
+    prior_success = json.loads(first.stdout)["last_success_at"]
+    appended = b'{"kind":"transaction","ok":false}\n' * 32768
+    with (source / "raw" / "local-dongle.jsonl").open("ab") as stream:
+        stream.write(appended)
+
+    # Fail the real server's reads only after one full new copy chunk arrived.
+    received = 256 * 1024
+    sftp_server.fail_read_at = len(original) + received
+    before_transfer = datetime.now(timezone.utc)
+    interrupted = invoke(destination, *sftp_server.route())
+    assert interrupted.returncode != 0
+    assert sftp_server.failed_at is not None
+    assert archived_raw(destination) == [original + appended[:received]]
+    status = json.loads(interrupted.stdout)
+    assert status == json.loads((destination / "status.json").read_text())
+    assert status["state"] == "degraded"
+    assert status["last_success_at"] == prior_success
+    assert status["bytes_copied"] == received
+    assert status["files_changed"] == 1
+    assert before_transfer <= datetime.fromisoformat(status["started_at"]) <= sftp_server.failed_at
+
+    sftp_server.fail_read_at = None
+    resumed = invoke(destination, *sftp_server.route())
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    receipt = json.loads(resumed.stdout)
+    assert receipt == json.loads((destination / "status.json").read_text())
+    assert receipt["state"] == "healthy"
+    assert receipt["bytes_copied"] == len(appended) - received
+    assert archived_raw(destination) == [original + appended]
+    assert (source / "raw" / "local-dongle.jsonl").read_bytes() == original + appended
 
 
 @pytest.mark.parametrize("trust", ["unknown", "mismatch"])

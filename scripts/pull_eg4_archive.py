@@ -162,15 +162,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-        try:
-            status = record_failure(args.destination, entry_id=args.entry_id, error=error)
-        except Exception as recording_error:
-            # Ownership/locking/disk errors may make even a status write unsafe.
-            status = {
-                "schema": "eg4_archive_status.v1", "state": "degraded",
-                "entry_id": args.entry_id, "error": error,
-                "status_recording_error": f"{type(recording_error).__name__}: {recording_error}",
-            }
+        if isinstance(exc, ArchiveError) and exc.status is not None:
+            status = exc.status
+        else:
+            try:
+                status = record_failure(args.destination, entry_id=args.entry_id, error=error)
+            except Exception as recording_error:
+                # Ownership/locking/disk errors may make even a status write unsafe.
+                status = {
+                    "schema": "eg4_archive_status.v1", "state": "degraded",
+                    "entry_id": args.entry_id, "error": error,
+                    "status_recording_error": f"{type(recording_error).__name__}: {recording_error}",
+                }
         print(json.dumps(status, sort_keys=True))
         return 1
     print(json.dumps(status, sort_keys=True))

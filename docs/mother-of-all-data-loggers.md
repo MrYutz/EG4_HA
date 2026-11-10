@@ -405,8 +405,13 @@ HA-owned configuration if90-day entity history is required.
 ## Plucky off-host archive
 
 The Plucky-side puller copies existing recorder files; it does not poll devices,
-change sampling, mount storage into HA or require a Core restart. HA keeps its local
-outage buffer and continues collecting when Plucky is unavailable.
+change sampling, mount storage into HA or itself require a Core restart. HA keeps
+an independent local outage buffer. During rollout, HA actually exhausted its
+1GiB free-space reserve and stopped persisting. Separately approved storage relief
+preserved current evidence first, reduced only recorder ceilings to256MiB raw,
+32MiB controller and128MiB incidents, and required one checked Core restart.
+The reserve and equipment settings are unchanged. Restart/failed-persistence gaps
+remain evidence loss, not reconstructed observations.
 
 | Plucky evidence | Retention |
 | --- | --- |
@@ -437,6 +442,14 @@ are not overwritten by subsequent source pruning or changes. A sealed copy can
 still have `received_complete: false`: custody does not repair missing acquisition,
 startup warmup or interrupted coverage. Source-pruned open copies remain incomplete
 and report missing source evidence.
+
+The exact received producer manifest is retained as `source-manifest.json`.
+The analyzer-facing `manifest.json` also inventories captured files not yet
+checkpointed by HA and previously received files subsequently pruned there.
+It labels archive reconstruction and remains incomplete when source evidence
+cannot establish completeness. Sealed receipts hash both manifests separately.
+Durable inode-checked operation intents make publication, rotation and pruning
+recoverable across process termination; unrelated replacement files fail closed.
 
 ### Plucky runtime and operation
 
@@ -488,8 +501,8 @@ Analyze an incident directory or selected segment with the unchanged
 detailed report. Keep reports/raw logs outside Git.
 
 Eight days fills prospectively; already-pruned history cannot be recovered.
-Plucky downtime can only catch up within HA's remaining local spool (about8.7h
-at the measured production rate/ceiling, not a guarantee). Check both archive
+Plucky downtime can only catch up within HA's remaining local spool (about2.9h
+at the earlier measured rate and reduced256MiB ceiling, not a guarantee). Check both archive
 `last_success_at` and HA `RecorderHealth` loss/coverage; successful replication
 does not prove successful acquisition or explain the historical standby fault.
 

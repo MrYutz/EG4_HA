@@ -25,6 +25,10 @@ _INCIDENT_NAME = re.compile(r"incident-[A-Za-z0-9_-]+\Z")
 class ArchiveError(Exception):
     """A transfer or custody check failed; existing evidence is not disposable."""
 
+    def __init__(self, message: str, *, status: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
 
 @dataclass(frozen=True)
 class SourceEntry:
@@ -111,7 +115,7 @@ class LocalSource:
             descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
         finally:
             os.close(directory)
-        with os.fdopen(descriptor, "rb", buffering=0) as stream:
+        with os.fdopen(descriptor, "rb") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode):
                 raise ArchiveError(f"not a regular source file: {relative}")
@@ -269,7 +273,21 @@ class _Archive:
             else:
                 self.owner = {"schema": "eg4_archive.v1", "entry_id": self.entry_id,
                               "created_at": _iso(self.now), "segments": {}, "incidents": {}}
-                self.save()
+                # Bootstrap through the already locked inode: there is no named
+                # temporary file to strand before the first ownership marker.
+                payload = (json.dumps(self.owner, sort_keys=True) + "\n").encode()
+                os.ftruncate(self.lock, 0)
+                os.lseek(self.lock, 0, os.SEEK_SET)
+                remaining = memoryview(payload)
+                while remaining:
+                    written = os.write(self.lock, remaining)
+                    if not written:
+                        raise ArchiveError("short bootstrap ownership write")
+                    remaining = remaining[written:]
+                os.fsync(self.lock)
+                os.link(self.root / ".archive.lock", self.root / "archive.json")
+                self.sync_dir(self.root)
+            self.recover()
             os.fchmod(self.directory, 0o700)
             for name, claim in self.owner["incidents"].items():
                 if len(_parts(name)) != 1:
@@ -372,14 +390,87 @@ class _Archive:
             raise ArchiveError(f"archive file ownership mismatch: {relative}")
         return info
 
+    def indexed(self, relative: str) -> tuple[dict[str, Any], str]:
+        parts = _parts(relative)
+        if len(parts) == 2 and parts[0] in _STREAMS:
+            return self.owner["segments"], relative
+        if len(parts) == 4 and parts[0] == "incidents" and parts[2] in ("records", "triggers"):
+            return self.owner["incidents"][parts[1]]["files"], "/".join(parts[2:])
+        raise ArchiveError(f"invalid owned evidence path: {relative}")
+
+    def recover(self) -> None:
+        """Replay one fsynced namespace intent, never inferring ownership by name.
+
+        Publication uses hard links, not overwrite-capable rename. An interrupted
+        publication can leave two names for one recorded inode; only that inode
+        may be removed. Unindexed pre-intent empty stages remain untouched.
+        """
+        pending = self.owner.get("pending")
+        if pending is None:
+            return
+        operation = pending["operation"]
+        target = pending["target"]
+        index, key = self.indexed(pending.get("source") if operation == "move" else target)
+        claim = index[key]
+        if operation == "prune":
+            try:
+                self.owned_info(target, claim)
+            except FileNotFoundError:
+                pass
+            else:
+                self.path(target).unlink()
+            self.sync_dir((self.root / target).parent)
+            claim["pruned"] = True
+        elif operation in ("create", "move"):
+            source = pending["source"]
+            source_exists = self.path(source).exists()
+            if source_exists:
+                self.owned_info(source, claim)
+            try:
+                self.owned_info(target, claim)
+            except FileNotFoundError:
+                if not source_exists:
+                    raise ArchiveError(f"owned namespace intent lost both paths: {target}")
+                os.link(self.path(source), self.path(target), follow_symlinks=False)
+                self.owned_info(target, claim)
+            self.sync_dir((self.root / target).parent)
+            if source_exists:
+                self.owned_info(source, claim)
+                self.path(source).unlink()
+                self.sync_dir((self.root / source).parent)
+            if operation == "move":
+                destination_index, destination_key = self.indexed(target)
+                if destination_key in destination_index:
+                    raise ArchiveError(f"archive index collision: {target}")
+                destination_index[destination_key] = index.pop(key)
+        else:
+            raise ArchiveError("invalid archive namespace intent")
+        del self.owner["pending"]
+        self.save()
+
+    def move(self, source: str, target: str) -> None:
+        index, key = self.indexed(source)
+        self.owned_info(source, index[key])
+        destination_index, destination_key = self.indexed(target)
+        if destination_key in destination_index or self.path(target).exists():
+            raise ArchiveError(f"archive promotion collision: {target}")
+        self.owner["pending"] = {"operation": "move", "source": source, "target": target}
+        self.save()
+        self.recover()
+
     def create(self, relative: str, claim: dict[str, Any]) -> None:
-        descriptor = os.open(self.path(relative), os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        # No evidence is copied until this empty staged inode is durably claimed.
+        # Death before save can strand an empty stage, never an ambiguous .jsonl.
+        stage = str(Path(relative).with_name(f".archive-create-{uuid4().hex}.tmp"))
+        descriptor = os.open(self.path(stage), os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             info = os.fstat(descriptor)
             claim.update(device=info.st_dev, inode=info.st_ino, bytes=0)
             os.fsync(descriptor)
-            self.sync_dir((self.root / relative).parent)
+            self.sync_dir((self.root / stage).parent)
+            self.owner["pending"] = {"operation": "create", "source": stage, "target": relative}
             self.save()
+            self.recover()
         finally:
             os.close(descriptor)
 
@@ -513,17 +604,71 @@ class _Archive:
             if not claim.get("first_record_sha256") and identity["first_record_sha256"]:
                 stamp = (identity["interval"] or _date(claim["first_seen_at"])).strftime("%Y%m%dT%H%M%S%fZ")
                 promoted = f"{stream}/{stamp}-{identity['first_record_sha256']}.jsonl"
-                if self.path(promoted).exists():
-                    raise ArchiveError(f"archive promotion collision: {promoted}")
-                os.rename(self.path(match), self.path(promoted))
-                self.sync_dir(self.root / stream)
-                segments[promoted] = segments.pop(match)
+                if promoted != match:
+                    self.move(match, promoted)
                 self.seen_segments.discard(match)
                 self.seen_segments.add(promoted)
                 claim.update({key: value for key, value in identity.items() if key != "interval"})
                 metadata_changed = True
             if metadata_changed:
                 self.save()
+
+    def incident_manifest(self, name: str, manifest: dict[str, Any], claim: dict[str, Any],
+                          received: dict[str, int], *, sealed: bool = False,
+                          complete: bool = False) -> bytes:
+        """Expose every captured file through the native analyzer's manifest.
+
+        The exact producer document remains source-manifest.json. This document
+        describes local custody, not a rewritten claim of producer completeness.
+        """
+        root = f"incidents/{name}"
+        references = {item["path"]: item for item in manifest["files"]}
+        entries = []
+        triggers = 0
+        for relative, file_claim in sorted(claim["files"].items()):
+            size, digest = self.file_hash(f"{root}/{relative}", file_claim)
+            if file_claim.get("summary_sha256") != digest:
+                count = 0
+                with LocalSource(self.root).open(f"{root}/{relative}") as opened:
+                    while line := opened.stream.readline(_METADATA_LIMIT + 1):
+                        if len(line) > _METADATA_LIMIT:
+                            while line and not line.endswith(b"\n"):
+                                line = opened.stream.readline(_METADATA_LIMIT + 1)
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except (ValueError, UnicodeError):
+                            continue
+                        count += isinstance(row, dict) and row.get("kind") == "incident_trigger"
+                file_claim.update(summary_sha256=digest, trigger_count=count)
+            triggers += file_claim["trigger_count"]
+            file_claim.update(bytes=size, sha256=digest, source_available=relative in received)
+            entry = dict(references.get(relative, {}))
+            entry.update(path=relative, kind=relative.split("/")[0], bytes=size,
+                         sha256=digest if sealed else None,
+                         retained=True, finalized=sealed, source_available=relative in received)
+            entries.append(entry)
+        for relative, metadata in references.items():
+            if relative not in claim["files"]:
+                entry = dict(metadata)
+                entry.update(kind=relative.split("/")[0], retained=False, source_available=relative in received)
+                entries.append(entry)
+        document = dict(manifest)
+        document.update(files=entries, trigger_count=triggers,
+                        trigger_files=[item["path"] for item in entries if item["kind"] == "triggers"],
+                        complete=complete if sealed else False)
+        document["archive_provenance"] = {
+            "schema": "eg4_archive_manifest.v1", "source_manifest": "source-manifest.json",
+            "source_manifest_sha256": claim["manifest_sha256"],
+            "source_state": manifest["state"], "source_complete": manifest.get("complete") is True,
+            "source_trigger_count": manifest.get("trigger_count"),
+            "trigger_summaries_origin": "source_manifest", "state": "sealed" if sealed else "moving",
+            "unlisted_captured_files": sorted(set(claim["files"]) - set(references)),
+        }
+        payload = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        self.atomic(f"{root}/manifest.json", payload)
+        claim["archive_manifest_sha256"] = hashlib.sha256(payload).hexdigest()
+        return payload
 
     def receipt(self, name: str, claim: dict[str, Any], *, error: str | None = None) -> None:
         if claim.get("sealed"):
@@ -534,8 +679,19 @@ class _Archive:
                     "source_state": claim.get("source_state"), "source_complete": claim.get("source_complete", False),
                     "received_complete": False, "source_available": error != "source_missing",
                     "received_at": _iso(self.now), "manifest_sha256": claim.get("manifest_sha256"),
+                    "archive_manifest_sha256": claim.get("archive_manifest_sha256"),
                     "files": claim["files"], "error": error[:4096] if error else None}
         self.json(f"incidents/{name}/archive-receipt.json", document)
+
+    @staticmethod
+    def incident_matches(source: Source, relative: str, claim: dict[str, Any],
+                         identity: dict[str, Any]) -> bool:
+        first = claim.get("first_record_sha256")
+        if first is not None:
+            return first == identity["first_record_sha256"]
+        with source.open(relative) as opened:
+            return (claim["anchor_bytes"] <= opened.size
+                    and _prefix_hash(opened, claim["anchor_bytes"]) == claim["anchor_sha256"])
 
     def incident(self, source: Source, name: str) -> None:
         incidents = self.owner["incidents"]
@@ -594,29 +750,16 @@ class _Archive:
             files = claim["files"]
             # A rotated source prefix moves to its native final basename first.
             for relative, identity in sorted(inventory.items(), key=lambda item: item[0].endswith("/local-dongle.jsonl")):
-                if relative in files:
-                    existing = files[relative]
-                    same = (existing.get("first_record_sha256") == identity["first_record_sha256"]
-                            and identity["first_record_sha256"] is not None)
-                    if same or not existing.get("first_record_sha256"):
-                        continue
+                if relative in files and self.incident_matches(source, f"{root}/{relative}", files[relative], identity):
+                    continue
                 matching = next((old for old, previous in files.items()
-                                 if previous.get("first_record_sha256")
-                                 and previous["first_record_sha256"] == identity["first_record_sha256"]), None)
+                                 if old.split("/")[0] == relative.split("/")[0]
+                                 and self.incident_matches(source, f"{root}/{relative}", previous, identity)), None)
                 if relative in files:
-                    old_claim = files.pop(relative)
-                    self.owned_info(f"{root}/{relative}", old_claim)
                     preserved = f"{relative.split('/')[0]}/received-{uuid4().hex}.jsonl"
-                    os.rename(self.path(f"{root}/{relative}"), self.path(f"{root}/{preserved}"))
-                    files[preserved] = old_claim
-                    self.sync_dir((self.root / root / relative).parent)
+                    self.move(f"{root}/{relative}", f"{root}/{preserved}")
                 if matching is not None:
-                    old_claim = files.pop(matching)
-                    self.owned_info(f"{root}/{matching}", old_claim)
-                    os.rename(self.path(f"{root}/{matching}"), self.path(f"{root}/{relative}"))
-                    files[relative] = old_claim
-                    self.sync_dir((self.root / root / relative).parent)
-                self.save()
+                    self.move(f"{root}/{matching}", f"{root}/{relative}")
             received = {}
             for relative, identity in inventory.items():
                 full = f"{root}/{relative}"
@@ -629,7 +772,8 @@ class _Archive:
                 file_claim.update({key: value for key, value in identity.items() if key != "interval"})
                 file_claim.pop("sha256", None)
                 received[relative] = size
-            self.atomic(f"{root}/manifest.json", payload)
+            self.atomic(f"{root}/source-manifest.json", payload)
+            self.incident_manifest(name, manifest, claim, received)
             self.save()
             if manifest["state"] == "open":
                 self.receipt(name, claim)
@@ -674,16 +818,24 @@ class _Archive:
             _, after = _source_metadata(source, f"{root}/manifest.json")
             if after != payload:
                 raise ArchiveError("incident manifest changed while sealing")
+            _, local_source_manifest = _source_metadata(LocalSource(self.root), f"{root}/source-manifest.json")
+            if local_source_manifest != payload:
+                raise ArchiveError("received source incident manifest hash mismatch")
+            received_complete = (manifest.get("complete") is True and bool(references)
+                                 and set(files) == set(references)
+                                 and all(item.get("retained") is True for item in references.values()))
+            archive_payload = self.incident_manifest(name, manifest, claim, received,
+                                                     sealed=True, complete=received_complete)
             _, local_manifest = _source_metadata(LocalSource(self.root), f"{root}/manifest.json")
-            if local_manifest != payload:
-                raise ArchiveError("received incident manifest hash mismatch")
+            if local_manifest != archive_payload:
+                raise ArchiveError("received archive incident manifest hash mismatch")
             receipt = {"schema": "eg4_archive_incident.v1", "entry_id": self.entry_id,
                        "incident_id": claim["incident_id"], "state": "sealed", "custody_verified": True,
                        "source_state": manifest["state"], "source_complete": manifest.get("complete") is True,
-                       "received_complete": (manifest.get("complete") is True and bool(references)
-                                             and all(item.get("retained") is True for item in references.values())),
+                       "received_complete": received_complete,
                        "source_available": True, "received_at": _iso(self.now),
-                       "manifest_sha256": claim["manifest_sha256"], "files": files, "error": None}
+                       "manifest_sha256": claim["manifest_sha256"],
+                       "archive_manifest_sha256": claim["archive_manifest_sha256"], "files": files, "error": None}
             self.json(f"{root}/archive-receipt.json", receipt)
             claim["sealed"] = True
             # The permanent receipt owns finalized custody detail; the live
@@ -712,13 +864,13 @@ class _Archive:
                 continue
             # An inode replacement, even under an owned basename, is never ours to delete.
             self.owned_info(relative, claim)
-            self.path(relative).unlink()
-            self.sync_dir((self.root / relative).parent)
-            claim["pruned"] = True
+            self.owner["pending"] = {"operation": "prune", "target": relative}
+            self.save()
+            self.recover()
             if relative not in self.seen_segments:
                 del self.owner["segments"][relative]
+                self.save()
             self.pruned_files += 1
-            self.save()
 
     def finish(self, error: str | None) -> dict[str, Any]:
         counts = {stream: {"files": 0, "bytes": 0} for stream in _STREAMS}
@@ -793,8 +945,8 @@ def archive_once(source: Source, destination: Path, *, entry_id: str, raw_days: 
                     raise ArchiveError(status["error"])
                 return status
             except Exception as error:
-                archive.finish(str(error))
-                raise ArchiveError(str(error)) from error
+                status = archive.finish(str(error))
+                raise ArchiveError(str(error), status=status) from error
     except ArchiveError:
         raise
     except Exception as error:

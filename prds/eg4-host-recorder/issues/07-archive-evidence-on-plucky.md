@@ -29,7 +29,7 @@ completion_evidence:
 
 ## What to build
 
-One Plucky-side file-only archiver keeps at least one week of raw/controller logs and indefinitely preserves incident snapshots without adding network storage to HA's polling path. Backfill available files, then incrementally copy through the established SFTP route every minute. Keep unchanged sampling and the local outage buffer, original bytes/source identity and honest incomplete coverage.
+One Plucky-side file-only archiver keeps at least one week of raw/controller logs and indefinitely preserves incident snapshots without adding network storage to HA's polling path. Backfill available files, then incrementally copy through the established SFTP route every minute. Keep unchanged sampling, an independent local outage buffer, original bytes/source identity and honest incomplete coverage. The later approved storage-pressure correction reduces only the three HA recorder ceilings after preserving current files and permits one safe Core restart.
 
 ## Acceptance criteria
 
@@ -39,7 +39,7 @@ One Plucky-side file-only archiver keeps at least one week of raw/controller log
 - [ ] Open incidents are honest mutable/incomplete copies. Stable finalized/interrupted manifests, sizes and available final hashes produce preserved snapshots that HA pruning or later source changes cannot overwrite; no automatic snapshot expiry.
 - [ ] Source disconnect/interrupted copy reports failure without destroying previous data or stalling HA. Resume catches up where local spool data still exists, and irrecoverable missing history is not fabricated.
 - [ ] Existing analyzer consumes archived raw/controller and incident directories. Real SFTP/CLI proofs, focused type/lint checks, final full suite and independent review cover consumer-visible errors and retention/custody behavior.
-- [ ] Push and verify coherent committed source before installing an isolated Plucky release and user timer. Confirm actual backfill, incremental scheduled activation, host-key verification, private permissions, custody hashes/status and healthy continued HA capture with no restart or equipment changes.
+- [ ] Push and verify coherent committed source before installing an isolated Plucky release and user timer. Confirm actual backfill, incremental scheduled activation, host-key verification, private permissions, custody hashes/status and continued HA capture with no equipment changes. For the separately approved storage-pressure correction, preserve/hash current files, change only256MiB raw/32MiB journal/128MiB incident ceilings with a private configuration backup and checked Core restart, leave unrelated files untouched and verify recovered persistence with explicit loss/gap evidence.
 - [ ] Publish operator/storage documentation and real deployment evidence outside Git. No keys/raw logs/user work enter commits; the existing credential has broader authority than this read-only client's behavior and is not claimed OS-sandboxed.
 
 ## Blocked by
