@@ -4,13 +4,13 @@ Custom Home Assistant integration for EG4 portal-backed systems, tuned for moder
 
 ## What Changed
 
-### Unreleased — recorder review fixes
+### Recorder review fixes and persistence verification
 
 - Shared raw measurement projection keeps capture evidence separate from decoded publication guards; repeated invalid readings no longer manufacture recovery events.
 - Bounded reclamation-only metadata commits allow owned evidence to be pruned below the free-space reserve without permitting ordinary payload writes there.
 - The standalone analyzer recovers controller/protection and holding-word changes from matching raw transactions, deduplicates their summaries and retains unresolved timing across host-clock regressions.
 
-These fixes are not deployed. The receipt below documents the existing0.2.2 installation.
+The0.2.3 deployment was rolled back after live verification exposed a growing persistence backlog also present in0.2.2. A measured storage-path correction is being verified for0.2.4; prior deployment receipts remain historical evidence.
 
 ### Plucky recorder archive
 

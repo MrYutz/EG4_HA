@@ -216,6 +216,7 @@ class IncidentRecorder:
         self._fs_lock = threading.RLock()
         self._segment_cache: dict[Path, tuple[int, int, str | None, str | None]] = {}
         self._incident_segment_cache: dict[tuple[int, int], tuple[int, int, dict[str, Any]]] = {}
+        self._manifest_cache: dict[Path, tuple[tuple[int, ...], dict[str, Any]]] = {}
         self._recognized_segments: dict[Path, tuple[int, int]] = {}
         self._protected_bundles: set[Path] = set()
         self._inventory_cache: dict[str, list[Path]] | None = None
@@ -919,14 +920,10 @@ class IncidentRecorder:
         """Read a current owned manifest or observe its completed age retirement."""
         with self._fs_lock:
             path = directory / "manifest.json"
-            self._assert_path_sync(path, "incidents")
             try:
-                with path.open(encoding="utf-8") as source:
-                    document = json.load(source)
+                document = self._load_manifest_sync(path, mutable=True)
             except FileNotFoundError:
                 return None
-            if not isinstance(document, dict) or document.get("schema") != _INCIDENT_SCHEMA or document.get("entry_id") != self.entry_id:
-                raise OSError("invalid owned incident manifest")
             return document
 
     async def _barrier(self, kind: str, incident: _Incident | None = None) -> None:
@@ -1319,6 +1316,7 @@ class IncidentRecorder:
             gaps: list[Any] = [{"reason": "new_recorder_session", "session_id": self.session_id, "observed_at": _iso(self._now()), "prebuffer_warmup": True}]
             for path, manifest in self._manifests_sync():
                 if manifest.get("state") == "open":
+                    manifest = deepcopy(manifest)
                     manifest["state"] = "interrupted"
                     manifest["closed_at"] = _iso(self._now())
                     manifest["complete"] = False
@@ -1402,8 +1400,38 @@ class IncidentRecorder:
         coverage["by_role"] = per_role
         self._refresh_retained_context_sync(manifest, directory)
 
+    def _load_manifest_sync(self, path: Path, *, mutable: bool = False) -> dict[str, Any]:
+        """Reuse only unchanged regular owned manifests; copy before mutation."""
+        self._assert_path_sync(path, "incidents")
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("incident manifest is not a regular file")
+        signature = (
+            info.st_dev, info.st_ino, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns,
+        )
+        cached = self._manifest_cache.get(path)
+        if cached is not None and cached[0] == signature:
+            document = cached[1]
+        else:
+            with path.open(encoding="utf-8") as source:
+                opened = os.fstat(source.fileno())
+                if (opened.st_dev, opened.st_ino) != signature[:2]:
+                    raise OSError("incident manifest changed while opening")
+                document = json.load(source)
+                opened = os.fstat(source.fileno())
+                if (
+                    opened.st_dev, opened.st_ino, opened.st_size,
+                    opened.st_mtime_ns, opened.st_ctime_ns,
+                ) != signature:
+                    raise OSError("incident manifest changed while reading")
+            if not isinstance(document, dict) or document.get("schema") != _INCIDENT_SCHEMA or document.get("entry_id") != self.entry_id:
+                raise OSError("invalid owned incident manifest")
+            self._manifest_cache[path] = (signature, document)
+        return deepcopy(document) if mutable else document
+
     def _manifests_sync(self) -> list[tuple[Path, dict[str, Any]]]:
-        """Discover only regular owned manifests, leaving unrelated directories alone."""
+        """Discover owned manifests as read-only cached documents under the lock."""
         result = []
         if not self.incidents_root.exists():
             return result
@@ -1412,15 +1440,9 @@ class IncidentRecorder:
             if not _INCIDENT_DIR.fullmatch(directory.name):
                 continue
             try:
-                self._assert_path_sync(directory)
                 path = directory / "manifest.json"
-                self._assert_path_sync(path)
-                if not directory.is_dir() or not path.is_file():
-                    continue
-                with path.open(encoding="utf-8") as source:
-                    manifest = json.load(source)
-                if isinstance(manifest, dict) and manifest.get("schema") == _INCIDENT_SCHEMA and manifest.get("entry_id") == self.entry_id:
-                    result.append((path, manifest))
+                manifest = self._load_manifest_sync(path)
+                result.append((path, manifest))
             except (OSError, ValueError):
                 continue
         return result
@@ -1520,8 +1542,7 @@ class IncidentRecorder:
         size = info.st_size
         if stream == "incidents" and not retiring:
             manifest_path = path.parent.parent / "manifest.json"
-            with manifest_path.open(encoding="utf-8") as source:
-                manifest = json.load(source)
+            manifest = self._load_manifest_sync(manifest_path, mutable=True)
             relative = path.relative_to(manifest_path.parent).as_posix()
             entries = manifest.setdefault("files", [])
             entry = next((item for item in entries if item["path"] == relative), None)
@@ -1576,24 +1597,36 @@ class IncidentRecorder:
         reserve_size = size if reserve_bytes is None else reserve_bytes
         inventory = self._inventory_sync()
         now = self._now().timestamp()
+        observed: dict[Path, os.stat_result] = {}
+        ordered: dict[str, list[Path]] = {}
+
+        def info(path: Path) -> os.stat_result:
+            """Share live observations only within this locked quota pass."""
+            if path not in observed:
+                observed[path] = path.stat()
+            return observed[path]
 
         def candidates(name: str) -> list[Path]:
             """Order safe data candidates, protecting growing incident basenames."""
-            return sorted(
-                (
-                    path for path in inventory[name]
-                    if path.name != "manifest.json"
-                    and (path != target or name != "incidents")
-                    and not (name == "incidents" and path.name == "local-dongle.jsonl"
-                             and self._open_bundle_sync(path.parent.parent))
-                ),
-                key=lambda path: path.stat().st_mtime,
-            )
+            if name not in ordered:
+                ordered[name] = sorted(
+                    (
+                        path for path in inventory[name]
+                        if path.name != "manifest.json"
+                        and (path != target or name != "incidents")
+                        and not (name == "incidents" and path.name == "local-dongle.jsonl"
+                                 and self._open_bundle_sync(path.parent.parent))
+                    ),
+                    key=lambda path: info(path).st_mtime,
+                )
+            return ordered[name]
 
         def remove(path: Path, name: str, reason: str) -> None:
             """Keep this pass's inventory aligned with actual successful unlinks."""
             self._remove_sync(path, name, reason)
             inventory[name].remove(path)
+            observed.clear()
+            ordered.clear()
 
         for name in ("raw", "journal"):
             for path in candidates(name):
@@ -1602,6 +1635,8 @@ class IncidentRecorder:
                 remove(path, name, "free_space_reserve")
         self._expire_incident_metadata_sync()
         inventory = self._inventory_sync()
+        observed.clear()
+        ordered.clear()
         for path in candidates("incidents"):
             if shutil.disk_usage(self.root).free - reserve_size >= self.limits.min_free_bytes:
                 break
@@ -1609,26 +1644,25 @@ class IncidentRecorder:
         for name, paths in inventory.items():
             maximum, age = self._stream_limit(name)
             for path in candidates(name):
-                if now - path.stat().st_mtime > age:
+                if now - info(path).st_mtime > age:
                     remove(path, name, "retention_age")
             extra = size if name == stream else 0
             if target.name == "manifest.json" and name == stream and target.exists():
-                extra -= target.stat().st_size
+                extra -= info(target).st_size
             for path in candidates(name):
-                if sum(item.stat().st_size for item in paths) + extra <= maximum:
+                if sum(info(item).st_size for item in paths) + extra <= maximum:
                     break
                 remove(path, name, "retention_bytes")
                 if path == target:
                     extra = size if name == stream else 0
-            if sum(item.stat().st_size for item in paths) + extra > maximum:
+            if sum(info(item).st_size for item in paths) + extra > maximum:
                 raise OSError(f"recorder {name} byte ceiling prevents write")
         if shutil.disk_usage(self.root).free - reserve_size < self.limits.min_free_bytes:
             raise OSError("recorder free-space reserve prevents write")
 
     def _open_bundle_sync(self, directory: Path) -> bool:
         """Protect a growing basename while permitting its rotated history."""
-        with (directory / "manifest.json").open(encoding="utf-8") as source:
-            return json.load(source).get("state") == "open"
+        return self._load_manifest_sync(directory / "manifest.json").get("state") == "open"
 
     def _prepare_incident_sync(self, manifest: dict[str, Any], path: Path) -> None:
         """Create the manifest before any segment can become a retention candidate."""
@@ -1711,6 +1745,7 @@ class IncidentRecorder:
             if changed:
                 self._atomic_json_sync(self.root / "recorder.json", owner, reclamation=True)
             path.unlink()
+            self._manifest_cache.pop(path, None)
             self._sync_directory_sync(directory)
             for candidate in (directory / "records", directory / "triggers", directory):
                 if candidate.is_symlink() or not candidate.is_dir():
@@ -1764,8 +1799,7 @@ class IncidentRecorder:
         """Merge monotonic disk loss and enforce budget before atomic replacement."""
         self._assert_path_sync(path, "incidents")
         if path.exists():
-            with path.open(encoding="utf-8") as source:
-                self._merge_losses(manifest, json.load(source))
+            self._merge_losses(manifest, self._load_manifest_sync(path, mutable=True))
         self._refresh_retained_context_sync(manifest, path.parent)
         while True:
             payload_size = len((json.dumps(manifest, separators=(",", ":")) + "\n").encode())
@@ -1773,8 +1807,7 @@ class IncidentRecorder:
             # Pruning may grow this bundle's loss metadata. Recalculate until
             # the exact merged payload, not a stale smaller one, fits its budget.
             if path.exists():
-                with path.open(encoding="utf-8") as source:
-                    self._merge_losses(manifest, json.load(source))
+                self._merge_losses(manifest, self._load_manifest_sync(path, mutable=True))
             self._refresh_retained_context_sync(manifest, path.parent)
             updated_size = len((json.dumps(manifest, separators=(",", ":")) + "\n").encode())
             if updated_size == payload_size:
@@ -2052,6 +2085,7 @@ class IncidentRecorder:
             if open_ids is not None:
                 for path, manifest in self._manifests_sync():
                     if manifest.get("state") == "open" and manifest.get("incident_id") not in open_ids:
+                        manifest = deepcopy(manifest)
                         manifest["state"] = "interrupted"
                         manifest["complete"] = False
                         manifest["closed_at"] = _iso(self._now())

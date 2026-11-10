@@ -1,7 +1,8 @@
 # EG4 Mother of All Data Loggers
 
-This branch includes **unreleased recorder review fixes**. It does not change the
-installation documented in the [0.2.2 deployment receipt](host-recorder-deployment-2026-11-10.md).
+The0.2.3 deployment was rolled back after a growing persistence backlog was observed
+on both old and new code. A storage-path correction is being verified for0.2.4.
+The [0.2.2 receipt](host-recorder-deployment-2026-11-10.md) remains historical evidence.
 
 ## Implementation status
 
