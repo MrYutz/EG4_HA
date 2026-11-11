@@ -93,6 +93,79 @@ already-pending one-second save request. Transfer-change evidence retains the
 previous/current inferred states and explicitly marks intervening unknown
 coverage; the initial observation establishes a baseline, not a physical edge.
 
+### GridBOSS fast lane
+
+Deployed in 0.2.6 on 2026-11-11
+([receipt](host-recorder-fast-lane-deployment-2026-11-11.md)). It has not yet
+run with a generator present. It answers one need from the generator investigation: several GridBOSS decision
+inputs change for half a second to two seconds, shorter than the normal
+four-second GridBOSS round.
+
+- **What it reads.** Input 568 × 21 (`LOCAL_GRIDBOSS_FAST_BLOCK`): fast flags
+  568/569, selector 572, received control 577, packed status 578/579, battery
+  580/581, request state 585–587, warm-up 588. It is a sub-range of the
+  existing 500 × 100 block, read-only, function 04.
+- **How.** While the lane is active the GridBOSS connection is held open, so
+  reads skip the connect and greeting-frame wait. Fast reads are slotted
+  between the profile reads: one between the two primary blocks, then
+  `gridboss_fast_reads` (default 2) after the primary, the dynamic block and
+  any maintenance block. Any failed read closes the connection; the next read
+  starts from a new connection exactly as before. After one failed fast read
+  the lane rests until the next round.
+- **When.** Option `local_gridboss_fast_mode`: `generator` (default) runs the
+  lane only while the last primary read shows generator voltage, plus a
+  120-second hold; `always`; `off`. With the lane inactive the transport and
+  the request sequence are unchanged.
+- **Evidence.** Each fast read is an ordinary raw `transaction` record with
+  `"lane": "fast"` and `"connection": "held"` (or `"new"`), under its own
+  acquisition id. It is not counted in a round's `transaction_ids`, errors or
+  profile health. Every transaction record now carries `connection`.
+- **Health.** `Roles.gridboss.FastLane`: mode, active, samples, failures,
+  discrete changes, median and maximum spacing, last sample age. Health is
+  summarised at most every 30 seconds.
+- **Expected cadence** (from the live test of 2026-11-11, recorder paused):
+  about 0.5 s per GridBOSS read on a held connection, so fast samples land
+  0.5–1.0 s apart and a GridBOSS round takes about 5.5 s instead of 4.
+- **Known blind spot.** The dongle periodically reads the device itself
+  (input 0–380 in three blocks) and does not answer local requests meanwhile;
+  one such stall lasted 10.5 s in a 60-second test.
+
+Tests: `tests/test_gridboss_fast_lane.py`. Live evidence:
+`investigations/2026-11-08-firmware-reverse-engineering/fast-poll-test/`.
+
+### Idle cadence
+
+Deployed in 0.2.6 on 2026-11-11 with the fast lane
+([receipt](host-recorder-fast-lane-deployment-2026-11-11.md)). While the GridBOSS shows no generator,
+every role reads one round per `local_trace_idle_interval` (default 30 s;
+0 keeps the full rate). When generator voltage appears the recorder returns to
+the full rate and, in `generator` mode, starts the fast lane.
+
+- **Decision.** Generator presence comes from the last completed GridBOSS
+  primary read (`generator_available`). It stays "present" for 120 s after the
+  voltage disappears. If no GridBOSS read can tell (no GridBOSS role, or its
+  primary read is failing), the recorder does **not** slow down.
+- **Switching.** The GridBOSS round that first sees the generator starts the
+  fast lane in that same round. Other roles wake from an idle wait within half
+  a second. Worst case the generator is noticed one idle interval after it
+  starts.
+- **Freshness.** A sample read at the idle cadence stays current for
+  `2 × idle interval + 15 s` (75 s at the default) instead of 15 s; a sample
+  read at the full rate keeps the 15 s limit. A failed primary read still
+  marks the role unavailable at once.
+- **Slow blocks.** An idle round may read up to four due maintenance blocks
+  instead of one, so the five-second blocks (GridBOSS holding 4500, inverter
+  battery block) are not starved by the five-minute settings blocks.
+- **Records.** Each acquisition record carries `cadence` (`idle` or `active`)
+  and `target_interval_seconds`; idle rounds list every block they read in
+  `maintenance_attempted_all`. The analyzer no longer reports a round read at
+  its own slower target as an acquisition gap.
+- **Health.** `Cadence`: mode, both intervals, generator presence and each
+  role's current freshness limit.
+- **What is given up while idle.** Home Assistant values update every 30 s,
+  and anything shorter than that with the generator off (a utility dropout, a
+  transfer to battery) is seen at 30-second resolution.
+
 ### Audited register inventory
 
 `custom_components/eg4_monitor/register_catalog.py` is the shared source for

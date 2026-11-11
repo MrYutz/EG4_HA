@@ -465,7 +465,13 @@ class RoleSummary:
             if start is not None and previous_end is not None:
                 gap = (start - previous_end).total_seconds()
                 self.numbers["uncovered_s"].add(gap if gap > 0 else None)
-                if gap > self.gap_seconds:
+                # A round read at a deliberate slower cadence is not a gap.
+                target = row.get("target_interval_seconds")
+                allowed = max(
+                    self.gap_seconds,
+                    1.5 * target if isinstance(target, (int, float)) and not isinstance(target, bool) else 0.0,
+                )
+                if gap > allowed:
                     self.acquisition_gaps += 1
                     _event(
                         "acquisition_gap", row, observation_gap_s=gap,

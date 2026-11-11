@@ -32,6 +32,11 @@ GRIDBOSS_CURRENT_INTERPRETATION = (
 )
 LOCAL_GRIDBOSS_PRIMARY_BLOCKS = ((4, 0, 40), (4, 120, 12))
 LOCAL_GRIDBOSS_DYNAMIC_BLOCKS = ((4, 500, 100),)
+# Optional short block read between the others while the recorder's GridBOSS
+# fast lane is active: fast flags 568/569, selector 572, received control 577,
+# packed status 578/579, battery 580/581, request state 585..587, warm-up 588.
+# It is a sub-range of the dynamic 500/100 block, not a new register surface.
+LOCAL_GRIDBOSS_FAST_BLOCK = (4, 568, 21)
 LOCAL_INVERTER_MAINTENANCE = (
     (4, 80, 40, None),
     (3, 110, 125, 60.0),
@@ -127,6 +132,7 @@ def capture_profile(role: str) -> dict:
         "primary": [list(shape) for shape in primary],
         "dynamic": [list(shape) for shape in dynamic],
         "maintenance": [list(shape) for shape in maintenance],
+        "fast": [list(LOCAL_GRIDBOSS_FAST_BLOCK)] if family == "gridboss" else [],
         "qualification": "reference_only; exact new shapes unqualified on live0.2.4",
         "request_constraints": [
             "Profiles use the local wrapper; inventory ranges are not request shapes.",

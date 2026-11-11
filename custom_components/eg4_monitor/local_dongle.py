@@ -996,6 +996,12 @@ class EG4LocalDongle:
     A new TCP connection is used for each register range. An unsolicited cached
     frame may arrive after connect. Clients for the configured host/port share
     request serialization; a hard hardware single-client limit is not established.
+
+    While ``keep_open`` is true, a successful read leaves its connection open
+    and the next read reuses it, skipping the connect and greeting-frame wait.
+    Any failed read closes the connection, so the following read starts again
+    from a new connection and a late reply can never be paired with a later
+    request.
     """
 
     def __init__(
@@ -1025,9 +1031,27 @@ class EG4LocalDongle:
         self._capture_context: ContextVar[dict[str, Any] | None] = ContextVar(
             f"eg4_capture_{id(self)}", default=None
         )
+        self.keep_open = False
+        # (reader, writer, dongle serial, inverter serial) of a reusable connection.
+        self._held: tuple[
+            asyncio.StreamReader, asyncio.StreamWriter, str, str
+        ] | None = None
+
+    async def _drop_held(self) -> None:
+        """Close a reusable connection; the caller owns the request lock."""
+        held, self._held = self._held, None
+        if held is not None:
+            held[1].close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(held[1].wait_closed(), timeout=0.5)
+
+    async def async_release(self) -> None:
+        """Close any reusable connection once no read is in flight."""
+        async with self._request_lock:
+            await self._drop_held()
 
     @contextlib.contextmanager
-    def capture(self) -> Iterator[dict[str, Any]]:
+    def capture(self, lane: str | None = None) -> Iterator[dict[str, Any]]:
         """Group public reads, including wait_for child tasks, into one acquisition."""
         acquisition: dict[str, Any] = {
             "acquisition_id": str(uuid4()),
@@ -1035,6 +1059,8 @@ class EG4LocalDongle:
             "successful_transaction_ids": [],
             "failed_transaction_ids": [],
         }
+        if lane is not None:
+            acquisition["lane"] = lane
         token = self._capture_context.set(acquisition)
         try:
             yield acquisition
@@ -1130,49 +1156,64 @@ class EG4LocalDongle:
                 "received_bytes": 0,
             }
             acquisition["transaction_ids"].append(transaction["transaction_id"])
+            if acquisition.get("lane"):
+                transaction["lane"] = acquisition["lane"]
             stage = "lock"
             writer: asyncio.StreamWriter | None = None
             locked = False
             failure: BaseException | None = None
+            reusable: tuple[
+                asyncio.StreamReader, asyncio.StreamWriter, str, str
+            ] | None = None
             try:
                 async with asyncio.timeout_at(deadline):
                     await self._request_lock.acquire()
                     locked = True
-                    stage = "connect"
-                    reader, writer = await asyncio.open_connection(self.host, self.port)
-                    stage = "identity"
-                    while True:
-                        if loop.time() >= deadline:
-                            raise TimeoutError("transaction deadline exhausted during identity")
-                        initial = await _read_frame(
-                            reader, transaction, dongle_serial=None,
-                            inverter_serial=self.inverter_serial,
-                            function=None, register=None, count=None,
-                        )
-                        # Both native A5/A5 history inside translated envelopes
-                        # and other envelope functions may precede identity.
-                        evidence = transaction["frames"][-1]
-                        if evidence["classification"] == "history":
-                            if evidence["validation"]["framing"] != "passed":
-                                raise DongleFrameError("malformed unsolicited history framing")
-                            if evidence["validation"]["crc"] != "passed":
-                                raise DongleFrameError("unsolicited history CRC mismatch")
-                            continue
-                        detected = parse_dongle_frame(
-                            initial, expected_inverter_serial=self.inverter_serial
-                        )
-                        if not detected.dongle_serial or not detected.inverter_serial:
-                            raise DongleFrameError("dongle identity frame has empty serials")
-                        transaction["frames"][-1]["classification"] = "identity"
-                        break
-                    dongle_serial = detected.dongle_serial
-                    inverter_serial = self.inverter_serial or detected.inverter_serial
-                    transaction["observed_dongle_serial"] = dongle_serial
-                    transaction["observed_inverter_serial"] = detected.inverter_serial
-                    if register is None:
-                        self.inverter_serial = detected.inverter_serial
-                        transaction["ok"] = True
-                        return detected, dongle_serial, transaction
+                    held = self._held if self.keep_open and register is not None else None
+                    if held is not None:
+                        # Ownership moves to this attempt: only success re-holds it.
+                        self._held = None
+                        reader, writer, dongle_serial, inverter_serial = held
+                        transaction["connection"] = "held"
+                        transaction["observed_dongle_serial"] = dongle_serial
+                    else:
+                        await self._drop_held()
+                        stage = "connect"
+                        reader, writer = await asyncio.open_connection(self.host, self.port)
+                        transaction["connection"] = "new"
+                        stage = "identity"
+                        while True:
+                            if loop.time() >= deadline:
+                                raise TimeoutError("transaction deadline exhausted during identity")
+                            initial = await _read_frame(
+                                reader, transaction, dongle_serial=None,
+                                inverter_serial=self.inverter_serial,
+                                function=None, register=None, count=None,
+                            )
+                            # Both native A5/A5 history inside translated envelopes
+                            # and other envelope functions may precede identity.
+                            evidence = transaction["frames"][-1]
+                            if evidence["classification"] == "history":
+                                if evidence["validation"]["framing"] != "passed":
+                                    raise DongleFrameError("malformed unsolicited history framing")
+                                if evidence["validation"]["crc"] != "passed":
+                                    raise DongleFrameError("unsolicited history CRC mismatch")
+                                continue
+                            detected = parse_dongle_frame(
+                                initial, expected_inverter_serial=self.inverter_serial
+                            )
+                            if not detected.dongle_serial or not detected.inverter_serial:
+                                raise DongleFrameError("dongle identity frame has empty serials")
+                            transaction["frames"][-1]["classification"] = "identity"
+                            break
+                        dongle_serial = detected.dongle_serial
+                        inverter_serial = self.inverter_serial or detected.inverter_serial
+                        transaction["observed_dongle_serial"] = dongle_serial
+                        transaction["observed_inverter_serial"] = detected.inverter_serial
+                        if register is None:
+                            self.inverter_serial = detected.inverter_serial
+                            transaction["ok"] = True
+                            return detected, dongle_serial, transaction
                     assert count is not None and function is not None
                     stage = "request"
                     request = build_read_packet(
@@ -1210,6 +1251,8 @@ class EG4LocalDongle:
                         transaction["frames"][-1]["classification"] = "matching"
                         self.inverter_serial = parsed.inverter_serial
                         transaction["ok"] = True
+                        if self.keep_open:
+                            reusable = (reader, writer, dongle_serial, inverter_serial)
                         return parsed, dongle_serial, transaction
             except BaseException as err:
                 failure = err
@@ -1225,8 +1268,12 @@ class EG4LocalDongle:
                 acquisition[outcome].append(transaction["transaction_id"])
                 transaction["completed_at"] = datetime.now(UTC).isoformat()
                 transaction["duration_ms"] = (loop.time() - started) * 1000.0
+                # Only a completed, matching read may leave its connection open.
+                keep = failure is None and reusable is not None and self.keep_open
                 try:
-                    if writer is not None:
+                    if keep:
+                        self._held = reusable
+                    elif writer is not None:
                         writer.close()
                     if failure is None:
                         await self._emit(transaction)
@@ -1235,7 +1282,7 @@ class EG4LocalDongle:
                         # while the original CancelledError still propagates.
                         with contextlib.suppress(BaseException):
                             await self._emit(transaction)
-                    if writer is not None:
+                    if writer is not None and not keep:
                         with contextlib.suppress(Exception):
                             await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
                 finally:
@@ -1309,12 +1356,20 @@ class EG4LocalDongle:
 class EG4GridBossDongle(EG4LocalDongle):
     """Read-only client for the GridBOSS input-register telemetry ranges."""
 
-    async def async_read_snapshot(self) -> EG4GridBossTelemetry:
-        """Read source/output power ranges and classify the observed transfer."""
+    async def async_read_snapshot(
+        self, interleave: Callable[[], Awaitable[object]] | None = None,
+    ) -> EG4GridBossTelemetry:
+        """Read source/output power ranges and classify the observed transfer.
+
+        ``interleave`` runs between the two reads so a caller's own short read
+        does not have to wait behind both of them.
+        """
         with self._acquisition():
             input_frame, dongle_serial, input_transaction = await self._read_registers(
                 _GRIDBOSS_REGISTER, _GRIDBOSS_COUNT
             )
+            if interleave is not None:
+                await interleave()
             frequency_frame, _, frequency_transaction = await self._read_registers(
                 _GRIDBOSS_FREQUENCY_REGISTER, _GRIDBOSS_FREQUENCY_COUNT
             )

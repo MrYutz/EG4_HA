@@ -37,6 +37,7 @@ from .local_dongle_trace import (
 from .local_incidents import IncidentRecorder
 from .register_catalog import (
     LOCAL_GRIDBOSS_DYNAMIC_BLOCKS,
+    LOCAL_GRIDBOSS_FAST_BLOCK,
     LOCAL_GRIDBOSS_MAINTENANCE,
     LOCAL_GRIDBOSS_PRIMARY_BLOCKS,
     LOCAL_INVERTER_DYNAMIC_BLOCKS,
@@ -48,6 +49,12 @@ from .register_catalog import (
 
 Shape = tuple[int, int, int]
 _LOGGER = logging.getLogger(__name__)
+FAST_MODES = ("off", "generator", "always")
+# Words of the fast block whose change marks a controller decision input, as
+# offsets from register 568. Analog words (573, 580..582) are left out.
+_FAST_DISCRETE = (0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20)
+# Most due maintenance blocks one idle round may read.
+_IDLE_MAINTENANCE = 4
 
 
 def _age(source: dict[str, Any] | None, now: datetime) -> float | None:
@@ -108,6 +115,19 @@ class _Role:
     source_sequence: int | None = None
     last_transfer_state: str | None = None
     transfer_unknown: bool = False
+    # Freshness limit of the current primary sample, set by the cadence it was read under.
+    sample_max_age: float = 15.0
+    # Optional short block read between the others on a held-open connection.
+    fast: Shape | None = None
+    fast_active: bool = False
+    fast_suspended: bool = False
+    fast_samples: int = 0
+    fast_failures: int = 0
+    fast_changes: int = 0
+    fast_last: dict[str, Any] | None = None
+    fast_last_error: str | None = None
+    fast_completed: float | None = None
+    fast_spacing: deque[float] = field(default_factory=lambda: deque(maxlen=240))
 
 
 class EG4LocalRecorder:
@@ -132,11 +152,28 @@ class EG4LocalRecorder:
         build_id: str = "unknown",
         session_id: str | None = None,
         clock: Callable[[], float] = time.monotonic,
+        gridboss_fast_mode: str = "off",
+        gridboss_fast_reads: int = 2,
+        gridboss_fast_timeout: float = 1.5,
+        gridboss_fast_hold: float = 120.0,
+        idle_interval: float | None = None,
     ) -> None:
         """Bind independent role owners and their shared evidence consumer."""
+        if gridboss_fast_mode not in FAST_MODES:
+            raise ValueError(f"Unsupported GridBOSS fast mode: {gridboss_fast_mode}")
+        self.fast_mode = gridboss_fast_mode
+        self.fast_reads = max(1, int(gridboss_fast_reads))
+        self.fast_timeout = max(0.05, float(gridboss_fast_timeout))
+        self.fast_hold = max(0.0, float(gridboss_fast_hold))
         self.interval = max(0.001, float(interval))
         self.bms_interval = max(0.001, float(bms_interval))
         self.max_age = max(15.0, self.interval * 5.0)
+        # Slower cadence used only while the GridBOSS shows no generator.
+        self.idle_interval = (
+            None if idle_interval is None or float(idle_interval) <= self.interval
+            else float(idle_interval)
+        )
+        self._generator_until = 0.0
         self.writer = writer
         self.journal = journal
         self.incidents = incidents
@@ -174,6 +211,8 @@ class EG4LocalRecorder:
                 dynamic=LOCAL_GRIDBOSS_DYNAMIC_BLOCKS if gridboss else LOCAL_INVERTER_DYNAMIC_BLOCKS,
                 periods=periods,
                 due=dict.fromkeys(periods, self._clock()),
+                fast=LOCAL_GRIDBOSS_FAST_BLOCK if gridboss and self.fast_mode != "off" else None,
+                sample_max_age=self.max_age,
             )
             device.role = role
             device.session_id = self.session_id
@@ -243,6 +282,12 @@ class EG4LocalRecorder:
             self.journal.set_observation_callback(None)
         for state in self._roles.values():
             state.primary_available = False
+            state.fast_active = False
+            state.device.keep_open = False
+            try:
+                await state.device.async_release()
+            except Exception as err:
+                self._warn("connection release", f"{type(err).__name__}: {err}")
             state.device.evidence_sink = None
         self._health_cache = None
         if self._started:
@@ -305,6 +350,7 @@ class EG4LocalRecorder:
         return (
             raw["State"], journal["State"], journal.get("ContinuityBroken"),
             incident_signature, roles,
+            self._idle(), tuple(state.fast_active for state in self._roles.values()),
         )
 
     def _signal_health(self) -> None:
@@ -397,7 +443,9 @@ class EG4LocalRecorder:
         evidence["build_id"] = self.build_id
         evidence["register_map_revision"] = REGISTER_MAP_REVISION
         state = self._roles.get(evidence["role"])
-        if state is not None and evidence.get("kind") == "transaction":
+        if state is not None and evidence.get("kind") == "transaction" and evidence.get("lane") == "fast":
+            self._fast_observed(state, evidence)
+        elif state is not None and evidence.get("kind") == "transaction":
             request = evidence["request"]
             shape = (request["function"], request["register"], request["count"])
             if shape in (*state.primary, *state.dynamic, *state.periods):
@@ -429,6 +477,118 @@ class EG4LocalRecorder:
                         state.semantic_rejections.discard(shape)
                     break
         await self._write(evidence)
+
+    def _fast_observed(self, state: _Role, evidence: dict[str, Any]) -> None:
+        """Keep fast-lane cadence and change counts apart from profile blocks."""
+        if not evidence["ok"]:
+            return
+        matched = next(
+            (frame for frame in reversed(evidence["frames"])
+             if frame.get("classification") == "matching"),
+            {},
+        )
+        values = matched.get("values")
+        completed = time.monotonic()
+        if state.fast_completed is not None:
+            state.fast_spacing.append(max(0.0, completed - state.fast_completed))
+        state.fast_completed = completed
+        previous = (state.fast_last or {}).get("values")
+        if values and previous and len(values) == len(previous) and any(
+            values[index] != previous[index] for index in _FAST_DISCRETE if index < len(values)
+        ):
+            state.fast_changes += 1
+        state.fast_samples += 1
+        state.fast_last = {
+            "transaction_id": evidence["transaction_id"],
+            "acquired_at": evidence["completed_at"],
+            "connection": evidence.get("connection"),
+            "values": values,
+        }
+
+    def _generator_state(self) -> bool | None:
+        """Generator presence from the last GridBOSS primary read.
+
+        True while it is seen and for the hold time afterwards, False once a
+        completed read shows it absent, None when no GridBOSS read can tell.
+        """
+        grid = self._roles.get("gridboss")
+        if grid is None:
+            return None
+        now = self._clock()
+        known = grid.primary_available and isinstance(grid.core, EG4GridBossTelemetry)
+        if known and grid.core.generator_available:
+            self._generator_until = now + self.fast_hold
+            return True
+        if now < self._generator_until:
+            return True
+        return False if known else None
+
+    def _idle(self) -> bool:
+        """Slow down only on positive evidence that no generator is present."""
+        return (
+            self.idle_interval is not None and not self._closed
+            and self._generator_state() is False
+        )
+
+    def _target_interval(self) -> float:
+        """Return the round spacing the current cadence asks for."""
+        return self.idle_interval if self._idle() and self.idle_interval else self.interval
+
+    def _age_limit(self, target: float) -> float:
+        """Allow a sample read at the idle cadence to stay current between rounds."""
+        return self.max_age if target <= self.interval else max(self.max_age, target * 2.0 + 15.0)
+
+    async def _pause(self, started: float) -> None:
+        """Wait out the cadence; an idle wait ends as soon as capture goes active."""
+        while not self._closed:
+            remaining = self._target_interval() - (time.monotonic() - started)
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, 0.5))
+
+    def _fast_wanted(self, state: _Role) -> bool:
+        """Decide from the last completed primary read whether to run the lane."""
+        if state.fast is None or self._closed:
+            return False
+        return self.fast_mode == "always" or self._generator_state() is True
+
+    async def _set_fast(self, state: _Role, wanted: bool) -> None:
+        """Hold the connection open only while the fast lane is running."""
+        if wanted == state.fast_active:
+            return
+        state.fast_active = wanted
+        state.device.keep_open = wanted
+        if not wanted:
+            state.fast_completed = None
+            await state.device.async_release()
+        self._health_cache = None
+        self._signal_health()
+
+    async def _fast(self, state: _Role, reads: int | None = None) -> None:
+        """Read the fast block; a failure never fails the round.
+
+        After one failure the lane rests until the next round, so an unanswered
+        dongle costs at most one short timeout per round.
+        """
+        if not state.fast_active or state.fast is None or state.fast_suspended:
+            return
+        function, register, count = state.fast
+        for _ in range(self.fast_reads if reads is None else reads):
+            if self._closed:
+                return
+            try:
+                # Its own acquisition: profile accounting never sees these reads.
+                with state.device.capture(lane="fast"):
+                    await state.device.async_read_register_block(
+                        register, count, function=function, timeout=self.fast_timeout,
+                    )
+            except Exception as err:
+                state.fast_failures += 1
+                state.fast_suspended = True
+                state.fast_last_error = f"{type(err).__name__}: {err}"
+                self._warn("gridboss fast lane", state.fast_last_error)
+                self._signal_health()
+                return
 
     def _source(self, state: _Role, shapes: tuple[Shape, ...], acquisition_id: str) -> dict[str, Any]:
         """Require successful primary blocks from this exact acquisition."""
@@ -468,7 +628,12 @@ class EG4LocalRecorder:
         """Read dynamic data and publish primary continuity loss immediately."""
         try:
             if role == "gridboss":
-                core = await state.device.async_read_snapshot()
+                if state.fast_active:
+                    core = await state.device.async_read_snapshot(
+                        interleave=lambda: self._fast(state, 1),
+                    )
+                else:
+                    core = await state.device.async_read_snapshot()
                 if not isinstance(core, EG4GridBossTelemetry):
                     raise ValueError("Expected GridBOSS telemetry")
             else:
@@ -488,6 +653,7 @@ class EG4LocalRecorder:
         else:
             state.core, state.source = core, source
             state.source_sequence = state.sequence
+            state.sample_max_age = self._age_limit(record["target_interval_seconds"])
             state.primary_available = True
             state.error = None
             state.last_success = source["acquired_at"]
@@ -550,21 +716,37 @@ class EG4LocalRecorder:
                     "sample_started_at": state.last_attempt,
                     "sample_gap_seconds": gap, "ok": False,
                 }
+                idle = self._idle()
+                record["cadence"] = "idle" if idle else "active"
+                record["target_interval_seconds"] = self._target_interval()
                 cancelled = False
                 try:
+                    state.fast_suspended = False
+                    await self._set_fast(state, self._fast_wanted(state))
                     await self._primary(role, state, record)
+                    if role == "gridboss":
+                        # This round's own read may have just found or lost the
+                        # generator: act on it now, not one idle wait later.
+                        await self._set_fast(state, self._fast_wanted(state))
+                        idle = self._idle()
+                    await self._fast(state)
                     for shape in state.dynamic:
                         await self._block(state, shape)
+                        await self._fast(state)
                     due = [shape for shape, deadline in state.due.items() if deadline <= self._clock()]
-                    if due:
-                        shape = min(due, key=state.due.__getitem__)
+                    # One block per round at full rate. An idle round has time
+                    # for more, so short-period blocks are not starved by it.
+                    for shape in sorted(due, key=state.due.__getitem__)[:_IDLE_MAINTENANCE if idle else 1]:
                         # Schedule from actual attempt, including failures. Ties
                         # retain profile order; startup shapes cannot starve.
                         state.due[shape] = self._clock() + state.periods[shape]
                         await self._block(
                             state, shape, bms=role != "gridboss" and shape == (4, 80, 40),
                         )
-                        record["maintenance_attempted"] = _key(shape)
+                        record.setdefault("maintenance_attempted", _key(shape))
+                        if idle:
+                            record.setdefault("maintenance_attempted_all", []).append(_key(shape))
+                        await self._fast(state)
                 except asyncio.CancelledError:
                     cancelled = True
                     state.primary_available = False
@@ -583,7 +765,7 @@ class EG4LocalRecorder:
                         await self._notify(state, record)
                 if cancelled:
                     raise asyncio.CancelledError
-            await asyncio.sleep(max(0.0, self.interval - (time.monotonic() - started)))
+            await self._pause(started)
 
     def _context(self, state: _Role, shape: Shape, now: datetime) -> dict[str, Any]:
         """Keep latest-attempt failure distinct from aged last-success context."""
@@ -624,7 +806,7 @@ class EG4LocalRecorder:
         return {
             **self._context(state, shape, now),
             "source": deepcopy(state.bms_source), "age_seconds": age,
-            "available": state.bms_available and age is not None and age <= self.max_age,
+            "available": state.bms_available and age is not None and age <= state.sample_max_age,
         }
 
     def _finish(self, state: _Role, record: dict[str, Any]) -> None:
@@ -743,7 +925,7 @@ class EG4LocalRecorder:
             )
             diagnostics = [block for shape, block in state.blocks.items() if shape in state.dynamic]
             primary_age = _age(state.source, now)
-            healthy = (state.primary_available and primary_age is not None and primary_age <= self.max_age
+            healthy = (state.primary_available and primary_age is not None and primary_age <= state.sample_max_age
                        and not state.callback_error and not missing and not failed
                        and len(diagnostics) == len(state.dynamic) and all(block["ok"] for block in diagnostics))
             roles[role] = {
@@ -761,6 +943,19 @@ class EG4LocalRecorder:
                 "MissingProfileBlocks": missing, "FailedProfileBlocks": failed,
                 "Maintenance": maintenance,
             }
+            if state.fast is not None:
+                roles[role]["FastLane"] = {
+                    "Mode": self.fast_mode, "Shape": _key(state.fast),
+                    "Active": state.fast_active, "ReadsPerSlot": self.fast_reads,
+                    "Samples": state.fast_samples, "Failures": state.fast_failures,
+                    "DiscreteChanges": state.fast_changes,
+                    "MedianSpacingSeconds": median(state.fast_spacing) if state.fast_spacing else None,
+                    "MaxSpacingSeconds": max(state.fast_spacing) if state.fast_spacing else None,
+                    "SpacingSamples": len(state.fast_spacing),
+                    "LastSampleAgeSeconds": _age(state.fast_last, now),
+                    "LastConnection": (state.fast_last or {}).get("connection"),
+                    "LastError": state.fast_last_error,
+                }
         raw, journal = self._persistence()
         incidents = (
             {**self.incidents.health, "Enabled": True} if self.incidents is not None
@@ -787,6 +982,16 @@ class EG4LocalRecorder:
             "RawPersistence": raw, "JournalPersistence": journal,
             "Incidents": incidents,
         }
+        if self.idle_interval is not None:
+            self._health_cache["Cadence"] = {
+                "Mode": "idle" if self._idle() else "active",
+                "ActiveIntervalSeconds": self.interval,
+                "IdleIntervalSeconds": self.idle_interval,
+                "GeneratorPresent": self._generator_state(),
+                "SampleMaxAgesSeconds": {
+                    role: state.sample_max_age for role, state in sorted(self._roles.items())
+                },
+            }
         self._health_at = clock
         return deepcopy(self._health_cache)
 
@@ -804,7 +1009,9 @@ class EG4LocalRecorder:
             source = state.source if state else None
             age = _age(source, now)
             core = state.core if state else None
-            available = bool(state and state.primary_available and age is not None and age <= self.max_age)
+            available = bool(
+                state and state.primary_available and age is not None and age <= state.sample_max_age
+            )
             primary_available[role] = bool(state and state.primary_available)
             if age is not None:
                 ages[role] = age
@@ -827,7 +1034,7 @@ class EG4LocalRecorder:
         grid_source = grid_state.source if grid_state else None
         grid_age = _age(grid_source, now)
         gridboss = grid_state.core if (grid_state and grid_state.primary_available
-            and grid_age is not None and grid_age <= self.max_age
+            and grid_age is not None and grid_age <= grid_state.sample_max_age
             and isinstance(grid_state.core, EG4GridBossTelemetry)) else None
         charge_available = bool(role_context) and all(context["available"] for context in role_context.values())
         process_charge = bool(self._roles.keys() - {"gridboss"})
@@ -859,7 +1066,10 @@ class EG4LocalRecorder:
                 "Enabled": self.writer is not None, "IntervalSeconds": self.interval,
                 "BMSIntervalSeconds": self.bms_interval, "MaxAgeSeconds": self.max_age,
                 "SampleAgesSeconds": ages,
-                "StaleRoles": sorted(role for role, age in ages.items() if age > self.max_age),
+                "StaleRoles": sorted(
+                    role for role, age in ages.items()
+                    if age > self._roles[role].sample_max_age
+                ),
                 "MissingRoles": sorted(self._configured - sources.keys()),
                 "AvailableRoles": sorted(inverters), "PrimaryAvailable": primary_available,
                 "IsStale": process_charge and not self._configured <= inverters.keys(),

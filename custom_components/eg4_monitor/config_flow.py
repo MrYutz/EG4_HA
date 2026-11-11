@@ -45,11 +45,13 @@ from .const import (
     CONF_LOAD_SHED_RUNTIME_HOURS,
     CONF_LOCAL_AUTO_DISCOVERY,
     CONF_LOCAL_DONGLE_PORT,
+    CONF_LOCAL_GRIDBOSS_FAST_MODE,
     CONF_LOCAL_GRIDBOSS_HOST,
     CONF_LOCAL_MASTER_HOST,
     CONF_LOCAL_SLAVE_HOST,
     CONF_LOCAL_TRACE_BMS_INTERVAL,
     CONF_LOCAL_TRACE_ENABLED,
+    CONF_LOCAL_TRACE_IDLE_INTERVAL,
     CONF_LOCAL_TRACE_INCIDENT_MAX_BYTES,
     CONF_LOCAL_TRACE_INTERVAL,
     CONF_LOCAL_TRACE_JOURNAL_MAX_BYTES,
@@ -59,11 +61,14 @@ from .const import (
     DEFAULT_BATTERY_DETAIL_INTERVAL,
     DEFAULT_LOCAL_AUTO_DISCOVERY,
     DEFAULT_LOCAL_DONGLE_PORT,
+    DEFAULT_LOCAL_GRIDBOSS_FAST_MODE,
     DEFAULT_LOCAL_GRIDBOSS_HOST,
     DEFAULT_LOCAL_TRACE_BMS_INTERVAL,
     DEFAULT_LOCAL_TRACE_ENABLED,
+    DEFAULT_LOCAL_TRACE_IDLE_INTERVAL,
     DEFAULT_LOCAL_TRACE_INTERVAL,
     DOMAIN,
+    LOCAL_GRIDBOSS_FAST_MODES,
 )
 from .eg4_api import EG4API
 
@@ -328,6 +333,18 @@ class SensorSelectFlow(config_entries.OptionsFlow):
                     CONF_LOCAL_TRACE_BMS_INTERVAL, DEFAULT_LOCAL_TRACE_BMS_INTERVAL
                 ),
             ): vol.All(vol.Coerce(float), vol.Range(min=2, max=300)),
+            vol.Optional(
+                CONF_LOCAL_GRIDBOSS_FAST_MODE,
+                default=self.config_entry.options.get(
+                    CONF_LOCAL_GRIDBOSS_FAST_MODE, DEFAULT_LOCAL_GRIDBOSS_FAST_MODE
+                ),
+            ): vol.In(LOCAL_GRIDBOSS_FAST_MODES),
+            vol.Optional(
+                CONF_LOCAL_TRACE_IDLE_INTERVAL,
+                default=self.config_entry.options.get(
+                    CONF_LOCAL_TRACE_IDLE_INTERVAL, DEFAULT_LOCAL_TRACE_IDLE_INTERVAL
+                ),
+            ): vol.All(vol.Coerce(float), vol.Range(min=0, max=600)),
             vol.Optional(
                 CONF_BATTERY_HIGH_SOC_THRESHOLD,
                 default=self.config_entry.options.get(

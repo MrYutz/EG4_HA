@@ -32,11 +32,13 @@ from .const import (
     CONF_GRIDBOSS_SERIAL,
     CONF_LOCAL_AUTO_DISCOVERY,
     CONF_LOCAL_DONGLE_PORT,
+    CONF_LOCAL_GRIDBOSS_FAST_MODE,
     CONF_LOCAL_GRIDBOSS_HOST,
     CONF_LOCAL_MASTER_HOST,
     CONF_LOCAL_SLAVE_HOST,
     CONF_LOCAL_TRACE_BMS_INTERVAL,
     CONF_LOCAL_TRACE_ENABLED,
+    CONF_LOCAL_TRACE_IDLE_INTERVAL,
     CONF_LOCAL_TRACE_INCIDENT_MAX_BYTES,
     CONF_LOCAL_TRACE_INTERVAL,
     CONF_LOCAL_TRACE_JOURNAL_MAX_BYTES,
@@ -50,11 +52,14 @@ from .const import (
     DEFAULT_LOCAL_DISCOVERY_TIMEOUT,
     DEFAULT_LOCAL_DONGLE_PORT,
     DEFAULT_LOCAL_DONGLE_TIMEOUT,
+    DEFAULT_LOCAL_GRIDBOSS_FAST_MODE,
     DEFAULT_LOCAL_GRIDBOSS_HOST,
     DEFAULT_LOCAL_TRACE_BMS_INTERVAL,
     DEFAULT_LOCAL_TRACE_ENABLED,
+    DEFAULT_LOCAL_TRACE_IDLE_INTERVAL,
     DEFAULT_LOCAL_TRACE_INTERVAL,
     DOMAIN,
+    LOCAL_GRIDBOSS_FAST_MODES,
 )
 from .data_cache import BoundedPayloadCache
 from .eg4_api import (
@@ -1503,6 +1508,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except (TypeError, ValueError):
         local_trace_bms_interval = DEFAULT_LOCAL_TRACE_BMS_INTERVAL
     local_trace_bms_interval = max(2.0, min(local_trace_bms_interval, 300.0))
+    local_gridboss_fast_mode = str(
+        entry.options.get(CONF_LOCAL_GRIDBOSS_FAST_MODE, DEFAULT_LOCAL_GRIDBOSS_FAST_MODE)
+    )
+    if local_gridboss_fast_mode not in LOCAL_GRIDBOSS_FAST_MODES:
+        local_gridboss_fast_mode = DEFAULT_LOCAL_GRIDBOSS_FAST_MODE
+    try:
+        local_trace_idle_interval = float(
+            entry.options.get(
+                CONF_LOCAL_TRACE_IDLE_INTERVAL, DEFAULT_LOCAL_TRACE_IDLE_INTERVAL
+            )
+        )
+    except (TypeError, ValueError):
+        local_trace_idle_interval = DEFAULT_LOCAL_TRACE_IDLE_INTERVAL
+    local_trace_idle_interval = max(0.0, min(local_trace_idle_interval, 600.0))
     gridboss_host = str(
         entry.options.get(CONF_LOCAL_GRIDBOSS_HOST, DEFAULT_LOCAL_GRIDBOSS_HOST) or ""
     ).strip()
@@ -1738,6 +1757,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         bms_interval=local_trace_bms_interval,
         build_id=recorder_build_id,
         session_id=recorder_session_id,
+        gridboss_fast_mode=local_gridboss_fast_mode,
+        idle_interval=local_trace_idle_interval or None,
     )
 
     async def _async_close_local_capture() -> None:
