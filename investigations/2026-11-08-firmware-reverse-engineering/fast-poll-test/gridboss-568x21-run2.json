@@ -1,0 +1,20 @@
+{
+ "summary": {
+  "register": 568,
+  "count": 21,
+  "duration_s": 0.12,
+  "requests": 1,
+  "ok": 0,
+  "errors": [
+   [
+    "closed_by_peer:IncompleteReadError",
+    0.115
+   ]
+  ],
+  "rate_hz": 0.0,
+  "latency_ms": null,
+  "sample_spacing_ms": null,
+  "other_frames_seen": {}
+ },
+ "samples": []
+}

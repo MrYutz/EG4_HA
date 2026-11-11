@@ -1,0 +1,48 @@
+{
+ "schema": "eg4_fast_poll_pause_session.v1",
+ "started_at": "2026-11-11T15:14:25.258+00:00",
+ "entry_id": "01KM5TPJ4PMEGW55RT8W1KY3ZS",
+ "writes_to_controllers": 0,
+ "before_entry": {
+  "entry_id": "01KM5TPJ4PMEGW55RT8W1KY3ZS",
+  "domain": "eg4_monitor",
+  "state": "loaded",
+  "disabled_by": null
+ },
+ "watchdog": {
+  "ready": true,
+  "armed": true,
+  "seconds": 300,
+  "exit_code": 0,
+  "disarmed": true
+ },
+ "disable_requested_at": "2026-11-11T15:14:25.405+00:00",
+ "disable_result": {
+  "success": true,
+  "require_restart": false,
+  "error": null
+ },
+ "paused_entry": {
+  "entry_id": "01KM5TPJ4PMEGW55RT8W1KY3ZS",
+  "domain": "eg4_monitor",
+  "state": "not_loaded",
+  "disabled_by": "user"
+ },
+ "pause_confirmed_at": "2026-11-11T15:16:38.422+00:00",
+ "test_started_at": "2026-11-11T15:16:41.422+00:00",
+ "test_exit_code": 0,
+ "test_finished_at": "2026-11-11T15:18:11.953+00:00",
+ "restore_requested_at": "2026-11-11T15:18:11.953+00:00",
+ "restore_result": {
+  "success": true,
+  "require_restart": false,
+  "error": null
+ },
+ "after_entry": {
+  "entry_id": "01KM5TPJ4PMEGW55RT8W1KY3ZS",
+  "domain": "eg4_monitor",
+  "state": "loaded",
+  "disabled_by": null
+ },
+ "restored_at": "2026-11-11T15:18:42.103+00:00"
+}
