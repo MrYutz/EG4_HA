@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from .const import LOCAL_DONGLE_TRACE_SCHEMA
 from .local_dongle import EG4GridBossTelemetry, EG4LocalTelemetry
+from .register_catalog import GRIDBOSS_CURRENT_INTERPRETATION
 
 DEFAULT_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_MAX_FILES = 8
@@ -94,7 +95,12 @@ def gridboss_to_record(telemetry: EG4GridBossTelemetry) -> dict[str, Any]:
             "ups_l1_power_w": telemetry.ups_l1_power,
             "ups_l2_power_w": telemetry.ups_l2_power,
             "load_power_w": telemetry.load_power,
+            "load_l1_power_w": telemetry.load_l1_power,
+            "load_l2_power_w": telemetry.load_l2_power,
             "phase_lock_frequency_hz": telemetry.phase_lock_frequency,
+        },
+        "interpretation": {
+            "current_a": GRIDBOSS_CURRENT_INTERPRETATION,
         },
         "transfer": {
             "grid_available": telemetry.grid_available,

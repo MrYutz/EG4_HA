@@ -105,6 +105,16 @@ Reuse fresh maintenance reads when schedules coincide. Store changed configurati
 
 Do not start FlexBOSS reads at224 or248. The listed safe-start ranges may include those positions without invoking the exact-start behavior. Never use historical GridBOSS4516, undefined input132–499 or inaccessible engineering1100 as replacements. Proof: [verified read surfaces](../investigations/2026-11-08-firmware-reverse-engineering/direct-session/history-and-read-surfaces.md).
 
+**Deployed 0.2.5 extension:** the canonical profiles now live in
+`register_catalog.py`, including additional slow inventory reads described in
+[the operator guide](mother-of-all-data-loggers.md#audited-register-inventory).
+The table above records the original release scope. The separately authorized
+0.2.5 rollout qualified all 35 exact shapes on the live installation; see the
+[deployment receipt](host-recorder-inventory-deployment-2026-11-10.md).
+That host-recorder authorization does not authorize controller instrumentation.
+The recorder still has one owner, at most one due maintenance read per round,
+unchanged primary shapes, and separate latest-attempt/last-good provenance.
+
 ## R4 — Meaningful journal changes and persistence recovery
 
 Add **FlexBOSS input6 low bits0/1** to discrete signatures: candidate-mapped protection outcomes are redirected there out of the ordinary warning/fault locations. Keep the full raw word as context, without inventing physical meanings. Retain current warnings60/61, faults62/63, limiter/state144/145, both bytes of519 and command counters. Small analog142/143 fluctuations need not all trigger the journal; raw capture retains them.

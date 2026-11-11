@@ -28,6 +28,8 @@ CONF_LOCAL_AUTO_DISCOVERY = "local_auto_discovery"
 CONF_LOCAL_TRACE_ENABLED = "local_trace_enabled"
 CONF_LOCAL_TRACE_INTERVAL = "local_trace_interval"
 CONF_LOCAL_TRACE_BMS_INTERVAL = "local_trace_bms_interval"
+CONF_LOCAL_GRIDBOSS_FAST_MODE = "local_gridboss_fast_mode"
+CONF_LOCAL_TRACE_IDLE_INTERVAL = "local_trace_idle_interval"
 CONF_LOCAL_TRACE_RAW_MAX_BYTES = "local_trace_raw_max_bytes"
 CONF_LOCAL_TRACE_JOURNAL_MAX_BYTES = "local_trace_journal_max_bytes"
 CONF_LOCAL_TRACE_INCIDENT_MAX_BYTES = "local_trace_incident_max_bytes"
@@ -50,25 +52,9 @@ DEFAULT_LOCAL_DISCOVERY_CONCURRENCY = 8
 DEFAULT_LOCAL_TRACE_ENABLED = True
 DEFAULT_LOCAL_TRACE_INTERVAL = 1.0
 DEFAULT_LOCAL_TRACE_BMS_INTERVAL = 5.0
+# "generator": fast lane runs only while the GridBOSS reports generator voltage.
+LOCAL_GRIDBOSS_FAST_MODES = ("off", "generator", "always")
+DEFAULT_LOCAL_GRIDBOSS_FAST_MODE = "generator"
+# Round spacing while the GridBOSS shows no generator; 0 keeps the full rate.
+DEFAULT_LOCAL_TRACE_IDLE_INTERVAL = 30.0
 
-# Read-only, zero-based profiles. The recorder owns scheduling; shared shapes
-# (notably inverter holding110/125) have exactly one maintenance deadline.
-LOCAL_INVERTER_PRIMARY_BLOCKS = ((4, 0, 40),)
-LOCAL_INVERTER_DYNAMIC_BLOCKS = ((4, 40, 40), (4, 120, 26))
-LOCAL_GRIDBOSS_PRIMARY_BLOCKS = ((4, 0, 40), (4, 120, 12))
-LOCAL_GRIDBOSS_DYNAMIC_BLOCKS = ((4, 500, 100),)
-LOCAL_INVERTER_MAINTENANCE = (
-    (4, 80, 40, None),  # Configured BMS interval.
-    (3, 110, 125, 60.0),
-    (3, 0, 20, 300.0),
-    (3, 20, 90, 300.0),
-    (3, 235, 102, 300.0),
-)
-LOCAL_GRIDBOSS_MAINTENANCE = (
-    (3, 4500, 10, 5.0),
-    (3, 0, 20, 300.0),
-    (3, 20, 90, 300.0),
-    (3, 110, 125, 300.0),
-    (3, 235, 88, 300.0),
-    (3, 2000, 108, 300.0),
-)

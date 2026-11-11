@@ -81,7 +81,9 @@
                     "local_dongle_port": "Local EG4 dongle TCP port",
                     "local_trace_enabled": "Enable local dongle trace logging",
                     "local_trace_interval": "Local trace interval (seconds)",
-                    "local_trace_bms_interval": "Local BMS trace interval (seconds)"
+                    "local_trace_bms_interval": "Local BMS trace interval (seconds)",
+                    "local_gridboss_fast_mode": "GridBOSS fast poll (off, generator = only while generator voltage is present, always)",
+                    "local_trace_idle_interval": "Local trace interval while no generator is present (seconds, 0 = always full rate)"
                 }
             }
         }

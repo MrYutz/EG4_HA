@@ -11,10 +11,13 @@ import os
 import stat
 from collections import Counter
 from collections.abc import Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO, TypeGuard
+
+from eg4_trace_coverage import Coverage
 
 MAX_RECORD_BYTES = 4 * 1024 * 1024
 MAX_DIRECTORY_ENTRIES = 16384
@@ -89,6 +92,43 @@ def _rows(path: Path) -> Iterator[dict[str, Any]]:
             if not isinstance(row, dict):
                 raise ValueError(f"{path}:{line_number}: expected a JSON object")
             yield row
+
+
+def _evidence_rows(path: Path) -> Iterator[dict[str, Any]]:
+    """Adapt retained direct-baseline wrappers without inventing transport IDs."""
+    if path.suffix != ".json":
+        yield from _rows(path)
+        return
+    document = _json_document(path)
+    schema = document.get("schema")
+    supported = {
+        "eg4_extended_baseline.v1", "eg4_gridboss_configuration_baseline.v1",
+    }
+    if schema not in supported and not (
+        isinstance(document.get("role"), str) and isinstance(document.get("reads"), list)
+    ):
+        raise ValueError(f"{path}: unsupported baseline document schema: {schema!r}")
+    role = document.get("role")
+    if role is None and schema == "eg4_gridboss_configuration_baseline.v1":
+        role = "gridboss"  # Explicit schema identity, never a filename guess.
+    context = {
+        key: document[key] for key in ("build_id", "session_id", "register_map_revision", "captured_at")
+        if key in document
+    }
+    yield {**context, "kind": "baseline_context", "role": role, "baseline_schema": schema}
+    collections = [_mapping(document.get("initial_q1_readonly")).get("transactions")]
+    collections.extend(
+        document.get(key) for key in ("reads", "blocks", "additional_blocks", "requests")
+    )
+    for blocks in collections:
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            if isinstance(block, dict) and block.get("function") in (3, 4):
+                yield {
+                    **context, **block, "kind": "direct_baseline", "role": role,
+                    "baseline_schema": schema,
+                }
 
 
 def _segment_order(path: Path) -> tuple[bool, str]:
@@ -425,7 +465,13 @@ class RoleSummary:
             if start is not None and previous_end is not None:
                 gap = (start - previous_end).total_seconds()
                 self.numbers["uncovered_s"].add(gap if gap > 0 else None)
-                if gap > self.gap_seconds:
+                # A round read at a deliberate slower cadence is not a gap.
+                target = row.get("target_interval_seconds")
+                allowed = max(
+                    self.gap_seconds,
+                    1.5 * target if isinstance(target, (int, float)) and not isinstance(target, bool) else 0.0,
+                )
+                if gap > allowed:
                     self.acquisition_gaps += 1
                     _event(
                         "acquisition_gap", row, observation_gap_s=gap,
@@ -779,12 +825,16 @@ class Analysis:
     roles: list[str] | None = None
     gap_seconds: float = 5
     summaries: dict[str, RoleSummary] = field(default_factory=dict)
+    coverage: Coverage | None = None
+    summary_identities: dict[str, tuple[Any, Any, str | None]] = field(default_factory=dict)
 
     def consume(self, path: Path) -> int:
         """Analyze a single retained stream without retaining its rows."""
         print(f"source_file={path}")
         triggers = 0
-        for row in _rows(path):
+        for row in _evidence_rows(path):
+            if self.coverage is not None:
+                self.coverage.observe(row, str(path))
             triggers += row.get("kind") == "incident_trigger"
             if row.get("kind") == "incident_context":
                 # Like the manifest's first snapshot, this is all-role context,
@@ -803,10 +853,22 @@ class Analysis:
                     incident_id=row.get("incident_id"),
                 )
                 continue
+            identity = (row.get("build_id"), row.get("session_id"),
+                        None if row.get("session_id") else str(path))
+            if role in self.summaries and self.summary_identities[role] != identity:
+                previous = self.summaries[role]
+                self._report_role(role)
+                self.summaries[role] = RoleSummary(
+                    gap_seconds=self.gap_seconds, previous_session=previous.previous_session,
+                    previous_end=previous.previous_end,
+                )
+                _event("source_identity_change", row, previous_identity=self.summary_identities[role],
+                       current_identity=identity, continuity="unknown")
             if role not in self.summaries:
                 if len(self.summaries) >= MAX_ROLES:
                     raise ValueError(f"{path}: role limit exceeded; analysis incomplete")
                 self.summaries[role] = RoleSummary(gap_seconds=self.gap_seconds)
+            self.summary_identities[role] = identity
             self.summaries[role].observe(row)
         return triggers
 
@@ -819,6 +881,8 @@ class Analysis:
                 "path": str(path), "error": str(error),
                 "continuity": "unknown", "analysis_complete": False,
             }, sort_keys=True))
+            if self.coverage is not None:
+                self.coverage.fact({}, str(path), "input_file_gap", {"path": str(path), "error": str(error)})
             for summary in self.summaries.values():
                 summary._close_status()
                 summary.source_interval = None
@@ -828,7 +892,15 @@ class Analysis:
     def report(self, prefix: str = "") -> None:
         """Finish each independent source group without combining copied evidence."""
         for role in sorted(self.summaries):
-            self.summaries[role].report(prefix + role)
+            self._report_role(role, prefix)
+
+    def _report_role(self, role: str, prefix: str = "") -> None:
+        build, session, anonymous_file = self.summary_identities[role]
+        print("  summary_identity=" + json.dumps({
+            "build_id": build, "session_id": session, "role": role,
+            "anonymous_source_file": anonymous_file, "scope": "contiguous_source_segment",
+        }, sort_keys=True))
+        self.summaries[role].report(prefix + role)
 
 
 def _file_integrity(path: Path, metadata: dict[str, Any]) -> tuple[bool, str]:
@@ -925,9 +997,17 @@ def _incident(root: Path, analysis: Analysis) -> None:
             "incomplete_reasons", "errors", "gaps", "coverage", "trigger_count", "triggers",
         )
     }, sort_keys=True))
+    gap_limits_coverage = _gaps_affect_coverage(manifest)
+    if analysis.coverage is not None:
+        analysis.coverage.metadata({
+            **manifest, "gaps": manifest.get("gaps") if gap_limits_coverage else [],
+        }, str(root / "manifest.json"))
+        if manifest.get("gaps") and not gap_limits_coverage:
+            analysis.coverage.fact(manifest, str(root / "manifest.json"),
+                                   "gaps_outside_captured_coverage", manifest["gaps"])
     if missing_keys:
         print(f"  missing_manifest_fields={json.dumps(missing_keys)}")
-    if _gaps_affect_coverage(manifest):
+    if gap_limits_coverage:
         complete = False
     _configuration(manifest)
     if manifest.get("state") == "closed" and _timestamp(manifest.get("closed_at")) is None:
@@ -1034,65 +1114,85 @@ def _incident(root: Path, analysis: Analysis) -> None:
         complete = False
         print("  missing_or_inconsistent_trigger_file_references")
     print(f"  manifest_verification={'complete' if complete else 'incomplete'}")
+    if not complete and analysis.coverage is not None:
+        analysis.coverage.fact(manifest, str(root / "manifest.json"), "manifest_custody_failure",
+                               {"manifest_verification": "incomplete", "sample_coverage": "independent"})
 
 
-def _analyze_path(path: Path, roles: list[str] | None, gap_seconds: float) -> None:
-    """Dispatch files, recorder roots, individual incidents and historical folders."""
+def _analyze_path(
+    path: Path, roles: list[str] | None, gap_seconds: float, *, registers: bool = False,
+) -> None:
+    """Keep incident custody independent; deduplicate rolling and journal copies."""
     path = _safe_path(path)
-    analysis = Analysis(roles=roles, gap_seconds=gap_seconds)
-    if path.is_file():
-        analysis.consume(path)
-        analysis.report()
-        return
-    if not path.is_dir():
-        raise ValueError(f"{path}: expected an evidence file or directory")
-    if (path / "manifest.json").exists():
-        _incident(path, analysis)
-        analysis.report()
-        return
-    marker = path / "recorder.json"
-    if marker.exists():
-        metadata = _json_document(marker)
-        if metadata.get("schema") != "eg4_host_recorder.v1":
-            raise ValueError(f"{marker}: unsupported recorder schema")
-        print(f"recorder={json.dumps(metadata, sort_keys=True)}")
-    files = 0
-    damaged_files = 0
-    print("source_group=rolling incident_copies_excluded=true")
-    for trace in _trace_files(path, historical=True):
-        damaged_files += not analysis.consume_retained(trace)
-        files += 1
-    for trace in _trace_files(path / "raw"):
-        damaged_files += not analysis.consume_retained(trace)
-        files += 1
-    analysis.report()
-    journal = Analysis(roles=roles, gap_seconds=gap_seconds)
-    print("source_group=journal separate_controller_observations=true")
-    for trace in _trace_files(path / "controller-observations"):
-        damaged_files += not journal.consume_retained(trace)
-        files += 1
-    journal.report("journal:")
-    incident_root = path / "incidents"
-    if incident_root.exists():
-        for bundle in _children(incident_root):
-            if bundle.name.startswith("incident-"):
-                incident_analysis = Analysis(roles=roles, gap_seconds=gap_seconds)
-                _incident(bundle, incident_analysis)
-                incident_analysis.report(f"incident:{bundle.name}:")
+    with ExitStack() as resources:
+        def coverage() -> Coverage:
+            return resources.enter_context(Coverage(registers=registers, gap_seconds=gap_seconds, roles=roles))
+
+        rolling = coverage()
+        analysis = Analysis(roles=roles, gap_seconds=gap_seconds, coverage=rolling)
+        if path.is_file():
+            analysis.consume(path)
+            analysis.report()
+            rolling.report("file")
+            return
+        if not path.is_dir():
+            raise ValueError(f"{path}: expected an evidence file or directory")
+        if (path / "manifest.json").exists():
+            _incident(path, analysis)
+            analysis.report()
+            rolling.report(f"incident:{path.name}")
+            return
+        marker = path / "recorder.json"
+        if marker.exists():
+            metadata = _json_document(marker)
+            if metadata.get("schema") != "eg4_host_recorder.v1":
+                raise ValueError(f"{marker}: unsupported recorder schema")
+            print(f"recorder={json.dumps(metadata, sort_keys=True)}")
+            rolling.metadata(metadata, str(marker))
+        files = 0
+        damaged_files = 0
+        print("source_group=rolling incident_copies_excluded=true")
+        for trace in _trace_files(path, historical=True):
+            damaged_files += not analysis.consume_retained(trace)
+            files += 1
+        for baseline in _children(path):
+            if baseline.suffix == ".json" and "baseline" in baseline.name:
+                damaged_files += not analysis.consume_retained(baseline)
                 files += 1
-    if not files:
-        raise ValueError(f"{path}: no recognizable evidence files or incident manifests")
-    if damaged_files:
-        raise ValueError(
-            f"{path}: directory analysis incomplete: {damaged_files} damaged or unreadable files; "
-            "later safe files were analyzed without assuming continuity"
-        )
+        for trace in _trace_files(path / "raw"):
+            damaged_files += not analysis.consume_retained(trace)
+            files += 1
+        analysis.report()
+        journal = Analysis(roles=roles, gap_seconds=gap_seconds, coverage=rolling)
+        print("source_group=journal separate_controller_observations=true")
+        for trace in _trace_files(path / "controller-observations"):
+            damaged_files += not journal.consume_retained(trace)
+            files += 1
+        journal.report("journal:")
+        rolling.report("rolling_and_journal_deduplicated")
+        incident_root = path / "incidents"
+        if incident_root.exists():
+            for bundle in _children(incident_root):
+                if bundle.name.startswith("incident-"):
+                    retained = coverage()
+                    incident_analysis = Analysis(roles=roles, gap_seconds=gap_seconds, coverage=retained)
+                    _incident(bundle, incident_analysis)
+                    incident_analysis.report(f"incident:{bundle.name}:")
+                    retained.report(f"incident:{bundle.name}")
+                    files += 1
+        if not files:
+            raise ValueError(f"{path}: no recognizable evidence files or incident manifests")
+        if damaged_files:
+            raise ValueError(
+                f"{path}: directory analysis incomplete: {damaged_files} damaged or unreadable files; "
+                "later safe files were analyzed without assuming continuity"
+            )
 
 
 def main() -> int:
     """Run the read-only, standard-library evidence analyzer."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("trace", type=Path, help="JSONL file or recorder/incident directory (read-only)")
+    parser.add_argument("trace", type=Path, help="JSONL, retained baseline JSON, or recorder/incident directory (read-only)")
     parser.add_argument(
         "--role", action="append",
         help="include only this role's observations; all-role bundle context remains visible; repeatable",
@@ -1101,15 +1201,17 @@ def main() -> int:
         "--gap-seconds", type=float, default=5,
         help="report uncovered acquisition intervals longer than this many seconds (default: 5)",
     )
+    parser.add_argument("--registers", action="store_true",
+                        help="emit source-bound canonical register projections, including raw/uncertain fields")
     args = parser.parse_args()
     if not math.isfinite(args.gap_seconds) or args.gap_seconds < 0:
         parser.error("--gap-seconds must be finite and nonnegative")
-    print("Evidence observations only; raw/rejected words are not decoded telemetry.")
+    print("Evidence observations only; register projections retain source quality and calibration uncertainty.")
     print("Acquisition intervals are host observations, not engine state or physical contacts.")
     print("Onset/recovery transition times and overlapping interval ordering remain unresolved.")
     print("No zero-fill, interpolation or continuous house-outage duration is inferred.")
     try:
-        _analyze_path(args.trace, args.role, args.gap_seconds)
+        _analyze_path(args.trace, args.role, args.gap_seconds, registers=args.registers)
     except (OSError, ValueError) as error:
         parser.exit(2, f"{error}\n")
     return 0

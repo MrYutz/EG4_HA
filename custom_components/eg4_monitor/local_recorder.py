@@ -18,15 +18,7 @@ from statistics import median
 from typing import Any
 from uuid import uuid4
 
-from .const import (
-    LOCAL_DONGLE_TRACE_SCHEMA,
-    LOCAL_GRIDBOSS_DYNAMIC_BLOCKS,
-    LOCAL_GRIDBOSS_MAINTENANCE,
-    LOCAL_GRIDBOSS_PRIMARY_BLOCKS,
-    LOCAL_INVERTER_DYNAMIC_BLOCKS,
-    LOCAL_INVERTER_MAINTENANCE,
-    LOCAL_INVERTER_PRIMARY_BLOCKS,
-)
+from .const import LOCAL_DONGLE_TRACE_SCHEMA
 from .eg4_logger import LoggerSample
 from .local_dongle import (
     EG4GridBossTelemetry,
@@ -43,9 +35,26 @@ from .local_dongle_trace import (
     telemetry_to_record,
 )
 from .local_incidents import IncidentRecorder
+from .register_catalog import (
+    LOCAL_GRIDBOSS_DYNAMIC_BLOCKS,
+    LOCAL_GRIDBOSS_FAST_BLOCK,
+    LOCAL_GRIDBOSS_MAINTENANCE,
+    LOCAL_GRIDBOSS_PRIMARY_BLOCKS,
+    LOCAL_INVERTER_DYNAMIC_BLOCKS,
+    LOCAL_INVERTER_MAINTENANCE,
+    LOCAL_INVERTER_PRIMARY_BLOCKS,
+    REGISTER_MAP_REVISION,
+    capture_profile,
+)
 
 Shape = tuple[int, int, int]
 _LOGGER = logging.getLogger(__name__)
+FAST_MODES = ("off", "generator", "always")
+# Words of the fast block whose change marks a controller decision input, as
+# offsets from register 568. Analog words (573, 580..582) are left out.
+_FAST_DISCRETE = (0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20)
+# Most due maintenance blocks one idle round may read.
+_IDLE_MAINTENANCE = 4
 
 
 def _age(source: dict[str, Any] | None, now: datetime) -> float | None:
@@ -84,6 +93,7 @@ class _Role:
     due: dict[Shape, float]
     blocks: dict[Shape, dict[str, Any]] = field(default_factory=dict)
     last_good: dict[Shape, dict[str, Any]] = field(default_factory=dict)
+    failures: dict[Shape, int] = field(default_factory=dict)
     # Pending raw frames do not replace the last completed semantic verdict.
     semantic_rejections: set[Shape] = field(default_factory=set)
     core: EG4LocalTelemetry | EG4GridBossTelemetry | None = None
@@ -105,6 +115,19 @@ class _Role:
     source_sequence: int | None = None
     last_transfer_state: str | None = None
     transfer_unknown: bool = False
+    # Freshness limit of the current primary sample, set by the cadence it was read under.
+    sample_max_age: float = 15.0
+    # Optional short block read between the others on a held-open connection.
+    fast: Shape | None = None
+    fast_active: bool = False
+    fast_suspended: bool = False
+    fast_samples: int = 0
+    fast_failures: int = 0
+    fast_changes: int = 0
+    fast_last: dict[str, Any] | None = None
+    fast_last_error: str | None = None
+    fast_completed: float | None = None
+    fast_spacing: deque[float] = field(default_factory=lambda: deque(maxlen=240))
 
 
 class EG4LocalRecorder:
@@ -129,11 +152,28 @@ class EG4LocalRecorder:
         build_id: str = "unknown",
         session_id: str | None = None,
         clock: Callable[[], float] = time.monotonic,
+        gridboss_fast_mode: str = "off",
+        gridboss_fast_reads: int = 2,
+        gridboss_fast_timeout: float = 1.5,
+        gridboss_fast_hold: float = 120.0,
+        idle_interval: float | None = None,
     ) -> None:
         """Bind independent role owners and their shared evidence consumer."""
+        if gridboss_fast_mode not in FAST_MODES:
+            raise ValueError(f"Unsupported GridBOSS fast mode: {gridboss_fast_mode}")
+        self.fast_mode = gridboss_fast_mode
+        self.fast_reads = max(1, int(gridboss_fast_reads))
+        self.fast_timeout = max(0.05, float(gridboss_fast_timeout))
+        self.fast_hold = max(0.0, float(gridboss_fast_hold))
         self.interval = max(0.001, float(interval))
         self.bms_interval = max(0.001, float(bms_interval))
         self.max_age = max(15.0, self.interval * 5.0)
+        # Slower cadence used only while the GridBOSS shows no generator.
+        self.idle_interval = (
+            None if idle_interval is None or float(idle_interval) <= self.interval
+            else float(idle_interval)
+        )
+        self._generator_until = 0.0
         self.writer = writer
         self.journal = journal
         self.incidents = incidents
@@ -157,6 +197,8 @@ class EG4LocalRecorder:
         self._warnings: dict[str, float] = {}
         self._close_task: asyncio.Task[None] | None = None
         for role, device in devices.items():
+            if capture_profile(role)["family"] == "unknown":
+                raise ValueError(f"Unsupported local recorder role: {role}")
             gridboss = role == "gridboss"
             profile = LOCAL_GRIDBOSS_MAINTENANCE if gridboss else LOCAL_INVERTER_MAINTENANCE
             periods = {
@@ -169,6 +211,8 @@ class EG4LocalRecorder:
                 dynamic=LOCAL_GRIDBOSS_DYNAMIC_BLOCKS if gridboss else LOCAL_INVERTER_DYNAMIC_BLOCKS,
                 periods=periods,
                 due=dict.fromkeys(periods, self._clock()),
+                fast=LOCAL_GRIDBOSS_FAST_BLOCK if gridboss and self.fast_mode != "off" else None,
+                sample_max_age=self.max_age,
             )
             device.role = role
             device.session_id = self.session_id
@@ -179,6 +223,9 @@ class EG4LocalRecorder:
         now = datetime.now(UTC)
         snapshot = self.snapshot(now)
         return {
+            "inventory_context": {
+                role: self._inventory(state, now) for role, state in self._roles.items()
+            },
             "configuration_observed_at": now.isoformat(),
             "roles": snapshot.settings,
             "role_freshness": {
@@ -235,6 +282,12 @@ class EG4LocalRecorder:
             self.journal.set_observation_callback(None)
         for state in self._roles.values():
             state.primary_available = False
+            state.fast_active = False
+            state.device.keep_open = False
+            try:
+                await state.device.async_release()
+            except Exception as err:
+                self._warn("connection release", f"{type(err).__name__}: {err}")
             state.device.evidence_sink = None
         self._health_cache = None
         if self._started:
@@ -297,6 +350,7 @@ class EG4LocalRecorder:
         return (
             raw["State"], journal["State"], journal.get("ContinuityBroken"),
             incident_signature, roles,
+            self._idle(), tuple(state.fast_active for state in self._roles.values()),
         )
 
     def _signal_health(self) -> None:
@@ -321,6 +375,8 @@ class EG4LocalRecorder:
 
     async def _write(self, record: dict[str, Any]) -> None:
         """Enqueue evidence without waiting for disk or reporting queue success."""
+        record["build_id"] = self.build_id
+        record["register_map_revision"] = REGISTER_MAP_REVISION
         if self.incidents is not None:
             self.incidents.observe(record)
         if self.writer is None:
@@ -384,8 +440,12 @@ class EG4LocalRecorder:
 
     async def _observe(self, evidence: dict[str, Any]) -> None:
         """Keep bounded shape metadata before optionally persisting raw evidence."""
+        evidence["build_id"] = self.build_id
+        evidence["register_map_revision"] = REGISTER_MAP_REVISION
         state = self._roles.get(evidence["role"])
-        if state is not None and evidence.get("kind") == "transaction":
+        if state is not None and evidence.get("kind") == "transaction" and evidence.get("lane") == "fast":
+            self._fast_observed(state, evidence)
+        elif state is not None and evidence.get("kind") == "transaction":
             request = evidence["request"]
             shape = (request["function"], request["register"], request["count"])
             if shape in (*state.primary, *state.dynamic, *state.periods):
@@ -397,6 +457,7 @@ class EG4LocalRecorder:
                 state.blocks[shape] = {
                     **{name: evidence[name] for name in (
                         "session_id", "acquisition_id", "transaction_id", "started_at", "completed_at", "ok",
+                        "build_id", "register_map_revision",
                     )},
                     "function": shape[0], "register": shape[1], "count": shape[2],
                     "acquired_at": evidence["completed_at"],
@@ -417,6 +478,118 @@ class EG4LocalRecorder:
                     break
         await self._write(evidence)
 
+    def _fast_observed(self, state: _Role, evidence: dict[str, Any]) -> None:
+        """Keep fast-lane cadence and change counts apart from profile blocks."""
+        if not evidence["ok"]:
+            return
+        matched = next(
+            (frame for frame in reversed(evidence["frames"])
+             if frame.get("classification") == "matching"),
+            {},
+        )
+        values = matched.get("values")
+        completed = time.monotonic()
+        if state.fast_completed is not None:
+            state.fast_spacing.append(max(0.0, completed - state.fast_completed))
+        state.fast_completed = completed
+        previous = (state.fast_last or {}).get("values")
+        if values and previous and len(values) == len(previous) and any(
+            values[index] != previous[index] for index in _FAST_DISCRETE if index < len(values)
+        ):
+            state.fast_changes += 1
+        state.fast_samples += 1
+        state.fast_last = {
+            "transaction_id": evidence["transaction_id"],
+            "acquired_at": evidence["completed_at"],
+            "connection": evidence.get("connection"),
+            "values": values,
+        }
+
+    def _generator_state(self) -> bool | None:
+        """Generator presence from the last GridBOSS primary read.
+
+        True while it is seen and for the hold time afterwards, False once a
+        completed read shows it absent, None when no GridBOSS read can tell.
+        """
+        grid = self._roles.get("gridboss")
+        if grid is None:
+            return None
+        now = self._clock()
+        known = grid.primary_available and isinstance(grid.core, EG4GridBossTelemetry)
+        if known and grid.core.generator_available:
+            self._generator_until = now + self.fast_hold
+            return True
+        if now < self._generator_until:
+            return True
+        return False if known else None
+
+    def _idle(self) -> bool:
+        """Slow down only on positive evidence that no generator is present."""
+        return (
+            self.idle_interval is not None and not self._closed
+            and self._generator_state() is False
+        )
+
+    def _target_interval(self) -> float:
+        """Return the round spacing the current cadence asks for."""
+        return self.idle_interval if self._idle() and self.idle_interval else self.interval
+
+    def _age_limit(self, target: float) -> float:
+        """Allow a sample read at the idle cadence to stay current between rounds."""
+        return self.max_age if target <= self.interval else max(self.max_age, target * 2.0 + 15.0)
+
+    async def _pause(self, started: float) -> None:
+        """Wait out the cadence; an idle wait ends as soon as capture goes active."""
+        while not self._closed:
+            remaining = self._target_interval() - (time.monotonic() - started)
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, 0.5))
+
+    def _fast_wanted(self, state: _Role) -> bool:
+        """Decide from the last completed primary read whether to run the lane."""
+        if state.fast is None or self._closed:
+            return False
+        return self.fast_mode == "always" or self._generator_state() is True
+
+    async def _set_fast(self, state: _Role, wanted: bool) -> None:
+        """Hold the connection open only while the fast lane is running."""
+        if wanted == state.fast_active:
+            return
+        state.fast_active = wanted
+        state.device.keep_open = wanted
+        if not wanted:
+            state.fast_completed = None
+            await state.device.async_release()
+        self._health_cache = None
+        self._signal_health()
+
+    async def _fast(self, state: _Role, reads: int | None = None) -> None:
+        """Read the fast block; a failure never fails the round.
+
+        After one failure the lane rests until the next round, so an unanswered
+        dongle costs at most one short timeout per round.
+        """
+        if not state.fast_active or state.fast is None or state.fast_suspended:
+            return
+        function, register, count = state.fast
+        for _ in range(self.fast_reads if reads is None else reads):
+            if self._closed:
+                return
+            try:
+                # Its own acquisition: profile accounting never sees these reads.
+                with state.device.capture(lane="fast"):
+                    await state.device.async_read_register_block(
+                        register, count, function=function, timeout=self.fast_timeout,
+                    )
+            except Exception as err:
+                state.fast_failures += 1
+                state.fast_suspended = True
+                state.fast_last_error = f"{type(err).__name__}: {err}"
+                self._warn("gridboss fast lane", state.fast_last_error)
+                self._signal_health()
+                return
+
     def _source(self, state: _Role, shapes: tuple[Shape, ...], acquisition_id: str) -> dict[str, Any]:
         """Require successful primary blocks from this exact acquisition."""
         blocks = [state.blocks.get(shape) for shape in shapes]
@@ -424,8 +597,10 @@ class EG4LocalRecorder:
             raise ValueError("Primary acquisition provenance unavailable")
         transactions = [{name: block[name] for name in (
             "session_id", "acquisition_id", "transaction_id", "started_at", "completed_at", "ok",
+            "build_id", "register_map_revision",
         )} for block in blocks if block is not None]
         return {
+            "build_id": self.build_id, "register_map_revision": REGISTER_MAP_REVISION,
             "acquisition_id": acquisition_id,
             "transaction_ids": [block["transaction_id"] for block in transactions],
             "started_at": min(block["started_at"] for block in transactions),
@@ -453,7 +628,12 @@ class EG4LocalRecorder:
         """Read dynamic data and publish primary continuity loss immediately."""
         try:
             if role == "gridboss":
-                core = await state.device.async_read_snapshot()
+                if state.fast_active:
+                    core = await state.device.async_read_snapshot(
+                        interleave=lambda: self._fast(state, 1),
+                    )
+                else:
+                    core = await state.device.async_read_snapshot()
                 if not isinstance(core, EG4GridBossTelemetry):
                     raise ValueError("Expected GridBOSS telemetry")
             else:
@@ -473,6 +653,7 @@ class EG4LocalRecorder:
         else:
             state.core, state.source = core, source
             state.source_sequence = state.sequence
+            state.sample_max_age = self._age_limit(record["target_interval_seconds"])
             state.primary_available = True
             state.error = None
             state.last_success = source["acquired_at"]
@@ -493,6 +674,7 @@ class EG4LocalRecorder:
             if not block["ok"]:
                 raise ValueError("Block acquisition provenance unavailable")
         except Exception as err:
+            state.failures[shape] = state.failures.get(shape, 0) + 1
             state.errors += 1
             state.last_error = f"{type(err).__name__}: {err}"
             self._warn("maintenance acquisition", state.last_error)
@@ -534,19 +716,37 @@ class EG4LocalRecorder:
                     "sample_started_at": state.last_attempt,
                     "sample_gap_seconds": gap, "ok": False,
                 }
+                idle = self._idle()
+                record["cadence"] = "idle" if idle else "active"
+                record["target_interval_seconds"] = self._target_interval()
                 cancelled = False
                 try:
+                    state.fast_suspended = False
+                    await self._set_fast(state, self._fast_wanted(state))
                     await self._primary(role, state, record)
+                    if role == "gridboss":
+                        # This round's own read may have just found or lost the
+                        # generator: act on it now, not one idle wait later.
+                        await self._set_fast(state, self._fast_wanted(state))
+                        idle = self._idle()
+                    await self._fast(state)
                     for shape in state.dynamic:
                         await self._block(state, shape)
+                        await self._fast(state)
                     due = [shape for shape, deadline in state.due.items() if deadline <= self._clock()]
-                    if due:
-                        shape = min(due, key=state.due.__getitem__)
+                    # One block per round at full rate. An idle round has time
+                    # for more, so short-period blocks are not starved by it.
+                    for shape in sorted(due, key=state.due.__getitem__)[:_IDLE_MAINTENANCE if idle else 1]:
                         # Schedule from actual attempt, including failures. Ties
                         # retain profile order; startup shapes cannot starve.
                         state.due[shape] = self._clock() + state.periods[shape]
-                        await self._block(state, shape, bms=shape == (4, 80, 40))
-                        record["maintenance_attempted"] = _key(shape)
+                        await self._block(
+                            state, shape, bms=role != "gridboss" and shape == (4, 80, 40),
+                        )
+                        record.setdefault("maintenance_attempted", _key(shape))
+                        if idle:
+                            record.setdefault("maintenance_attempted_all", []).append(_key(shape))
+                        await self._fast(state)
                 except asyncio.CancelledError:
                     cancelled = True
                     state.primary_available = False
@@ -565,7 +765,7 @@ class EG4LocalRecorder:
                         await self._notify(state, record)
                 if cancelled:
                     raise asyncio.CancelledError
-            await asyncio.sleep(max(0.0, self.interval - (time.monotonic() - started)))
+            await self._pause(started)
 
     def _context(self, state: _Role, shape: Shape, now: datetime) -> dict[str, Any]:
         """Keep latest-attempt failure distinct from aged last-success context."""
@@ -575,10 +775,11 @@ class EG4LocalRecorder:
             "function": shape[0], "register": shape[1], "count": shape[2],
             "target_interval_seconds": state.periods[shape],
             "status": "missing" if latest is None else "ok" if (
-                latest["ok"] and latest["semantic"] != "rejected"
+                latest["ok"] and latest["semantic"] != "rejected" and not latest.get("error")
             ) else "failed",
             "latest_attempt": {**deepcopy(latest), "age_seconds": _age(latest, now)} if latest else None,
             "last_success": {**deepcopy(last_good), "age_seconds": _age(last_good, now)} if last_good else None,
+            "failures": state.failures.get(shape, 0),
             "effective_change_time_known": False,
         }
 
@@ -586,16 +787,26 @@ class EG4LocalRecorder:
         """Expose only the bounded holding-register configuration profile."""
         return {_key(shape): self._context(state, shape, now) for shape in state.periods if shape[0] == 3}
 
+    def _inventory(self, state: _Role, now: datetime) -> dict[str, Any]:
+        """Retain slow input banks independently of configuration and BMS."""
+        return {
+            _key(shape): self._context(state, shape, now)
+            for shape in state.periods
+            if shape[0] == 4 and not (
+                state.device.role != "gridboss" and shape == (4, 80, 40)
+            )
+        }
+
     def _bms_context(self, state: _Role, now: datetime) -> dict[str, Any]:
         """Report BMS source identity, original age and latest attempt status."""
         shape = (4, 80, 40)
-        if shape not in state.periods:
+        if state.device.role == "gridboss" or shape not in state.periods:
             return {}
         age = _age(state.bms_source, now)
         return {
             **self._context(state, shape, now),
             "source": deepcopy(state.bms_source), "age_seconds": age,
-            "available": state.bms_available and age is not None and age <= self.max_age,
+            "available": state.bms_available and age is not None and age <= state.sample_max_age,
         }
 
     def _finish(self, state: _Role, record: dict[str, Any]) -> None:
@@ -615,16 +826,22 @@ class EG4LocalRecorder:
             {**deepcopy(block), "age_seconds": _age(block, now),
              "current_acquisition": block["acquisition_id"] == acquisition_id}
             for shape, block in state.blocks.items()
-            if shape in state.dynamic or shape in state.periods and shape[0] == 3
+            if shape in state.dynamic or shape in state.periods and not (
+                state.device.role != "gridboss" and shape == (4, 80, 40)
+            )
         ]
         record["configuration_context"] = self._configuration(state, now)
+        record["inventory_context"] = self._inventory(state, now)
         record["bms_context"] = self._bms_context(state, now)
         record["bms_source"] = {
             **deepcopy(state.bms_source or {}),
             "used_in_telemetry": record["ok"] and record["bms_context"].get("available", False),
         }
         record["bms_age_seconds"] = record["bms_context"].get("age_seconds")
-        record["bms_sampled"] = any(block["register"] == 80 and block["function"] == 4 for block in current)
+        record["bms_sampled"] = state.device.role != "gridboss" and any(
+            (block["function"], block["register"], block["count"]) == (4, 80, 40)
+            for block in current
+        )
         if record["ok"] and state.core is not None:
             if isinstance(state.core, EG4GridBossTelemetry):
                 record["telemetry"] = gridboss_to_record(state.core)
@@ -663,8 +880,16 @@ class EG4LocalRecorder:
         roles = {}
         for role in sorted(self._configured | self._roles.keys()):
             state = self._roles.get(role)
+            profile = capture_profile(role)
+            profile["enabled"] = state is not None
+            profile["effective_periods"] = [
+                [*shape, self.interval] for shape in (*state.primary, *state.dynamic)
+            ] + [[*shape, period] for shape, period in state.periods.items()] if state else []
             if state is None:
-                roles[role] = {"State": "degraded", "PrimaryAvailable": False, "LastError": "configured driver missing"}
+                roles[role] = {
+                    "State": "degraded", "PrimaryAvailable": False,
+                    "LastError": "configured driver missing", "capture_profile": profile,
+                }
                 continue
             maintenance = {
                 _key(shape): {
@@ -674,9 +899,13 @@ class EG4LocalRecorder:
                         and not state.blocks[shape].get("error")
                     ) else "failed",
                     "LastSuccessAgeSeconds": _age(state.last_good.get(shape), now),
+                    "Failures": state.failures.get(shape, 0),
                     "Source": {
                         key: state.last_good[shape][key]
-                        for key in ("acquisition_id", "transaction_id", "acquired_at")
+                        for key in (
+                            "acquisition_id", "transaction_id", "acquired_at",
+                            "build_id", "register_map_revision",
+                        )
                     } if shape in state.last_good else None,
                 } for shape in state.periods
             }
@@ -696,11 +925,12 @@ class EG4LocalRecorder:
             )
             diagnostics = [block for shape, block in state.blocks.items() if shape in state.dynamic]
             primary_age = _age(state.source, now)
-            healthy = (state.primary_available and primary_age is not None and primary_age <= self.max_age
+            healthy = (state.primary_available and primary_age is not None and primary_age <= state.sample_max_age
                        and not state.callback_error and not missing and not failed
                        and len(diagnostics) == len(state.dynamic) and all(block["ok"] for block in diagnostics))
             roles[role] = {
                 "State": "starting" if state.last_attempt is None else "healthy" if healthy else "degraded",
+                "capture_profile": profile,
                 "LastAttempt": state.last_attempt, "LastSuccess": state.last_success,
                 "PrimaryAvailable": state.primary_available,
                 "PrimaryAgeSeconds": primary_age,
@@ -713,6 +943,19 @@ class EG4LocalRecorder:
                 "MissingProfileBlocks": missing, "FailedProfileBlocks": failed,
                 "Maintenance": maintenance,
             }
+            if state.fast is not None:
+                roles[role]["FastLane"] = {
+                    "Mode": self.fast_mode, "Shape": _key(state.fast),
+                    "Active": state.fast_active, "ReadsPerSlot": self.fast_reads,
+                    "Samples": state.fast_samples, "Failures": state.fast_failures,
+                    "DiscreteChanges": state.fast_changes,
+                    "MedianSpacingSeconds": median(state.fast_spacing) if state.fast_spacing else None,
+                    "MaxSpacingSeconds": max(state.fast_spacing) if state.fast_spacing else None,
+                    "SpacingSamples": len(state.fast_spacing),
+                    "LastSampleAgeSeconds": _age(state.fast_last, now),
+                    "LastConnection": (state.fast_last or {}).get("connection"),
+                    "LastError": state.fast_last_error,
+                }
         raw, journal = self._persistence()
         incidents = (
             {**self.incidents.health, "Enabled": True} if self.incidents is not None
@@ -732,10 +975,23 @@ class EG4LocalRecorder:
         )
         self._health_cache = {
             "SessionId": self.session_id, "BuildId": self.build_id, "State": overall,
+            "RegisterMapRevision": REGISTER_MAP_REVISION,
+            "ConfiguredRoles": sorted(self._configured | self._roles.keys()),
+            "ActiveRoles": sorted(self._roles),
             "ObservedAt": now.isoformat(), "Roles": roles, "WriterError": self._writer_error,
             "RawPersistence": raw, "JournalPersistence": journal,
             "Incidents": incidents,
         }
+        if self.idle_interval is not None:
+            self._health_cache["Cadence"] = {
+                "Mode": "idle" if self._idle() else "active",
+                "ActiveIntervalSeconds": self.interval,
+                "IdleIntervalSeconds": self.idle_interval,
+                "GeneratorPresent": self._generator_state(),
+                "SampleMaxAgesSeconds": {
+                    role: state.sample_max_age for role, state in sorted(self._roles.items())
+                },
+            }
         self._health_at = clock
         return deepcopy(self._health_cache)
 
@@ -753,7 +1009,9 @@ class EG4LocalRecorder:
             source = state.source if state else None
             age = _age(source, now)
             core = state.core if state else None
-            available = bool(state and state.primary_available and age is not None and age <= self.max_age)
+            available = bool(
+                state and state.primary_available and age is not None and age <= state.sample_max_age
+            )
             primary_available[role] = bool(state and state.primary_available)
             if age is not None:
                 ages[role] = age
@@ -776,7 +1034,7 @@ class EG4LocalRecorder:
         grid_source = grid_state.source if grid_state else None
         grid_age = _age(grid_source, now)
         gridboss = grid_state.core if (grid_state and grid_state.primary_available
-            and grid_age is not None and grid_age <= self.max_age
+            and grid_age is not None and grid_age <= grid_state.sample_max_age
             and isinstance(grid_state.core, EG4GridBossTelemetry)) else None
         charge_available = bool(role_context) and all(context["available"] for context in role_context.values())
         process_charge = bool(self._roles.keys() - {"gridboss"})
@@ -808,7 +1066,10 @@ class EG4LocalRecorder:
                 "Enabled": self.writer is not None, "IntervalSeconds": self.interval,
                 "BMSIntervalSeconds": self.bms_interval, "MaxAgeSeconds": self.max_age,
                 "SampleAgesSeconds": ages,
-                "StaleRoles": sorted(role for role, age in ages.items() if age > self.max_age),
+                "StaleRoles": sorted(
+                    role for role, age in ages.items()
+                    if age > self._roles[role].sample_max_age
+                ),
                 "MissingRoles": sorted(self._configured - sources.keys()),
                 "AvailableRoles": sorted(inverters), "PrimaryAvailable": primary_available,
                 "IsStale": process_charge and not self._configured <= inverters.keys(),

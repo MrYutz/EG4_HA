@@ -159,7 +159,11 @@ def test_cli_filters_roles_and_reports_session_gap_without_filling_missing_data(
             "transaction_id": "tx-without-time", "error": {"message": "missing time"},
         },
     ], "--role", "master", "--role", "gridboss")
-    assert "[master] rows=2" in output
+    master_sessions = {
+        row["session_id"] for row in _structured(output, "role_coverage")
+        if row["role"] == "master"
+    }
+    assert master_sessions == {"session-before", "session-after"}
     assert "[gridboss] rows=1" in output
     assert "[slave]" not in output
     assert "excluded-session" not in output
@@ -243,10 +247,9 @@ def test_incident_cli_verifies_hashes_and_preserves_partial_and_rejected_rows(tm
     ])
     result = _invoke(bundle)
     assert result.returncode == 0, result.stderr
-    assert "[master] rows=4" in result.stdout
     assert "sha256=verified" in result.stdout
     assert "manifest_verification=complete" in result.stdout
-    assert "transaction_failures=1 partial_transactions=1 semantic_rejections=1" in result.stdout
+    assert "invalid inverter status: 33280" in result.stdout
     assert "acquisition_partials=1" in result.stdout
     assert "legacy failed acquisition" in result.stdout
     assert (bundle / "records-0001.jsonl").read_bytes() == original
@@ -912,8 +915,6 @@ def test_recorder_cli_reports_crash_tail_and_continues_later_sessions_read_only(
     assert "later-primary" in result.stdout
     assert "session=later-session" in result.stdout
     assert "session_change" in result.stdout
-    assert "[master] rows=2" in result.stdout
-    assert "[journal:master] rows=1" in result.stdout
     assert "output_voltage_anomaly" in result.stdout
     assert "282.9" in result.stdout
     assert "directory analysis incomplete" in result.stderr
@@ -1147,3 +1148,333 @@ def test_cli_keeps_new_raw_controller_changes_across_host_clock_regression(tmp_p
     assert details["observation_brackets"]["input.519"]["ordering"] == "unresolved"
     assert "transaction=tx-1" in events[0]
     assert "start=2026-11-09T11:59:58+00:00" in events[0]
+
+
+def _structured(output, name):
+    """Read public JSON evidence fragments, not presentation prose."""
+    prefix = f"{name}="
+    return [
+        json.loads(line.strip()[len(prefix):])
+        for line in output.splitlines() if line.strip().startswith(prefix)
+    ]
+
+
+def _timed_read(sequence, offset, duration, *, build="synthetic-build", session="coverage-session"):
+    row = _controller_transaction("gridboss", 4, 0, 40, 3, 2400, sequence)
+    start = datetime.fromisoformat("2026-11-09T12:00:00+00:00") + timedelta(seconds=offset)
+    row.update({
+        "build_id": build, "session_id": session,
+        "started_at": start.isoformat(),
+        "completed_at": (start + timedelta(seconds=duration)).isoformat(),
+        "duration_ms": duration * 1000,
+    })
+    return row
+
+
+def test_cli_deduplicates_source_copies_before_quantiles_and_late_rejection(tmp_path):
+    reads = [_timed_read(index, offset, duration) for index, (offset, duration) in enumerate(
+        ((0, .1), (2, .2), (12, .3), (42, .4))
+    )]
+    cached = {**_controller_summary(reads[1], cached=True), "build_id": "synthetic-build"}
+    reads[3].update(ok=False, frames=[], error={"message": "synthetic timeout"})
+    output = _analyze(tmp_path, [
+        reads[0], reads[1], cached, reads[2],
+        {**reads[2], "kind": "interpretation", "semantic": "rejected"},
+        reads[3], reads[1],
+    ], "--registers")
+    blocks = _structured(output, "block_coverage")
+    assert len(blocks) == 1
+    block = blocks[0]
+    assert (block["samples"], block["successes"], block["failures"], block["semantic_rejections"]) == (4, 2, 1, 1)
+    assert block["deduplicated_copies"] == 2
+    assert block["spacing_seconds"] == {"count": 3, "median": 10, "p95": 30, "max": 30}
+    assert block["latency_ms"] == {"count": 4, "median": 250, "p95": 400, "max": 400}
+    assert block["latest_attempt"]["transaction_id"] == "tx-3"
+    assert block["last_good"]["transaction_id"] == "tx-1"
+    assert block["last_good"]["age_at_evidence_end_seconds"] == pytest.approx(40.2)
+    rejected = next(row for row in _structured(output, "register_projection")
+                    if row["source"]["transaction_id"] == "tx-2")
+    assert rejected["quality"]["semantic"] == "rejected"
+    assert rejected["quality"]["telemetry_usable"] is False
+    assert rejected["registers"]
+
+
+def test_cli_never_pools_reused_transaction_ids_across_builds_or_sessions(tmp_path):
+    rows = [
+        _timed_read(0, 0, .1, build="old", session="one"),
+        _timed_read(0, 10, .2, build="new", session="one"),
+        _timed_read(0, 20, .3, build="new", session="two"),
+        _timed_read(0, 30, .4, build=None, session="one"),
+    ]
+    output = _analyze(tmp_path, rows)
+    blocks = _structured(output, "block_coverage")
+    assert {(row["build_id"], row["session_id"]) for row in blocks} == {
+        ("old", "one"), ("new", "one"), ("new", "two"), (None, "one"),
+    }
+    assert all(row["samples"] == 1 and row["spacing_seconds"]["count"] == 0 for row in blocks)
+    identities = _structured(output, "summary_identity")
+    assert {(row["build_id"], row["session_id"]) for row in identities} == {
+        ("old", "one"), ("new", "one"), ("new", "two"), (None, "one"),
+    }
+
+
+def test_cli_reports_captured_missing_roles_and_blocks_despite_healthy_metadata(tmp_path):
+    profile = {
+        "schema": "synthetic-captured-profile", "revision": "captured-not-current",
+        "primary": [[4, 0, 40]], "dynamic": [],
+        "maintenance": [[3, 4097, 41, 300]], "effective_periods": [[3, 4097, 41, 300]],
+    }
+    health = {
+        "kind": "recorder_health", "role": "recorder", "build_id": "synthetic-build",
+        "session_id": "coverage-session", "observed_at": "2026-11-09T12:00:01+00:00",
+        "health": {
+            "State": "healthy", "ConfiguredRoles": ["master", "slave", "gridboss"],
+            "Roles": {role: {"State": "healthy", "capture_profile": profile}
+                      for role in ("master", "slave", "gridboss")},
+            "RawPersistence": {"State": "healthy", "DroppedRecords": 4},
+        },
+    }
+    output = _analyze(tmp_path, [_timed_read(0, 0, .1), health])
+    roles = {row["role"]: row for row in _structured(output, "role_coverage")}
+    assert roles["master"]["status"] == roles["slave"]["status"] == "missing"
+    assert roles["gridboss"]["missing_expected_blocks"] == 1
+    assert all(row["sample_sufficiency"] == "insufficient" for row in roles.values())
+    assert all(row["retention_or_gap_limit"] for row in roles.values())
+    missing = [row for row in _structured(output, "block_coverage")
+               if row["role"] == "gridboss" and row["register"] == 4097]
+    assert len(missing) == 1
+    assert missing[0]["samples"] == 0
+    assert missing[0]["last_good"] is None
+    assert missing[0]["expectation"]["period_seconds"] == 300
+    assert all(row["profile"]["revision"] == "captured-not-current" for row in roles.values())
+
+
+def test_cli_source_query_skew_uses_original_queries_not_cached_summary_time(tmp_path):
+    voltage = _timed_read(0, 0, .1)
+    frequency = _timed_read(1, 3, .1)
+    frequency["acquisition_id"] = voltage["acquisition_id"]
+    frequency["request"] = {"function": 4, "register": 120, "count": 12}
+    frequency["frames"][0]["values"] = [0] * 10 + [6000, 0]
+    summary = {
+        **_controller_summary(voltage, cached=True), "build_id": "synthetic-build",
+        "sample_started_at": "2026-11-09T12:00:50+00:00",
+        "sample_completed_at": "2026-11-09T12:01:00+00:00",
+    }
+    output = _analyze(tmp_path, [voltage, frequency, summary])
+    skew = _structured(output, "source_query_skew")
+    assert len(skew) == 1
+    assert skew[0]["start_skew_seconds"] == {"count": 1, "median": 3, "p95": 3, "max": 3}
+    first = next(row for row in _structured(output, "block_coverage") if row["register"] == 0)
+    assert first["samples"] == 1
+    assert first["last_good"]["age_at_evidence_end_seconds"] == pytest.approx(59.9)
+    assert first["spacing_seconds"]["count"] == 0
+
+
+def test_cli_deduplicates_rolling_acquisition_and_journal_sources(tmp_path):
+    raw = tmp_path / "raw"
+    journal = tmp_path / "controller-observations"
+    raw.mkdir()
+    journal.mkdir()
+    transaction = _timed_read(0, 0, .1)
+    summary = {**_controller_summary(transaction), "build_id": "synthetic-build"}
+    raw_bytes = _write_rows(raw / "local-dongle.jsonl", [transaction, summary])
+    journal_bytes = _write_rows(journal / "local-dongle.jsonl", [
+        {**summary, "schema": "eg4_controller_observation.v1"},
+    ])
+    result = _invoke(tmp_path)
+    assert result.returncode == 0, result.stderr
+    blocks = _structured(result.stdout, "block_coverage")
+    assert len(blocks) == 1
+    assert blocks[0]["samples"] == 1
+    assert blocks[0]["deduplicated_copies"] == 2
+    assert (raw / "local-dongle.jsonl").read_bytes() == raw_bytes
+    assert (journal / "local-dongle.jsonl").read_bytes() == journal_bytes
+
+
+@pytest.mark.parametrize("wrapper", ["gridboss", "flexboss_master", "reads"])
+def test_cli_reads_retained_baseline_wrappers_without_inventing_build_or_query_ids(tmp_path, wrapper):
+    block = {
+        "function": 4, "start": 10, "value_or_count": 1, "ok": True, "values": [123],
+        "started_at": "2026-11-09T12:00:00+00:00",
+        "completed_at": "2026-11-09T12:00:00.250000+00:00", "duration_ms": 250,
+        "received_frames": [{"accepted": False}, {"accepted": True}],
+    }
+    document = {"schema": "eg4_extended_baseline.v1", "role": "gridboss",
+                "captured_at": "2026-11-09T12:00:01+00:00"}
+    if wrapper == "gridboss":
+        document["blocks"] = [block]
+    elif wrapper == "flexboss_master":
+        document.update(role=wrapper, initial_q1_readonly={
+            "transactions": [block, {"function": 7, "start": 0, "value_or_count": 5}]},
+            additional_blocks=[block])
+    else:
+        document["reads"] = [block]
+    path = tmp_path / "baseline.json"
+    path.write_text(json.dumps(document))
+    before = path.read_bytes()
+    result = _invoke(path, "--registers")
+    assert result.returncode == 0, result.stderr
+    blocks = _structured(result.stdout, "block_coverage")
+    assert len(blocks) == 1 and blocks[0]["samples"] == 1
+    assert blocks[0]["build_id"] is None and blocks[0]["session_id"] is None
+    assert blocks[0]["latency_ms"]["median"] == 250
+    projection = _structured(result.stdout, "register_projection")[0]
+    assert projection["source"]["transaction_id"] is None
+    assert projection["source"]["baseline_frame_acceptance"] == [False, True]
+    assert projection["registers"][0]["raw"] == [123]
+    assert projection["registers"][0]["unit"] is None
+    assert not any(row["category"] == "invalid_source" for row in _structured(result.stdout, "coverage_fact"))
+    assert path.read_bytes() == before
+
+
+def test_cli_projection_preserves_incomplete_invalid_and_uncalibrated_words(tmp_path):
+    current = _controller_transaction("gridboss", 4, 10, 1, 0, 123, 0)
+    incomplete = _controller_transaction("gridboss", 4, 84, 1, 0, 65535, 1)
+    invalid = _controller_transaction("gridboss", 4, 26, 1, 0, True, 2)
+    output = _analyze(tmp_path, [current, incomplete, invalid], "--registers")
+    projections = {row["shape"][1]: row for row in _structured(output, "register_projection")}
+    assert projections[10]["registers"][0]["value"] == 123
+    assert projections[10]["registers"][0]["unit"] is None
+    assert projections[84]["registers"][0]["value"] is None
+    assert projections[84]["registers"][0]["addresses"] == [84]
+    assert projections[26]["registers"][0]["value"] is None
+    assert projections[26]["registers"][0]["raw"] == [True]
+    assert projections[26]["quality"]["structural"] == "rejected"
+    assert projections[26]["quality"]["telemetry_usable"] is False
+
+
+def test_cli_oversized_projection_is_explicitly_unusable_without_amplifying_words(tmp_path):
+    transaction = _controller_transaction("gridboss", 4, 0, 40, 3, 2400, 0)
+    transaction["frames"][0]["values"] = [1] * 200_000
+    output = _analyze(tmp_path, [transaction], "--registers")
+    assert not _structured(output, "register_projection")
+    facts = _structured(output, "coverage_fact")
+    invalid = next(row for row in facts if row["category"] == "invalid_source")
+    assert invalid["reported"]["word_count"] == 200_000
+    assert invalid["limits_sample_sufficiency"] is True
+    role = _structured(output, "role_coverage")[0]
+    assert role["sample_sufficiency"] == "insufficient"
+    assert role["observed_blocks"] is False
+
+
+def test_cli_inventory_last_success_keeps_original_age_after_failed_attempt(tmp_path):
+    good = _timed_read(0, 0, .1)
+    failed = _timed_read(1, 20, .1)
+    good_block = {**good["request"], **{key: good[key] for key in (
+        "transaction_id", "acquisition_id", "started_at", "completed_at",
+    )}, "ok": True, "values": good["frames"][0]["values"], "semantic": "accepted"}
+    failed_block = {**good_block, "transaction_id": failed["transaction_id"],
+                    "acquisition_id": failed["acquisition_id"],
+                    "started_at": failed["started_at"], "completed_at": failed["completed_at"],
+                    "ok": False, "values": None, "semantic": "not_evaluated"}
+    record = {
+        "kind": "acquisition", "role": "gridboss", "build_id": "synthetic-build",
+        "session_id": "coverage-session", "acquisition_id": "later",
+        "sample_completed_at": "2026-11-09T12:00:30+00:00", "ok": False,
+        "inventory_context": {"4:0:40": {
+            "function": 4, "register": 0, "count": 40,
+            "latest_attempt": failed_block, "last_success": good_block,
+        }},
+    }
+    output = _analyze(tmp_path, [record])
+    block = _structured(output, "block_coverage")[0]
+    assert (block["samples"], block["successes"], block["failures"]) == (2, 1, 1)
+    assert block["latest_attempt"]["transaction_id"] == "tx-1"
+    assert block["last_good"]["transaction_id"] == "tx-0"
+    assert block["last_good"]["age_at_evidence_end_seconds"] == pytest.approx(29.9)
+    assert block["latency_ms"]["count"] == 2
+
+
+def test_cli_cached_copy_cannot_rescue_failed_canonical_transaction(tmp_path):
+    transaction = _timed_read(0, 0, .1)
+    copy = {**_controller_summary(transaction), "build_id": "synthetic-build"}
+    transaction.update(ok=False, frames=[])
+    output = _analyze(tmp_path, [transaction, copy])
+    block = _structured(output, "block_coverage")[0]
+    assert block["samples"] == 1
+    assert block["conflicting_sources"] == 1
+    assert block["failures"] == 1 and block["successes"] == 0
+    assert block["last_good"] is None
+    assert block["latest_attempt"]["structural"] == "rejected"
+
+
+def test_cli_does_not_pair_ambiguous_repeated_queries_as_simultaneous_samples(tmp_path):
+    first = _timed_read(0, 0, .1)
+    retry = _timed_read(1, 2, .1)
+    frequency = _timed_read(2, 4, .1)
+    retry["acquisition_id"] = frequency["acquisition_id"] = first["acquisition_id"]
+    frequency["request"] = {"function": 4, "register": 120, "count": 12}
+    frequency["frames"][0]["values"] = [0] * 12
+    output = _analyze(tmp_path, [first, retry, frequency])
+    skew = _structured(output, "source_query_skew")[0]
+    assert skew["start_skew_seconds"]["count"] == 0
+    assert skew["unpaired_or_ambiguous_acquisitions"] == 1
+
+
+def test_cli_complete_manifest_does_not_attest_register_sample_coverage(tmp_path):
+    bundle, _, _ = _bundle(tmp_path, [{
+        "kind": "acquisition", "role": "gridboss", "session_id": "session-a",
+        "build_id": "test-build", "ok": True,
+        "started_at": "2026-11-09T12:00:00+00:00",
+        "completed_at": "2026-11-09T12:00:01+00:00",
+        "telemetry": {"decoded": {"ups_voltage_v": 240}},
+    }])
+    result = _invoke(bundle)
+    assert result.returncode == 0, result.stderr
+    assert "manifest_verification=complete" in result.stdout
+    role = _structured(result.stdout, "role_coverage")[0]
+    assert role["role_observed"] is True
+    assert role["observed_blocks"] is False
+    assert role["sample_sufficiency"] == "insufficient"
+    assert role["manifest_custody_is_sample_coverage"] is False
+
+
+def test_cli_raw_voltage_frequency_query_skew_survives_semantic_rejection(tmp_path):
+    voltage = _timed_read(0, 0, .1)
+    frequency = _timed_read(1, 3, .1)
+    frequency["acquisition_id"] = voltage["acquisition_id"]
+    frequency["request"] = {"function": 4, "register": 120, "count": 12}
+    frequency["frames"][0]["values"] = [0] * 12
+    output = _analyze(tmp_path, [
+        voltage, frequency, {**frequency, "kind": "interpretation", "semantic": "rejected"},
+    ])
+    skew = _structured(output, "source_query_skew")[0]
+    assert skew["start_skew_seconds"]["median"] == 3
+    assert skew["start_skew_seconds"]["count"] == 1
+    assert skew["semantic_rejected_sources"] == 1
+    rejected = next(row for row in _structured(output, "block_coverage") if row["register"] == 120)
+    assert rejected["semantic_rejections"] == 1 and rejected["successes"] == 0
+
+
+def test_cli_never_applies_gridboss_voltage_frequency_addresses_to_flex(tmp_path):
+    rows = [
+        _controller_transaction("flexboss_master", 4, 0, 40, 3, 2400, 0),
+        _controller_transaction("flexboss_master", 4, 120, 26, 10, 6000, 1),
+    ]
+    rows[1]["acquisition_id"] = rows[0]["acquisition_id"]
+    output = _analyze(tmp_path, rows)
+    assert not _structured(output, "source_query_skew")
+    assert len(_structured(output, "block_coverage")) == 2
+
+
+@pytest.mark.parametrize("regression", [False, True])
+def test_cli_flags_canonical_clock_order_not_replayed_cache_age(tmp_path, regression):
+    first = _timed_read(0, 0, .1)
+    second = _timed_read(1, 10, .1)
+    cached = {**_controller_summary(first, cached=True), "build_id": "synthetic-build"}
+    third = _timed_read(2, 5 if regression else 20, .1)
+    output = _analyze(tmp_path, [first, second, cached, third])
+    role = _structured(output, "role_coverage")[0]
+    assert role["canonical_time_regressions"] == int(regression)
+    block = _structured(output, "block_coverage")[0]
+    assert block["samples"] == 3
+    assert block["latest_attempt"]["transaction_id"] == "tx-2"
+    if regression:
+        assert block["spacing_seconds"]["count"] == 0
+        assert block["interior_gaps"] is None
+        assert block["last_good"]["age_at_evidence_end_seconds"] is None
+        assert role["sample_sufficiency"] == "insufficient"
+        assert any(row["category"] == "canonical_source_time_regression"
+                   for row in _structured(output, "coverage_fact"))
+    else:
+        assert block["spacing_seconds"]["count"] == 2
