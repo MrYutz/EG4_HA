@@ -87,6 +87,7 @@ from .local_dongle import (
 from .local_dongle_trace import ControllerObservationJournal, LocalDongleTraceWriter
 from .local_incidents import IncidentRecorder, RecorderLimits
 from .local_recorder import EG4LocalRecorder
+from .register_catalog import GRIDBOSS_CURRENT_INTERPRETATION
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1954,6 +1955,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         else gridboss_snapshot.generator_l1_current
                         + gridboss_snapshot.generator_l2_current
                     ),
+                    "CurrentInterpretation": GRIDBOSS_CURRENT_INTERPRETATION,
                     "UPSVoltage": gridboss_snapshot.ups_voltage,
                     "UPSPower": gridboss_snapshot.ups_power,
                     "LoadPower": gridboss_snapshot.load_power,

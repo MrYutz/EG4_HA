@@ -1,8 +1,10 @@
 # EG4 Mother of All Data Loggers
 
-The recorder review and measured persistence fixes are deployed as **0.2.4**,
-together with the updated standalone analyzer. See the [deployment receipt](host-recorder-review-fixes-deployment-2026-11-10.md)
-for the failed attempt, rollback, corrected native capture and remaining storage/transport limits.
+The source-bound inventory recorder and updated standalone analyzer are deployed
+as **0.2.5**. See the [current deployment receipt](host-recorder-inventory-deployment-2026-11-10.md)
+for live coverage, samples, the recovered storage failure and remaining limits.
+The [0.2.4 receipt](host-recorder-review-fixes-deployment-2026-11-10.md) remains the
+historical record of the preceding persistence fixes.
 
 ## Implementation status
 
@@ -56,6 +58,11 @@ Every role reads dynamic evidence first, then at most one oldest-due maintenance
 block. Startup baselines are staggered between dynamic rounds. Read indices are
 zero-based, device-specific and read-only:
 
+The table describes deployed 0.2.5. All 35 exact request shapes, including the
+final two inventory rows, succeeded at least twice in the authorized native
+verification window. See the [live qualification](host-recorder-inventory-deployment-2026-11-10.md).
+Observed coverage is not continuous sampling, internal decision tracing or causal sufficiency.
+
 | Role | Read profile | Target |
 | --- | --- | --- |
 | Each FlexBOSS | Input0/40,40/40,120/26 | Dynamic rounds, requested1s spacing |
@@ -65,6 +72,8 @@ zero-based, device-specific and read-only:
 | GridBOSS | Local holding4500/10 | Startup and5s |
 | Each FlexBOSS | Baseline holding0/20,20/90,235/102 plus latest110/125 | Startup and5min, staggered |
 | GridBOSS | Baseline holding0/20,20/90,110/125,235/88 and local2000/108 | Startup and5min, staggered |
+| GridBOSS — slow inventory | Input40/80 and local holding4097/41 | Startup and5min, staggered |
+| Each FlexBOSS — slow inventory | Input146/94; local holding500/112,612/112 and5000/18 | Startup and5min, staggered |
 
 Cached blocks retain their original acquisition intervals and IDs. A failed
 baseline block is missing in current context; last-successful values remain
@@ -83,6 +92,54 @@ Role notifications coalesce logger-state checkpoints without postponing an
 already-pending one-second save request. Transfer-change evidence retains the
 previous/current inferred states and explicitly marks intervening unknown
 coverage; the initial observation establishes a baseline, not a physical edge.
+
+### Audited register inventory
+
+`custom_components/eg4_monitor/register_catalog.py` is the shared source for
+request profiles and offline interpretation. It covers the audited GridBOSS
+input0–131/500–599 and holding0–322/2000–2107/4097–4137/4500–4509
+surfaces; each FlexBOSS covers input0–239 and
+holding0–336/500–723/5000–5017. This is a bounded, candidate-specific inventory,
+not a claim to know every controller register or every word's physical meaning.
+
+The [firmware causal-coverage audit](../investigations/2026-11-08-firmware-reverse-engineering/causal-path-audit-2026-11-11.md)
+separates mapped opening/reconnection paths, hidden state and unresolved producer
+chains. It also corrects the held-mode byte in GridBOSS input585 and identifies
+Flex input107 as the already-captured local battery-measurement alias. Complete
+readable-bank capture is not exhaustive firmware decision coverage.
+
+The [timing-first causal reassessment](../investigations/2026-11-08-firmware-reverse-engineering/timing-first-principles-2026-11-11.md)
+adds hourly maintenance, distributed timing-reference and inverter-permission
+paths. It distinguishes stock sampled evidence from the internal events still
+needed; it does not prescribe maximum-rate polling or another client.
+
+The extended banks use the existing local vendor wrapper. Flex500/112 and612/112
+remain separate exact-start requests; do not merge them or assume ordinary RTU
+has the same handlers. Flex5000/18 includes received and transient staging state,
+not eighteen independent peer sensors. Slow collection cannot preserve every
+intermediate state or identify the effective time of a configuration change.
+
+New raw/interpretation/acquisition records carry the installed integration's
+source build fingerprint and catalog revision. These identify **host code**,
+not the installed controller image. Recorder health retains configured/active
+roles, the capture profile and effective requested periods. Slow input
+`inventory_context` keeps latest attempt, last successful source and age
+separately; a failed read cannot refresh the successful value's timestamp.
+
+Current words10–25 are retained as unsigned candidate RMS magnitudes. The
+legacy signed-word/10 ampere conversion disagrees with the public /100
+interpretation; its physical factor is unresolved. `CurrentInterpretation`
+on GridBOSS entity attributes and trace interpretation metadata flag that
+uncertainty without silently changing numerical sensor values. Do not use those
+ampere values as calibrated fault evidence.
+
+Candidate energy counters are circuit aggregates, not leg measurements:
+generator daily is input50 and its low-first total is84/85. Literal-zero lanes
+are not evidence of zero leg consumption. The offline catalog preserves raw
+counts without asserting a verified kWh scale; incomplete pairs are not
+zero-filled or joined across transactions. Holding229 bit4 is configuration,
+not contact feedback. These interpretations do not retroactively create missing
+weekend samples or establish a first-cause event sequence.
 
 ### Historical controller capture
 
@@ -343,9 +400,11 @@ No history activation/erase or second device client is used. New raw summaries
 omit unrelated HA/light state dumps, credentials and tokens.
 
 Run `python scripts/analyze_local_dongle_trace.py <file-or-directory>` (optionally
-`--role <role>` and `--gap-seconds <seconds>`) to stream historical or v2 evidence.
-A recorder root reports rolling capture, controller journal and each incident
-separately; copied incident rows are not counted as additional rolling acquisitions.
+`--role <role>`, `--gap-seconds <seconds>` and `--registers`) to analyze historical
+or v2 evidence. Retained direct-session baseline JSON is also supported; only
+its saved03/04 observations are decoded, never its diagnostic actions executed.
+Per-stream event summaries remain separate. Structured rolling/journal coverage
+deduplicates shared source identities; each incident is analyzed independently.
 An incident directory verifies manifest references, retained file sizes and final
 SHA256 hashes. Growing, missing, evicted or modified files remain explicitly incomplete.
 
@@ -362,6 +421,38 @@ overlap or a regressed host clock unresolved rather than discarding a new raw fa
 Onset/recovery brackets retain original read intervals and unresolved overlapping
 ordering. No zero-fill, interpolation, engine/contact claim or continuous house-outage
 duration is inferred.
+
+The deployed 0.2.5 analyzer emits machine-readable JSON fragments prefixed with
+`block_coverage=`, `role_coverage=`, `register_projection=`,
+`source_query_skew=` and `coverage_fact=`. Coverage is partitioned by recorded
+host build/session; anonymous sources remain file-local. Captured profiles define
+expected blocks/roles. For older records, the catalog is explicitly an
+**unattested reference**, not evidence that today's profile was running then.
+
+Per-block reports include attempts, accepted raw sources, semantic rejections,
+deduplicated copies, exact median/p95/max spacing and latency, source ages and
+leading/interior/trailing gaps. Ages are relative to retained evidence, not the
+analysis machine's current time. Clock regressions, malformed sources, missing
+roles and reported retention/persistence loss prevent sufficient-coverage claims.
+Manifest custody completeness never means causal completeness.
+
+GridBOSS input3/input130 skew uses distinct original source intervals within the
+same recorded acquisition. Structurally received but semantically rejected pairs
+remain visible; no simultaneous physical V/Hz observation is inferred. Missing
+acquisition identity cannot be repaired by pairing arbitrary nearby timestamps.
+`--registers` retains raw words, source provenance and calibration/semantic
+uncertainty; its detailed output can be large.
+
+The CLI is still stdlib-only, but its standalone distribution is now **three
+adjacent files**: `analyze_local_dongle_trace.py`, `eg4_trace_coverage.py` and
+`register_catalog.py` (the latter copied from the component directory). In a
+checkout, it finds the canonical component catalog directly without importing HA.
+Copy all three together when updating Plucky; copying only the entry script is
+no longer sufficient. They were deployed together in the
+[0.2.5 rollout](host-recorder-inventory-deployment-2026-11-10.md).
+Exact deduplication/quantiles spill into a temporary SQLite file, removed on exit;
+allow temporary disk space proportional to the analyzed evidence. Input evidence
+remains read-only; this does not add a database or service to the HA recorder.
 
 ## Operational retention
 
@@ -474,11 +565,14 @@ recoverable across process termination; unrelated replacement files fail closed.
 
 ### Plucky runtime and operation
 
-Install a committed release of the two archive scripts, the existing analyzer,
-`scripts/requirements-eg4-archive.txt` and the systemd templates into
-`~/.local/libexec/eg4-recorder-archive/releases/<commit>/`. Create its isolated
-`venv` and install that requirements file there; no HA dependency changes.
-Point `~/.local/libexec/eg4-recorder-archive/current` at that release.
+Install a versioned, source-attested release of the two archive scripts, all
+three adjacent analyzer files, `scripts/requirements-eg4-archive.txt` and the
+systemd templates into `~/.local/libexec/eg4-recorder-archive/releases/<release-id>/`.
+Prefer a committed source; record a working-tree snapshot's content hashes when
+deploying one. Create an isolated `venv` and install the requirements there; no
+HA dependency changes. The current 0.2.5 deployment instead reuses the unchanged,
+pinned runtime from the preceding immutable release, which must be retained.
+Point `~/.local/libexec/eg4-recorder-archive/current` at the selected release.
 Install the service/timer templates from `scripts/systemd/` under
 `~/.config/systemd/user/`. The per-user manager must remain running after logout
 (`Linger=yes` on Plucky).
@@ -517,9 +611,10 @@ the last successful time. To stop replication without deleting evidence:
 
 The standalone `scripts/pull_eg4_archive.py --help` also exposes local backfill and
 SFTP options. Preserve older saved copies before pulling a newer moving source.
-Analyze an incident directory or selected segment with the unchanged
-`scripts/analyze_local_dongle_trace.py`; a whole multi-day archive produces a large
-detailed report. Keep reports/raw logs outside Git.
+Analyze an incident directory or selected segment with the analyzer version
+installed there. For the unreleased coverage analyzer, use the three-file
+distribution above. A multi-day archive can produce a large detailed report;
+keep reports/raw logs outside Git.
 
 Eight days fills prospectively; already-pruned history cannot be recovered.
 Plucky downtime can only catch up within HA's remaining local spool (about2.9h

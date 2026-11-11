@@ -23,6 +23,7 @@ from custom_components.eg4_monitor.local_incidents import (
     RecorderLimits,
 )
 from custom_components.eg4_monitor.local_recorder import EG4LocalRecorder
+from custom_components.eg4_monitor.register_catalog import REGISTER_MAP_REVISION
 from tests.test_local_dongle import _fixture_response
 
 
@@ -239,9 +240,10 @@ async def test_startup_profiles_are_literal_safe_and_one_maintenance_per_round(g
         ]
         maintenance = [
             (3, 4500, 10), (3, 0, 20), (3, 20, 90), (3, 110, 125),
-            (3, 235, 88), (3, 2000, 108),
+            (3, 235, 88), (3, 2000, 108), (4, 40, 80), (3, 4097, 41),
         ] if gridboss else [
             (4, 80, 40), (3, 110, 125), (3, 0, 20), (3, 20, 90), (3, 235, 102),
+            (4, 146, 94), (3, 500, 112), (3, 612, 112), (3, 5000, 18),
         ]
         try:
             await recorder.async_start()
@@ -283,6 +285,135 @@ async def test_startup_profiles_are_literal_safe_and_one_maintenance_per_round(g
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("gridboss", [False, True])
+async def test_slow_input_inventory_retains_source_through_failure_without_blocking_peer(
+    tmp_path, gridboss,
+):
+    """Real slow-bank failures retain raw history, not BMS/configuration values."""
+    role = "gridboss" if gridboss else "flexboss_master"
+    peer = "flexboss_master" if gridboss else "gridboss"
+    shape = (4, 40, 80) if gridboss else (4, 146, 94)
+    key = ":".join(map(str, shape))
+    schedule_time = [0.0]
+    attempts = Counter()
+    held, peer_progress = asyncio.Event(), asyncio.Event()
+    updates, permits = asyncio.Queue(), asyncio.Queue()
+    peer_records = []
+
+    async def respond(request):
+        attempts[request] += 1
+        if request == shape and attempts[request] == 2:
+            held.set()
+            await asyncio.wait_for(peer_progress.wait(), 2)
+            return None
+        words = _words(request, gridboss=gridboss)
+        if request == shape:
+            words[-1] = 321
+        return words
+
+    async def healthy(request):
+        return _words(request, gridboss=not gridboss)
+
+    async def consume(record):
+        assert record is not None
+        if record["role"] == role:
+            updates.put_nowait((record, recorder.snapshot()))
+            await permits.get()
+        else:
+            peer_records[:] = [record]
+            if held.is_set():
+                peer_progress.set()
+
+    async def next_record():
+        return await asyncio.wait_for(updates.get(), 2)
+
+    writer = LocalDongleTraceWriter(tmp_path)
+    async with _endpoint(respond, gridboss=gridboss) as (device, requests, concurrency):
+        async with _endpoint(healthy, gridboss=not gridboss) as (other, _, peer_concurrency):
+            recorder = EG4LocalRecorder(
+                devices={role: device, peer: other},
+                configured_inverter_roles={"flexboss_master"},
+                writer=writer, on_update=consume, interval=0.005,
+                bms_interval=7, clock=lambda: schedule_time[0],
+                build_id="slow-inventory-source",
+            )
+            try:
+                await recorder.async_start()
+                while True:
+                    initial, snapshot = await next_record()
+                    if not snapshot.health["Roles"][role]["MissingProfileBlocks"]:
+                        break
+                    permits.put_nowait(None)
+                baseline = initial["inventory_context"][key]["last_success"]
+                assert baseline["values"][-1] == 321
+                assert baseline["build_id"] == "slow-inventory-source"
+                assert baseline["register_map_revision"] == REGISTER_MAP_REVISION
+                assert shape in requests
+                assert key not in initial["configuration_context"]
+                assert initial["inventory_context"][key]["target_interval_seconds"] == 300
+                assert initial["inventory_context"][key]["failures"] == 0
+                if gridboss:
+                    assert initial["bms_context"] == {}
+                    assert initial["bms_sampled"] is False
+                else:
+                    assert initial["bms_context"]["register"] == 80
+                    assert initial["bms_context"]["last_success"]["count"] == 40
+                schedule_time[0] = 300
+                while True:
+                    permits.put_nowait(None)
+                    failed, snapshot = await next_record()
+                    if failed.get("maintenance_attempted") == key:
+                        break
+                context = failed["inventory_context"][key]
+                assert held.is_set() and peer_progress.is_set()
+                assert peer_records[-1]["role"] == peer and peer_records[-1]["ok"] is True
+                assert failed["ok"] is True and failed["partial"] is True
+                assert snapshot.health["Roles"][role]["PrimaryAvailable"] is True
+                assert failed["primary_source"]["acquisition_id"] == failed["acquisition_id"]
+                assert snapshot.sample.charge_power_w == 500
+                assert snapshot.sample.generator_voltage == 240
+                assert context["status"] == "failed" and context["failures"] == 1
+                assert context["latest_attempt"]["ok"] is False
+                assert context["latest_attempt"]["values"] is None
+                assert context["last_success"]["transaction_id"] == baseline["transaction_id"]
+                assert context["last_success"]["acquired_at"] == baseline["acquired_at"]
+                assert context["last_success"]["values"][-1] == 321
+                assert context["last_success"]["age_seconds"] > baseline["age_seconds"]
+                diagnostic = next(
+                    block for block in failed["diagnostics"]
+                    if (block["function"], block["register"], block["count"]) == shape
+                )
+                assert diagnostic["current_acquisition"] is True
+                assert diagnostic["transaction_id"] == context["latest_attempt"]["transaction_id"]
+                assert diagnostic["values"] is None
+                assert key in snapshot.health["Roles"][role]["FailedProfileBlocks"]
+                assert concurrency["maximum"] == peer_concurrency["maximum"] == 1
+                permits.put_nowait(None)
+                reused, _ = await next_record()
+                retained = reused["inventory_context"][key]
+                assert retained["last_success"]["acquired_at"] == baseline["acquired_at"]
+                assert retained["last_success"]["age_seconds"] >= context["last_success"]["age_seconds"]
+                assert retained["failures"] == 1 and attempts[shape] == 2
+            finally:
+                await recorder.async_close()
+                await writer.async_close()
+    rows = [json.loads(line) for line in writer.active_path.read_text().splitlines()]
+    assert all(row["build_id"] == "slow-inventory-source" for row in rows)
+    assert all(row["register_map_revision"] == REGISTER_MAP_REVISION for row in rows)
+    transactions = [row for row in rows if row["kind"] == "transaction"]
+    assert transactions and all("capture_profile" not in row for row in transactions)
+    startup = next(row for row in rows if row["kind"] == "recorder_health" and row["reason"] == "startup")
+    assert startup["health"]["ConfiguredRoles"] == ["flexboss_master", "gridboss"]
+    profile = startup["health"]["Roles"][role]["capture_profile"]
+    assert profile["revision"] == REGISTER_MAP_REVISION and profile["enabled"] is True
+    assert [*shape, 300.0] in profile["maintenance"]
+    assert [*shape, 300.0] in profile["effective_periods"]
+    assert [4, 0, 40, 0.005] in profile["effective_periods"]
+    inverter_profile = startup["health"]["Roles"]["flexboss_master"]["capture_profile"]
+    assert [4, 80, 40, 7.0] in inverter_profile["effective_periods"]
+
+
+@pytest.mark.asyncio
 async def test_failed_configuration_keeps_aged_last_good_and_unique_deadline():
     schedule_time = [0.0]
     attempts = Counter()
@@ -305,10 +436,11 @@ async def test_failed_configuration_keeps_aged_last_good_and_unique_deadline():
         )
         try:
             await recorder.async_start()
-            for index in range(5):
+            while True:
                 _, initial, _ = await consumer.next()
-                if index < 4:
-                    consumer.advance()
+                if not initial.health["Roles"]["flexboss_master"]["MissingProfileBlocks"]:
+                    break
+                consumer.advance()
             baseline = initial.settings["flexboss_master"]["3:110:125"]["last_success"]
             schedule_time[0] = 60
             consumer.advance()
@@ -620,9 +752,9 @@ async def test_bms_failure_and_age_cannot_authorize_cached_corroboration():
                 datetime.fromisoformat(original["acquired_at"]) + timedelta(seconds=16),
             )
             assert aged.local_freshness["BMSSources"]["flexboss_master"]["available"] is False
-            for _ in range(4):
+            while before.health["Roles"]["flexboss_master"]["MissingProfileBlocks"]:
                 consumer.advance()
-                await consumer.next()  # Staggered startup baselines.
+                _, before, _ = await consumer.next()
             schedule_time[0] = 5
             consumer.advance()
             failed, snapshot, _ = await consumer.next()
@@ -660,6 +792,12 @@ async def test_missing_configured_master_and_zero_slave_never_become_complete_ze
             assert snapshot.local_freshness["MissingRoles"] == ["flexboss_master"]
             assert state["Charging"]["Quality"] == "interrupted"
             assert snapshot.health["Roles"]["flexboss_master"]["State"] == "degraded"
+            assert snapshot.health["ConfiguredRoles"] == ["flexboss_master", "flexboss_slave"]
+            assert snapshot.health["ActiveRoles"] == ["flexboss_slave"]
+            missing_profile = snapshot.health["Roles"]["flexboss_master"]["capture_profile"]
+            assert missing_profile["enabled"] is False
+            assert missing_profile["effective_periods"] == []
+            assert missing_profile["family"] == "inverter"
         finally:
             await recorder.async_close()
 
@@ -844,13 +982,14 @@ async def test_real_storage_failure_recovers_health_without_hiding_healthy_captu
         try:
             await recorder.async_start()
             # Finish the real startup maintenance profile while storage fails.
-            for index in range(6):
+            while True:
                 record, snapshot, _ = await consumer.next()
                 captured.append(record["acquisition_id"])
                 assert record["ok"] is True
                 assert snapshot.sample.charge_power_w == 500
-                if index != 5:
-                    consumer.advance()
+                if not snapshot.health["Roles"]["flexboss_master"]["MissingProfileBlocks"]:
+                    break
+                consumer.advance()
             await raw.async_sync()
             await journal_writer.async_sync()
             failed = recorder.snapshot().health
@@ -1029,10 +1168,10 @@ async def test_repeated_semantic_rejection_does_not_republish_settled_health(tmp
         async def completed_acquisition():
             """Let immediate primary interruptions reach the final role record."""
             while True:
-                record, _, _ = await consumer.next()
+                record, snapshot, _ = await consumer.next()
                 if record is not None:
                     assert record["ok"] is False
-                    return
+                    return snapshot
                 consumer.advance()
 
         def saved_health():
@@ -1044,10 +1183,11 @@ async def test_repeated_semantic_rejection_does_not_republish_settled_health(tmp
 
         try:
             await recorder.async_start()
-            for index in range(5):
-                await completed_acquisition()
-                if index < 4:
-                    consumer.advance()
+            while True:
+                snapshot = await completed_acquisition()
+                if not snapshot.health["Roles"]["flexboss_master"]["MissingProfileBlocks"]:
+                    break
+                consumer.advance()
             await raw.async_sync()
             before = saved_health()
             for _ in range(3):

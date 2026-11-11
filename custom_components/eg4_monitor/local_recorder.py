@@ -18,15 +18,7 @@ from statistics import median
 from typing import Any
 from uuid import uuid4
 
-from .const import (
-    LOCAL_DONGLE_TRACE_SCHEMA,
-    LOCAL_GRIDBOSS_DYNAMIC_BLOCKS,
-    LOCAL_GRIDBOSS_MAINTENANCE,
-    LOCAL_GRIDBOSS_PRIMARY_BLOCKS,
-    LOCAL_INVERTER_DYNAMIC_BLOCKS,
-    LOCAL_INVERTER_MAINTENANCE,
-    LOCAL_INVERTER_PRIMARY_BLOCKS,
-)
+from .const import LOCAL_DONGLE_TRACE_SCHEMA
 from .eg4_logger import LoggerSample
 from .local_dongle import (
     EG4GridBossTelemetry,
@@ -43,6 +35,16 @@ from .local_dongle_trace import (
     telemetry_to_record,
 )
 from .local_incidents import IncidentRecorder
+from .register_catalog import (
+    LOCAL_GRIDBOSS_DYNAMIC_BLOCKS,
+    LOCAL_GRIDBOSS_MAINTENANCE,
+    LOCAL_GRIDBOSS_PRIMARY_BLOCKS,
+    LOCAL_INVERTER_DYNAMIC_BLOCKS,
+    LOCAL_INVERTER_MAINTENANCE,
+    LOCAL_INVERTER_PRIMARY_BLOCKS,
+    REGISTER_MAP_REVISION,
+    capture_profile,
+)
 
 Shape = tuple[int, int, int]
 _LOGGER = logging.getLogger(__name__)
@@ -84,6 +86,7 @@ class _Role:
     due: dict[Shape, float]
     blocks: dict[Shape, dict[str, Any]] = field(default_factory=dict)
     last_good: dict[Shape, dict[str, Any]] = field(default_factory=dict)
+    failures: dict[Shape, int] = field(default_factory=dict)
     # Pending raw frames do not replace the last completed semantic verdict.
     semantic_rejections: set[Shape] = field(default_factory=set)
     core: EG4LocalTelemetry | EG4GridBossTelemetry | None = None
@@ -157,6 +160,8 @@ class EG4LocalRecorder:
         self._warnings: dict[str, float] = {}
         self._close_task: asyncio.Task[None] | None = None
         for role, device in devices.items():
+            if capture_profile(role)["family"] == "unknown":
+                raise ValueError(f"Unsupported local recorder role: {role}")
             gridboss = role == "gridboss"
             profile = LOCAL_GRIDBOSS_MAINTENANCE if gridboss else LOCAL_INVERTER_MAINTENANCE
             periods = {
@@ -179,6 +184,9 @@ class EG4LocalRecorder:
         now = datetime.now(UTC)
         snapshot = self.snapshot(now)
         return {
+            "inventory_context": {
+                role: self._inventory(state, now) for role, state in self._roles.items()
+            },
             "configuration_observed_at": now.isoformat(),
             "roles": snapshot.settings,
             "role_freshness": {
@@ -321,6 +329,8 @@ class EG4LocalRecorder:
 
     async def _write(self, record: dict[str, Any]) -> None:
         """Enqueue evidence without waiting for disk or reporting queue success."""
+        record["build_id"] = self.build_id
+        record["register_map_revision"] = REGISTER_MAP_REVISION
         if self.incidents is not None:
             self.incidents.observe(record)
         if self.writer is None:
@@ -384,6 +394,8 @@ class EG4LocalRecorder:
 
     async def _observe(self, evidence: dict[str, Any]) -> None:
         """Keep bounded shape metadata before optionally persisting raw evidence."""
+        evidence["build_id"] = self.build_id
+        evidence["register_map_revision"] = REGISTER_MAP_REVISION
         state = self._roles.get(evidence["role"])
         if state is not None and evidence.get("kind") == "transaction":
             request = evidence["request"]
@@ -397,6 +409,7 @@ class EG4LocalRecorder:
                 state.blocks[shape] = {
                     **{name: evidence[name] for name in (
                         "session_id", "acquisition_id", "transaction_id", "started_at", "completed_at", "ok",
+                        "build_id", "register_map_revision",
                     )},
                     "function": shape[0], "register": shape[1], "count": shape[2],
                     "acquired_at": evidence["completed_at"],
@@ -424,8 +437,10 @@ class EG4LocalRecorder:
             raise ValueError("Primary acquisition provenance unavailable")
         transactions = [{name: block[name] for name in (
             "session_id", "acquisition_id", "transaction_id", "started_at", "completed_at", "ok",
+            "build_id", "register_map_revision",
         )} for block in blocks if block is not None]
         return {
+            "build_id": self.build_id, "register_map_revision": REGISTER_MAP_REVISION,
             "acquisition_id": acquisition_id,
             "transaction_ids": [block["transaction_id"] for block in transactions],
             "started_at": min(block["started_at"] for block in transactions),
@@ -493,6 +508,7 @@ class EG4LocalRecorder:
             if not block["ok"]:
                 raise ValueError("Block acquisition provenance unavailable")
         except Exception as err:
+            state.failures[shape] = state.failures.get(shape, 0) + 1
             state.errors += 1
             state.last_error = f"{type(err).__name__}: {err}"
             self._warn("maintenance acquisition", state.last_error)
@@ -545,7 +561,9 @@ class EG4LocalRecorder:
                         # Schedule from actual attempt, including failures. Ties
                         # retain profile order; startup shapes cannot starve.
                         state.due[shape] = self._clock() + state.periods[shape]
-                        await self._block(state, shape, bms=shape == (4, 80, 40))
+                        await self._block(
+                            state, shape, bms=role != "gridboss" and shape == (4, 80, 40),
+                        )
                         record["maintenance_attempted"] = _key(shape)
                 except asyncio.CancelledError:
                     cancelled = True
@@ -575,10 +593,11 @@ class EG4LocalRecorder:
             "function": shape[0], "register": shape[1], "count": shape[2],
             "target_interval_seconds": state.periods[shape],
             "status": "missing" if latest is None else "ok" if (
-                latest["ok"] and latest["semantic"] != "rejected"
+                latest["ok"] and latest["semantic"] != "rejected" and not latest.get("error")
             ) else "failed",
             "latest_attempt": {**deepcopy(latest), "age_seconds": _age(latest, now)} if latest else None,
             "last_success": {**deepcopy(last_good), "age_seconds": _age(last_good, now)} if last_good else None,
+            "failures": state.failures.get(shape, 0),
             "effective_change_time_known": False,
         }
 
@@ -586,10 +605,20 @@ class EG4LocalRecorder:
         """Expose only the bounded holding-register configuration profile."""
         return {_key(shape): self._context(state, shape, now) for shape in state.periods if shape[0] == 3}
 
+    def _inventory(self, state: _Role, now: datetime) -> dict[str, Any]:
+        """Retain slow input banks independently of configuration and BMS."""
+        return {
+            _key(shape): self._context(state, shape, now)
+            for shape in state.periods
+            if shape[0] == 4 and not (
+                state.device.role != "gridboss" and shape == (4, 80, 40)
+            )
+        }
+
     def _bms_context(self, state: _Role, now: datetime) -> dict[str, Any]:
         """Report BMS source identity, original age and latest attempt status."""
         shape = (4, 80, 40)
-        if shape not in state.periods:
+        if state.device.role == "gridboss" or shape not in state.periods:
             return {}
         age = _age(state.bms_source, now)
         return {
@@ -615,16 +644,22 @@ class EG4LocalRecorder:
             {**deepcopy(block), "age_seconds": _age(block, now),
              "current_acquisition": block["acquisition_id"] == acquisition_id}
             for shape, block in state.blocks.items()
-            if shape in state.dynamic or shape in state.periods and shape[0] == 3
+            if shape in state.dynamic or shape in state.periods and not (
+                state.device.role != "gridboss" and shape == (4, 80, 40)
+            )
         ]
         record["configuration_context"] = self._configuration(state, now)
+        record["inventory_context"] = self._inventory(state, now)
         record["bms_context"] = self._bms_context(state, now)
         record["bms_source"] = {
             **deepcopy(state.bms_source or {}),
             "used_in_telemetry": record["ok"] and record["bms_context"].get("available", False),
         }
         record["bms_age_seconds"] = record["bms_context"].get("age_seconds")
-        record["bms_sampled"] = any(block["register"] == 80 and block["function"] == 4 for block in current)
+        record["bms_sampled"] = state.device.role != "gridboss" and any(
+            (block["function"], block["register"], block["count"]) == (4, 80, 40)
+            for block in current
+        )
         if record["ok"] and state.core is not None:
             if isinstance(state.core, EG4GridBossTelemetry):
                 record["telemetry"] = gridboss_to_record(state.core)
@@ -663,8 +698,16 @@ class EG4LocalRecorder:
         roles = {}
         for role in sorted(self._configured | self._roles.keys()):
             state = self._roles.get(role)
+            profile = capture_profile(role)
+            profile["enabled"] = state is not None
+            profile["effective_periods"] = [
+                [*shape, self.interval] for shape in (*state.primary, *state.dynamic)
+            ] + [[*shape, period] for shape, period in state.periods.items()] if state else []
             if state is None:
-                roles[role] = {"State": "degraded", "PrimaryAvailable": False, "LastError": "configured driver missing"}
+                roles[role] = {
+                    "State": "degraded", "PrimaryAvailable": False,
+                    "LastError": "configured driver missing", "capture_profile": profile,
+                }
                 continue
             maintenance = {
                 _key(shape): {
@@ -674,9 +717,13 @@ class EG4LocalRecorder:
                         and not state.blocks[shape].get("error")
                     ) else "failed",
                     "LastSuccessAgeSeconds": _age(state.last_good.get(shape), now),
+                    "Failures": state.failures.get(shape, 0),
                     "Source": {
                         key: state.last_good[shape][key]
-                        for key in ("acquisition_id", "transaction_id", "acquired_at")
+                        for key in (
+                            "acquisition_id", "transaction_id", "acquired_at",
+                            "build_id", "register_map_revision",
+                        )
                     } if shape in state.last_good else None,
                 } for shape in state.periods
             }
@@ -701,6 +748,7 @@ class EG4LocalRecorder:
                        and len(diagnostics) == len(state.dynamic) and all(block["ok"] for block in diagnostics))
             roles[role] = {
                 "State": "starting" if state.last_attempt is None else "healthy" if healthy else "degraded",
+                "capture_profile": profile,
                 "LastAttempt": state.last_attempt, "LastSuccess": state.last_success,
                 "PrimaryAvailable": state.primary_available,
                 "PrimaryAgeSeconds": primary_age,
@@ -732,6 +780,9 @@ class EG4LocalRecorder:
         )
         self._health_cache = {
             "SessionId": self.session_id, "BuildId": self.build_id, "State": overall,
+            "RegisterMapRevision": REGISTER_MAP_REVISION,
+            "ConfiguredRoles": sorted(self._configured | self._roles.keys()),
+            "ActiveRoles": sorted(self._roles),
             "ObservedAt": now.isoformat(), "Roles": roles, "WriterError": self._writer_error,
             "RawPersistence": raw, "JournalPersistence": journal,
             "Incidents": incidents,

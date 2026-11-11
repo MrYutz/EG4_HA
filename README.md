@@ -4,6 +4,15 @@ Custom Home Assistant integration for EG4 portal-backed systems, tuned for moder
 
 ## What Changed
 
+### Host recorder 0.2.5 — source-bound register inventory
+
+- One shared catalog defines the audited read surfaces, safe request shapes and candidate-firmware interpretations.
+- Slow maintenance reads cover the remaining audited GridBOSS and FlexBOSS banks without adding another poller or changing the primary read shapes.
+- Raw current/energy counters retain their calibration uncertainty; existing GridBOSS ampere values are explicitly labeled unverified. Load-leg power is retained separately.
+- Offline coverage reports separate host builds/sessions, deduplicate retained sources, and expose per-block timing, missing roles, loss and GridBOSS voltage/frequency query skew. `--registers` adds source-bound raw interpretations.
+
+Deployed to HA and Plucky on 2026-11-10 from a content-attested working-tree snapshot. All 35 audited request shapes succeeded at least twice in the native verification window; all 2,352 audited register words were retained. See the [deployment evidence and samples](docs/host-recorder-inventory-deployment-2026-11-10.md). This is not an internal decision trace, full register-semantic decoding, or proof of the weekend's cause; the [inventory boundary](docs/mother-of-all-data-loggers.md#audited-register-inventory) still applies.
+
 ### Host recorder 0.2.4 — recorder and persistence fixes
 
 - Shared raw measurement projection keeps capture evidence separate from decoded publication guards; repeated invalid readings no longer manufacture recovery events.
